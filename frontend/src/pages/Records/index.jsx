@@ -410,11 +410,56 @@ export default function Records() {
     )
   }
 
-  // CPM数据：总花费 / 次周播放量 * 1000，播放量为 0 显示 -
+  // 单条记录的最新累计口径：latest 已填写且不违反 latest >= first 时才可信
+  const recordLatestPlay = (record) => {
+    const latestRaw = record?.second_week_play
+    if (latestRaw === null || latestRaw === undefined || latestRaw === '') return null
+    const latest = Number(latestRaw)
+    if (!Number.isFinite(latest)) return null
+    const firstRaw = record?.first_play
+    if (firstRaw !== null && firstRaw !== undefined && firstRaw !== '') {
+      const first = Number(firstRaw)
+      // latest < first 属于异常数据，不可信
+      if (Number.isFinite(first) && latest < first) return null
+    }
+    return latest
+  }
+
+  // 最新CPM = 总花费 ÷ 最新累计播放量 × 1000
+  // latest 未填写（待更新）/ 异常（latest < first）/ latest <= 0 → 显示 -
   const cpmRender = (_, record) => {
-    const cpm = calcCpm(record.total_cost, record.second_week_play)
-    // CPM 全局统一保留 1 位小数；无播放量时 calcCpm 返回 null -> 显示 -
-    return formatCpm(cpm)
+    const latest = recordLatestPlay(record)
+    return formatCpm(latest === null ? null : calcCpm(record.total_cost, latest))
+  }
+
+  // 最新累计播放量：未填写显示「待更新」；异常（latest < first）保留原始数值并标红 + 悬浮提示
+  const latestPlayRender = (value, record) => {
+    if (value === null || value === undefined || value === '') {
+      return <Typography.Text type="secondary">待更新</Typography.Text>
+    }
+    const latest = Number(value)
+    const firstRaw = record?.first_play
+    const first =
+      firstRaw === null || firstRaw === undefined || firstRaw === '' ? null : Number(firstRaw)
+    if (Number.isFinite(latest) && first !== null && Number.isFinite(first) && latest < first) {
+      return (
+        <Tooltip title="最新累计播放量小于7日累计播放量">
+          <span style={{ color: '#d4380d' }}>{formatPlays(value)}</span>
+        </Tooltip>
+      )
+    }
+    return formatPlays(value)
+  }
+
+  // 7日后新增播放量 = 最新累计播放量 − 7日累计播放量
+  // 仅当 latest 已填写且 latest >= 7日累计时展示；否则显示 -
+  const post7dGrowthRender = (_, record) => {
+    const latest = recordLatestPlay(record)
+    const firstRaw = record?.first_play
+    if (latest === null || firstRaw === null || firstRaw === undefined || firstRaw === '') return '-'
+    const first = Number(firstRaw)
+    if (!Number.isFinite(first)) return '-'
+    return formatPlays(latest - first)
   }
 
   const actionRender = (_, record) => (
@@ -469,25 +514,32 @@ export default function Records() {
       render: formatMoney
     },
     {
-      title: 'CPM数据',
-      key: 'cpm',
-      width: 120,
+      title: '最新CPM',
+      key: 'latestCpm',
+      width: 110,
       align: 'right',
       render: cpmRender
     },
     {
-      title: '首发播放量',
+      title: '7日累计播放量',
       dataIndex: 'first_play',
-      width: 110,
+      width: 130,
       align: 'right',
       render: formatPlays
     },
     {
-      title: '次周播放量',
+      title: '最新累计播放量',
       dataIndex: 'second_week_play',
-      width: 110,
+      width: 130,
       align: 'right',
-      render: formatPlays
+      render: latestPlayRender
+    },
+    {
+      title: '7日后新增播放量',
+      key: 'post7dGrowth',
+      width: 150,
+      align: 'right',
+      render: post7dGrowthRender
     },
     { title: '发布日期', dataIndex: 'publish_date', width: 110 },
     { title: '操作', key: 'action', width: 120, fixed: 'right', render: actionRender }
@@ -752,7 +804,7 @@ export default function Records() {
         }}
         rowClassName={(record) => (selectedRowKeys.includes(record.id) ? 'ant-table-row-selected' : '')}
         locale={{ emptyText: '暂无投放记录，点击「新增投放」创建' }}
-        scroll={{ x: 1560 }}
+        scroll={{ x: 1700 }}
         pagination={{
           current: page,
           pageSize,

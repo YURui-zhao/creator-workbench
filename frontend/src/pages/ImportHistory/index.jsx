@@ -32,11 +32,20 @@ const ITEM_STATUS = {
   duplicate: { text: '重复', color: 'warning' }
 }
 
-// created_at 由 SQLite CURRENT_TIMESTAMP 写入（UTC），统一截断到分钟展示
+// created_at 由 SQLite CURRENT_TIMESTAMP 写入（UTC 时间字符串），展示时统一转换为浏览器本地时间（精确到分钟）
 function formatDateTime(value) {
   if (!value) return '-'
-  const text = String(value).replace('T', ' ')
-  return text.length > 16 ? text.slice(0, 16) : text
+  const text = String(value).trim()
+  // 兼容 '2026-09-22 08:12:34'（SQLite UTC）与带时区的 ISO 字符串
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/.test(text)
+    ? `${text.replace(' ', 'T')}Z`
+    : text
+  const date = new Date(normalized)
+  if (Number.isNaN(date.getTime())) return text.slice(0, 16)
+  const pad = (num) => String(num).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
+    date.getHours()
+  )}:${pad(date.getMinutes())}`
 }
 
 /**
@@ -226,11 +235,61 @@ export default function ImportHistory() {
     { title: '说明', dataIndex: 'reason', render: (value) => value || '-' }
   ]
 
+  // V2 单条播放口径（与投放管理页 / 导出保持一致）：
+  // latest 未填写 或 异常（latest < first）→ 不可用于 CPM / 后续新增
+  const recordLatestPlay = (record) => {
+    const latestRaw = record?.second_week_play
+    if (latestRaw === null || latestRaw === undefined || latestRaw === '') return null
+    const latest = Number(latestRaw)
+    if (!Number.isFinite(latest)) return null
+    const firstRaw = record?.first_play
+    if (firstRaw !== null && firstRaw !== undefined && firstRaw !== '') {
+      const first = Number(firstRaw)
+      if (Number.isFinite(first) && latest < first) return null
+    }
+    return latest
+  }
+
+  // 累计播放量：未填写显示「待更新」；异常（latest < first）保留原始数值并标红 + 悬浮提示
+  const latestPlayRender = (value, record) => {
+    if (value === null || value === undefined || value === '') {
+      return <Typography.Text type="secondary">待更新</Typography.Text>
+    }
+    const latest = Number(value)
+    const firstRaw = record?.first_play
+    const first =
+      firstRaw === null || firstRaw === undefined || firstRaw === '' ? null : Number(firstRaw)
+    if (Number.isFinite(latest) && first !== null && Number.isFinite(first) && latest < first) {
+      return (
+        <Tooltip title="累计播放量小于7日播放量">
+          <span style={{ color: '#d4380d' }}>{formatPlays(value)}</span>
+        </Tooltip>
+      )
+    }
+    return formatPlays(value)
+  }
+
+  // CPM = 总花费 ÷ 累计播放量 × 1000；最新累计待更新 / 异常 / ≤0 → -
+  const latestCpmRender = (_, record) => {
+    const latest = recordLatestPlay(record)
+    return formatCpm(latest === null ? null : calcCpm(record.total_cost, latest))
+  }
+
+  // 后续新增播放量 = 累计播放量 − 7日播放量（仅 latest 有效且 ≥ 7日播放量时展示，否则 -）
+  const post7dGrowthRender = (_, record) => {
+    const latest = recordLatestPlay(record)
+    const firstRaw = record?.first_play
+    if (latest === null || firstRaw === null || firstRaw === undefined || firstRaw === '') return '-'
+    const first = Number(firstRaw)
+    if (!Number.isFinite(first)) return '-'
+    return formatPlays(latest - first)
+  }
+
   // 详情：对应投放记录（字段与投放管理页保持一致）
   const detailRecordColumns = [
     { title: '时间周期', dataIndex: 'time_cycle', width: 120, render: (value) => weekCodeToLabel(value) },
     { title: '达人昵称', dataIndex: 'nickname', width: 130, ellipsis: true },
-    { title: '博主类型', dataIndex: 'creator_type', width: 110, ellipsis: true },
+    { title: '达人类型', dataIndex: 'creator_type', width: 110, ellipsis: true },
     {
       title: '总花费(元)',
       dataIndex: 'total_cost',
@@ -239,25 +298,32 @@ export default function ImportHistory() {
       render: (value) => formatMoney(value)
     },
     {
-      title: '首发播放',
+      title: '7日播放量',
       dataIndex: 'first_play',
-      width: 100,
+      width: 120,
       align: 'right',
       render: (value) => formatPlays(value)
     },
     {
-      title: '次周播放',
+      title: '累计播放量',
       dataIndex: 'second_week_play',
-      width: 100,
+      width: 130,
       align: 'right',
-      render: (value) => formatPlays(value)
+      render: latestPlayRender
     },
     {
-      title: 'CPM数据',
-      key: 'cpm',
+      title: 'CPM',
+      key: 'latestCpm',
       width: 100,
       align: 'right',
-      render: (_, record) => formatCpm(calcCpm(record.total_cost, record.second_week_play))
+      render: latestCpmRender
+    },
+    {
+      title: '后续新增播放量',
+      key: 'post7dGrowth',
+      width: 145,
+      align: 'right',
+      render: post7dGrowthRender
     },
     { title: '发布日期', dataIndex: 'publish_date', width: 110, render: (value) => value || '-' }
   ]
@@ -421,7 +487,7 @@ export default function ImportHistory() {
                   columns={detailRecordColumns}
                   dataSource={detail.records}
                   pagination={false}
-                  scroll={{ x: 860 }}
+                  scroll={{ x: 1200 }}
                 />
               ) : (
                 <Empty description="该批次没有成功入库的记录" style={{ padding: 24 }} />

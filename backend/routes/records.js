@@ -123,6 +123,10 @@ const INSERT_SQL = `INSERT INTO creator_records (${COLUMNS.join(', ')}) VALUES (
   () => '?'
 ).join(', ')})`
 
+// 删除投放记录时同步清理导入批次映射（import_batch_records 只做「批次 ↔ 记录」关联）
+// 目的：避免记录删除后残留指向不存在 record_id 的孤儿 mapping，让批次详情统计与记录列表保持一致
+const DELETE_RECORD_MAPPING_SQL = 'DELETE FROM import_batch_records WHERE record_id = ?'
+
 function escapeLike(text) {
   // 转义 LIKE 通配符，配合 ESCAPE '\' 使用
   return text.replace(/[\\%_]/g, (ch) => `\\${ch}`)
@@ -1856,11 +1860,17 @@ router.post('/batch-delete', (req, res) => {
   const errors = []
   let success = 0
   const remove = db.prepare('DELETE FROM creator_records WHERE id = ?')
+  const removeMapping = db.prepare(DELETE_RECORD_MAPPING_SQL)
   const runAll = db.transaction((idList) => {
     for (const id of idList) {
       const info = remove.run(id)
-      if (info.changes > 0) success += 1
-      else errors.push({ id, reason: '记录不存在或已被删除' })
+      if (info.changes > 0) {
+        success += 1
+        // 同步清理批次映射，避免删除后留下孤儿 mapping
+        removeMapping.run(id)
+      } else {
+        errors.push({ id, reason: '记录不存在或已被删除' })
+      }
     }
   })
   runAll(ids)
@@ -1932,8 +1942,14 @@ router.delete('/:id', (req, res) => {
   if (id === null) {
     return fail(res, 400, '非法的记录 ID')
   }
-  const info = db.prepare('DELETE FROM creator_records WHERE id = ?').run(id)
-  if (info.changes === 0) {
+  // 删除记录 + 同步清理其导入批次映射（同一事务，避免孤儿 mapping）
+  const deleted = db.transaction((recordId) => {
+    const info = db.prepare('DELETE FROM creator_records WHERE id = ?').run(recordId)
+    if (info.changes === 0) return 0
+    db.prepare(DELETE_RECORD_MAPPING_SQL).run(recordId)
+    return info.changes
+  })(id)
+  if (deleted === 0) {
     return fail(res, 404, '记录不存在')
   }
   ok(res, { id })

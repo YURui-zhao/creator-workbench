@@ -128,7 +128,20 @@ const PREVIEW_COLUMNS = [
   { title: '博主类型', dataIndex: 'creator_type', width: 110, ellipsis: true, render: renderCell('creator_type') },
   { title: '总花费(元)', dataIndex: 'total_cost', width: 100, align: 'right', render: renderCell('total_cost') },
   { title: '发布日期', dataIndex: 'publish_date', width: 110, render: renderCell('publish_date') },
-  { title: '次周播放量', dataIndex: 'second_week_play', width: 110, align: 'right', render: renderCell('second_week_play') }
+  {
+    title: '7日播放量',
+    dataIndex: 'first_play',
+    width: 110,
+    align: 'right',
+    render: renderCell('first_play')
+  },
+  {
+    title: '累计播放量',
+    dataIndex: 'second_week_play',
+    width: 110,
+    align: 'right',
+    render: renderCell('second_week_play')
+  }
 ]
 
 /**

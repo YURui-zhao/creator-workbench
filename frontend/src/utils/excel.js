@@ -11,16 +11,35 @@ import {
 export { labelToWeekCode, normalizeTimeCycleValue, weekCodeToLabel } from './dateCycle.js'
 
 // Excel 列名（中文）-> 数据库字段
+// V2 正式表头：达人类型 / 总花费(元) / 7日播放量 / 累计播放量 / 视频链接
+// 兼容历史表头：博主类型 / 总花费 / 首发播放量 / 次周播放量 / 视频发布链接 / 植入内容链接
+// 兼容当前导出表头：植入链接 / 视频链接 / 总花费(元)
+// 过渡表头：7日累计播放量 / 最新累计播放量
+// 注意：second_week_play 只是历史数据库字段名，V2 业务含义是「累计播放量」（不是次周新增）
 export const HEADER_MAP = {
   时间周期: 'time_cycle',
   达人昵称: 'nickname',
   达人主页: 'homepage',
+  // 博主类型（旧名）与 达人类型（V2 正式名）指向同一字段
   博主类型: 'creator_type',
+  达人类型: 'creator_type',
+  // 植入内容链接（旧名）/ 植入链接（当前导出列名）
   植入内容链接: 'content_link',
+  植入链接: 'content_link',
+  // 总花费（旧名）/ 总花费(元)（V2 正式名 & 当前导出列名）
   总花费: 'total_cost',
+  '总花费(元)': 'total_cost',
   发布日期: 'publish_date',
+  // 视频发布链接（旧名）/ 视频链接（V2 正式名 & 当前导出列名）
   视频发布链接: 'video_link',
+  视频链接: 'video_link',
+  // 7日播放量 -> first_play
+  '7日播放量': 'first_play',
+  '7日累计播放量': 'first_play',
   首发播放量: 'first_play',
+  // 累计播放量 -> second_week_play
+  累计播放量: 'second_week_play',
+  最新累计播放量: 'second_week_play',
   次周播放量: 'second_week_play'
 }
 
@@ -33,8 +52,8 @@ export const FIELD_LABELS = {
   total_cost: '总花费',
   publish_date: '发布日期',
   video_link: '视频发布链接',
-  first_play: '首发播放量',
-  second_week_play: '次周播放量'
+  first_play: '7日播放量',
+  second_week_play: '累计播放量'
 }
 
 // 字段校验规则（与后端 / 新增表单保持一致）
@@ -74,6 +93,30 @@ const EMPTY_NUMBER_TOKENS = new Set([
 
 function isEmptyNumberToken(value) {
   return EMPTY_NUMBER_TOKENS.has(String(value ?? '').trim().toLowerCase())
+}
+
+export const PLAY_RANGE_ERROR = '累计播放量不能小于7日播放量，请检查数据是否录入正确'
+
+/**
+ * 播放量跨字段校验（V2 规则）
+ * 「7日播放量(first_play)」与「累计播放量(second_week_play)」同时有值时：
+ * 累计播放量不得小于 7日播放量。
+ * - 累计播放量为空 = 待更新，合法
+ * - 7日播放量为空 = 未填写，合法
+ * - 7日播放量 = 0 且 累计播放量 > 0 = 合法
+ * @param {Object} row 已归一化的行数据
+ * @returns {{ field: string, reason: string }|null}
+ */
+export function findPlayRangeError(row = {}) {
+  const firstRaw = row.first_play
+  const latestRaw = row.second_week_play
+  if (firstRaw === undefined || firstRaw === null || firstRaw === '') return null
+  if (latestRaw === undefined || latestRaw === null || latestRaw === '') return null
+  const first = Number(firstRaw)
+  const latest = Number(latestRaw)
+  if (!Number.isFinite(first) || !Number.isFinite(latest)) return null
+  if (latest < first) return { field: 'second_week_play', reason: PLAY_RANGE_ERROR }
+  return null
 }
 
 // 导入去重判定字段（与表格展示列对应）
@@ -227,17 +270,18 @@ function normalizeCellValue(field, value) {
     if (isEmptyNumberToken(value)) {
       return spec.required ? { value: 0, error: null } : { value: undefined, error: null }
     }
-    const num = spec.type === 'int' ? parseIntCell(value) : parseNumber(value)
-    if (num === null || num < 0) {
-      // 无法解析的数值：非必填字段按 null 处理且不报错；必填字段仍提示格式错误
+    const isInt = spec.type === 'int'
+    const num = isInt ? parseIntCell(value) : parseNumber(value)
+    const intError = `${label}必须为非负整数（支持 1.2万 / 1,234 写法）`
+    const numberError = `${label}必须为非负数字（自动识别货币符号/千分位）`
+    // 播放量（非负整数）显式校验：负数、非法写法都报错，不能静默置空
+    if (num === null) {
+      if (isInt) return { value, error: intError }
       if (!spec.required) return { value: undefined, error: null }
-      return {
-        value,
-        error:
-          spec.type === 'int'
-            ? `${label}必须为非负整数（支持 x.x万 写法）`
-            : `${label}必须为非负数字（自动识别货币符号/千分位）`
-      }
+      return { value, error: numberError }
+    }
+    if (num < 0) {
+      return { value, error: isInt ? intError : numberError }
     }
     return { value: num, error: null }
   }
@@ -393,6 +437,9 @@ export async function parseRecordsExcel(file, cycles = []) {
       mapped[field] = value
       if (error) cellErrors.push({ field, reason: error })
     }
+    // 跨字段校验：累计播放量不得小于 7日播放量（V2 规则）
+    const playRangeError = findPlayRangeError(mapped)
+    if (playRangeError) cellErrors.push(playRangeError)
 
     if (cellErrors.length) {
       failedRows.push({
@@ -498,6 +545,9 @@ export function applyTimeCycleMapping(result, mapping = {}) {
       next[field] = value
       if (error) cellErrors.push({ field, reason: error })
     }
+    // 跨字段校验：累计播放量不得小于 7日播放量（V2 规则）
+    const playRangeError = findPlayRangeError(next)
+    if (playRangeError) cellErrors.push(playRangeError)
 
     if (cellErrors.length) {
       failedRows.push({

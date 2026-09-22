@@ -64,7 +64,9 @@ const DETAIL_PAGE_SIZE = 20
 // 主色 #1677ff 延伸的渐变色系
 const PALETTE = ['#1677ff', '#3d8bfd', '#5ea1ff', '#7fb6ff', '#a0cbff', '#c1dfff', '#e2f1ff']
 const OTHER_COLOR = '#bfbfbf'
-const HOT_PLAY_THRESHOLD = 100000 // 爆款：首发播放量 >= 10 万
+// 爆款阈值（与后端 HOT_PLAY_THRESHOLD 保持一致）：
+//   累计爆款 = 最新累计播放量 ≥ 10 万（latest 必须有效）；7日爆款 = 7日累计播放量 ≥ 10 万
+const HOT_PLAY_THRESHOLD = 100000
 
 /**
  * 数据看板：基于现有投放记录接口，前端计算指标与图表
@@ -76,10 +78,11 @@ export default function Dashboard() {
   const [statsLoading, setStatsLoading] = useState(false)
   const [loadError, setLoadError] = useState('')
   const [records, setRecords] = useState([])
-  // 周度聚合（后端按“发生周”统计播放量；花费/达人数按投放周统计）
+  // 周度聚合（Batch 1 新口径：latest = 最新累计播放量；first = 7日累计播放量）
   const [weekStats, setWeekStats] = useState(null)
-  // 统计口径：campaign 投放周 / occurrence 发生周（默认发生周，向下兼容）
-  const [caliber, setCaliber] = useState('occurrence')
+  // 统计口径：campaign 投放周（主口径，固定）。
+  // occurrence 发生周缺少周级快照（无法还原每周新增播放），本轮前端停用（Segmented 选项 disabled）。
+  const [caliber, setCaliber] = useState('campaign')
   const [selectedWeek, setSelectedWeek] = useState(null)
   // ---------- BI 分析状态（周范围 / 维度筛选 / 明细分页） ----------
   // 周范围：与选中周同源，startWeek === endWeek 时视为单周模式（保持原有看板表现）
@@ -174,50 +177,45 @@ export default function Dashboard() {
     loadRecords()
   }, [loadRecords])
 
-  // 周边界：投放周口径=数据中实际存在的投放周；发生周口径=最新周扩展到「有次周播放量的下一周」
+  // 投放周边界：只取数据中真实存在的投放周
+  // （不再为 occurrence 把 second>0 的周扩展到下一周，避免 W34 这类「只有播放、没有花费」的空壳周）
   const weekBounds = useMemo(() => {
-    let campaignEarliest = null
-    let campaignLatest = null
-    let occurrenceLatest = null
+    let earliestWeek = null
+    let latestWeek = null
     for (const row of records) {
       const code = row.time_cycle
       if (typeof code !== 'string' || !code) continue
-      if (!campaignEarliest || code < campaignEarliest) campaignEarliest = code
-      if (!campaignLatest || code > campaignLatest) campaignLatest = code
-      if (!occurrenceLatest || code > occurrenceLatest) occurrenceLatest = code
-      if ((Number(row.second_week_play) || 0) > 0) {
-        const nextCode = getNextWeek(code)
-        if (nextCode && (!occurrenceLatest || nextCode > occurrenceLatest)) {
-          occurrenceLatest = nextCode
-        }
-      }
+      if (!earliestWeek || code < earliestWeek) earliestWeek = code
+      if (!latestWeek || code > latestWeek) latestWeek = code
     }
-    return { campaignEarliest, campaignLatest, occurrenceLatest }
+    return { earliestWeek, latestWeek }
   }, [records])
-  const earliestWeekCode = weekBounds.campaignEarliest
-  const latestWeekCode =
-    caliber === 'campaign'
-      ? weekBounds.campaignLatest
-      : weekBounds.occurrenceLatest || weekBounds.campaignLatest
+  const earliestWeekCode = weekBounds.earliestWeek
+  const latestWeekCode = weekBounds.latestWeek
 
-  // 筛选元数据：博主类型 / 达人昵称 / 数据周范围（一次拉取，供筛选面板与周下拉初始化）
+  // 周下拉选项：按投放周范围展开（含空周）
+  useEffect(() => {
+    if (!earliestWeekCode || !latestWeekCode) {
+      setWeekOptions([])
+      return
+    }
+    const options = []
+    let cursor = earliestWeekCode
+    while (cursor && cursor <= latestWeekCode && options.length < 300) {
+      const info = buildWeekInfoFromWeekCode(cursor)
+      if (info) options.push(info)
+      cursor = getNextWeek(cursor)
+    }
+    setWeekOptions(options)
+  }, [earliestWeekCode, latestWeekCode])
+
+  // 筛选元数据：博主类型 / 达人昵称（筛选面板用；周范围由上面的投放周边界决定）
   useEffect(() => {
     let active = true
     getRecordFilters()
       .then((res) => {
         if (!active || !res?.data) return
         setFilterMeta(res.data)
-        const { earliestWeek, latestWeek } = res.data.weekRange || {}
-        if (!earliestWeek || !latestWeek) return
-        // 展开最早周到最晚周（含空周），供起止周下拉选择
-        const options = []
-        let cursor = earliestWeek
-        while (cursor && cursor <= latestWeek && options.length < 300) {
-          const info = buildWeekInfoFromWeekCode(cursor)
-          if (info) options.push(info)
-          cursor = getNextWeek(cursor)
-        }
-        setWeekOptions(options)
       })
       .catch(() => {
         // 元数据拉取失败不影响主流程（筛选面板为空）
@@ -287,60 +285,38 @@ export default function Dashboard() {
     if (info) switchToWeek(info.weekCode)
   }
 
-  // 目标周数据：精确匹配 record.time_cycle === selectedWeekCode（依赖 selectedWeekCode，切换即重算）
-  const weekRecords = useMemo(
-    () =>
-      selectedWeekCode
-        ? records.filter((row) => row.time_cycle === selectedWeekCode)
-        : [],
-    [records, selectedWeekCode]
-  )
-
-  // 顶部核心指标
+  // 顶部核心指标：单周取 weekStats（week-stats 单周 bucket），范围取 rangeData.total_summary，
+  // 两者字段完全一致；CPM / 爆款 / 样本数一律使用后端聚合结果，前端不再自行聚合
   const metrics = useMemo(() => {
-    // 范围模式：使用范围汇总 total_summary；单周模式：沿用单周聚合（口径逻辑完全一致）
-    if (rangeEnabled) {
-      const summary = rangeData?.total_summary
-      const totalPlays = summary?.total_play ?? 0
-      const totalCost = summary?.total_cost ?? 0
-      return {
-        totalPlays,
-        firstPlayTotal: summary?.first_play_total ?? 0,
-        secondPlayTotal: summary?.second_play_total ?? 0,
-        totalCost,
-        // 平均CPM 直接使用后端范围汇总（无播放量时为 null -> 显示 -）
-        avgCpm: summary?.avg_cpm ?? (totalPlays > 0 ? (totalCost / totalPlays) * 1000 : null),
-        creatorCount: summary?.creator_count ?? 0,
-        recordCount: summary?.record_count ?? 0
-      }
-    }
-    // 播放量：当周实际发生（首发 + 来自上周投放的次周播放量）
-    const totalPlays = weekStats?.total_play ?? 0
-    // 首发/次周播放拆分（接口字段：first_play_total / second_play_total）
-    const firstPlayTotal = weekStats?.first_play_total ?? 0
-    const secondPlayTotal = weekStats?.second_play_total ?? weekStats?.second_week_play_total ?? 0
-    // 花费/达人数量：仍按投放周口径
-    const totalCost = weekStats?.total_cost ?? 0
-    const creatorCount = weekStats?.creator_count ?? 0
-	// 平均CPM = 投放周总花费 / 当周总播放 × 1000；无播放量时为 null（显示 -）
-    const avgCpm = totalPlays > 0 ? (totalCost / totalPlays) * 1000 : null
+    const source = rangeEnabled ? rangeData?.total_summary : weekStats
     return {
-      totalPlays,
-      firstPlayTotal,
-      secondPlayTotal,
-      totalCost,
-      avgCpm,
-      creatorCount,
-      recordCount: weekStats?.record_count ?? 0
+      // 最新累计播放量（兼容旧字段名 total_play）
+      latestPlayTotal: source?.latest_play_total ?? source?.total_play ?? 0,
+      // 7日累计播放量
+      firstPlayTotal: source?.first_play_total ?? 0,
+      // 7日后新增播放量
+      post7dGrowthTotal: source?.post_7d_growth_total ?? 0,
+      totalCost: source?.total_cost ?? 0,
+      // 最新平均CPM / 7日CPM：直接使用后端结果；无有效样本时为 null（界面显示 -）
+      avgCpm: Number.isFinite(source?.avg_cpm) ? source.avg_cpm : null,
+      cpm7d: Number.isFinite(source?.cpm_7d) ? source.cpm_7d : null,
+      creatorCount: source?.creator_count ?? 0,
+      recordCount: source?.record_count ?? 0,
+      // 爆款：累计爆款为主指标，7日爆款为辅助
+      hitLatestCount: source?.hit_latest_count ?? 0,
+      hit7dCount: source?.hit_7d_count ?? 0,
+      // 数据完整性：有效最新累计样本 / 待更新 / 异常
+      latestSampleCount: source?.latest_sample_count ?? 0,
+      latestPendingCount: source?.latest_pending_count ?? 0,
+      anomalyCount: source?.anomaly_count ?? 0
     }
   }, [weekStats, rangeEnabled, rangeData])
 
-  const caliberLabel = caliber === 'campaign' ? '投放周口径' : '发生周口径'
-  // 口径说明（hover 提示文案，随口径开关变化）
+  const caliberLabel = '投放周口径'
+  // 口径说明（hover 提示文案）
   const playCaliberTip =
-    caliber === 'campaign'
-      ? '投放周口径：统计当周投放记录的首发播放量 + 次周播放量（次周也计入投放当周）'
-      : '发生周口径：按播放实际发生的周统计（当周投放的首发 + 上周投放的次周播放量）'
+    '投放周口径：按投放记录归属周统计。最新累计播放量（latest）与 7日累计播放量（first）都归投放周；' +
+    '总花费 / 投放达人数量按投放记录统计'
 
   // ---------- BI：周范围、快捷选择、筛选、导出 ----------
   const weekOptionValues = weekOptions.map((item) => item.weekCode)
@@ -449,6 +425,38 @@ export default function Dashboard() {
     setDetailPage(1)
   }, [detailRecords.length])
 
+  // 单条记录的最新累计口径：latest 已填写且不违反 latest >= first 时才可信
+  const recordLatestPlay = (record) => {
+    const latestRaw = record?.second_week_play
+    if (latestRaw === null || latestRaw === undefined || latestRaw === '') return null
+    const latest = Number(latestRaw)
+    if (!Number.isFinite(latest)) return null
+    const firstRaw = record?.first_play
+    if (firstRaw !== null && firstRaw !== undefined && firstRaw !== '') {
+      const first = Number(firstRaw)
+      // latest < first 属于异常数据，不可信（不参与累计爆款 / 最新CPM / 7日后新增）
+      if (Number.isFinite(first) && latest < first) return null
+    }
+    return latest
+  }
+
+  // 最新CPM（单条）= 花费 ÷ 最新累计播放量 × 1000；latest 缺失 / 异常 / 为 0 → 显示 -
+  const recordLatestCpm = (record) => {
+    const latest = recordLatestPlay(record)
+    if (latest === null) return null
+    return calcCpm(record?.total_cost, latest)
+  }
+
+  // 7日后新增播放量 = 最新累计播放量 − 7日累计播放量（仅两者都有且 latest >= first 时展示，否则 -）
+  const recordPost7dGrowth = (record) => {
+    const latest = recordLatestPlay(record)
+    const firstRaw = record?.first_play
+    if (latest === null || firstRaw === null || firstRaw === undefined || firstRaw === '') return null
+    const first = Number(firstRaw)
+    if (!Number.isFinite(first)) return null
+    return latest - first
+  }
+
   // 范围模式：把各周 creators 合并成一条达人播放量列表（与范围汇总同口径）
   const pieSource = useMemo(() => {
     if (!rangeEnabled) return weekStats?.creators || []
@@ -478,21 +486,29 @@ export default function Dashboard() {
     return [...top, { name: '其他', value: rest, itemStyle: { color: OTHER_COLOR } }]
   }, [pieSource])
 
-  // 榜单/柱图作用域：范围模式用范围内记录，单周模式用当周记录
-  const scopeRecords = rangeEnabled ? detailRecords : weekRecords
-
-  // 柱状图：爆款类型分布（首发播放量 >= 10 万，按条数降序）
+  // 爆款类型分布：使用与页面其它区域完全相同的「当前筛选后记录」（detailRecords 已应用
+  // 周范围 + 博主类型 + 达人昵称），确保筛选口径一致。
+  // 主系列 = 累计爆款：有效 latest ≥ 阈值（latest 为空 → 不计入；latest < first 的异常 → 不计入）
+  // 辅助系列 = 7日爆款：first 有效且 ≥ 阈值（first = 0 是有效观察，但不是爆款）
   const barData = useMemo(() => {
     const map = new Map()
-    for (const row of scopeRecords) {
-      if ((Number(row.first_play) || 0) < HOT_PLAY_THRESHOLD) continue
+    for (const row of detailRecords) {
+      const latest = recordLatestPlay(row)
+      const firstRaw = row?.first_play
+      const first = firstRaw === null || firstRaw === undefined || firstRaw === '' ? null : Number(firstRaw)
+      const hitLatest = latest !== null && latest >= HOT_PLAY_THRESHOLD
+      const hit7d = first !== null && Number.isFinite(first) && first >= HOT_PLAY_THRESHOLD
+      if (!hitLatest && !hit7d) continue
       const type = String(row.creator_type || '').trim() || '未分类'
-      map.set(type, (map.get(type) || 0) + 1)
+      const entry = map.get(type) || { hitLatest: 0, hit7d: 0 }
+      if (hitLatest) entry.hitLatest += 1
+      if (hit7d) entry.hit7d += 1
+      map.set(type, entry)
     }
     return [...map.entries()]
-      .map(([name, value]) => ({ name, value }))
-      .sort((a, b) => b.value - a.value)
-  }, [scopeRecords])
+      .map(([name, value]) => ({ name, ...value }))
+      .sort((a, b) => b.hitLatest - a.hitLatest || b.hit7d - a.hit7d)
+  }, [detailRecords])
 
   // 图表配置（数据变化时重新生成）
   const pieOption = useMemo(
@@ -506,7 +522,7 @@ export default function Dashboard() {
       legend: { orient: 'vertical', right: 0, top: 'center' },
       series: [
         {
-          name: '首发播放量',
+          name: '最新累计播放量',
           type: 'pie',
           radius: ['45%', '70%'],
           center: ['38%', '50%'],
@@ -528,7 +544,8 @@ export default function Dashboard() {
         axisPointer: { type: 'shadow' },
         valueFormatter: (value) => `${formatInteger(value)} 条`
       },
-      grid: { left: 12, right: 24, top: 32, bottom: 8, containLabel: true },
+      legend: { data: ['累计爆款', '7日爆款'], top: 0 },
+      grid: { left: 12, right: 24, top: 40, bottom: 8, containLabel: true },
       xAxis: {
         type: 'category',
         data: barData.map((item) => item.name),
@@ -537,18 +554,26 @@ export default function Dashboard() {
       yAxis: { type: 'value', minInterval: 1 },
       series: [
         {
-          name: '爆款条数',
+          name: '累计爆款',
           type: 'bar',
-          data: barData.map((item) => item.value),
+          data: barData.map((item) => item.hitLatest),
           itemStyle: { color: '#1677ff', borderRadius: [4, 4, 0, 0] },
-          barMaxWidth: 36
+          barMaxWidth: 28
+        },
+        {
+          name: '7日爆款',
+          type: 'bar',
+          data: barData.map((item) => item.hit7d),
+          itemStyle: { color: '#91caff', borderRadius: [4, 4, 0, 0] },
+          barMaxWidth: 28
         }
       ]
     }),
     [barData]
   )
 
-  // 周度趋势：三条折线（总花费左轴 / 总播放量(万) 与 平均CPM 右轴），空周补零无断点
+  // 周度趋势（投放周口径）：总花费（左轴）/ 最新累计播放量(万) 与 最新平均CPM（右轴）
+  // 含义：各投放周投出去的内容，截至目前（最新采集）的累计表现——不是「该自然周实际产生多少播放」
   const trendWeeks = rangeData?.weeks || []
   const trendOption = useMemo(
     () => ({
@@ -557,18 +582,20 @@ export default function Dashboard() {
         formatter: (params) => {
           const week = trendWeeks[params[0]?.dataIndex ?? 0]
           if (!week) return ''
-          const cpm = week.total_play > 0 ? (week.total_cost / week.total_play) * 1000 : null
           return [
             `${week.weekCode}`,
             `总花费：${formatMoney(week.total_cost)} 元`,
-            `总播放量：${formatPlays(week.total_play)}`,
-            `平均CPM：${formatCpm(cpm)}`,
-            `首发：${formatPlays(week.first_play_total)}　次周：${formatPlays(week.second_play_total)}`,
-            `投放达人：${formatInteger(week.creator_count)} 人`
+            `最新累计播放量：${formatPlays(week.latest_play_total ?? week.total_play)}`,
+            `最新平均CPM：${formatCpm(week.avg_cpm)}`,
+            `7日累计播放量：${formatPlays(week.first_play_total)}　7日CPM：${formatCpm(week.cpm_7d)}`,
+            `7日后新增播放量：${formatPlays(week.post_7d_growth_total)}`,
+            `投放达人：${formatInteger(week.creator_count)} 人　投放次数：${formatInteger(
+              week.record_count
+            )}`
           ].join('<br/>')
         }
       },
-      legend: { data: ['总花费(元)', '总播放量(万)', '平均CPM(元)'], top: 0 },
+      legend: { data: ['总花费(元)', '最新累计播放量(万)', '最新平均CPM(元)'], top: 0 },
       grid: { left: 12, right: 24, top: 44, bottom: 8, containLabel: true },
       xAxis: {
         type: 'category',
@@ -589,29 +616,31 @@ export default function Dashboard() {
           data: trendWeeks.map((week) => Number(week.total_cost) || 0)
         },
         {
-          name: '总播放量(万)',
+          name: '最新累计播放量(万)',
           type: 'line',
           smooth: true,
           yAxisIndex: 1,
           itemStyle: { color: '#1677ff' },
-          data: trendWeeks.map((week) => Number(((Number(week.total_play) || 0) / 10000).toFixed(2)))
+          data: trendWeeks.map((week) => {
+            const play = week.latest_play_total ?? week.total_play
+            return Number.isFinite(play) ? Number((play / 10000).toFixed(2)) : null
+          })
         },
         {
-          name: '平均CPM(元)',
+          name: '最新平均CPM(元)',
           type: 'line',
           smooth: true,
           yAxisIndex: 1,
           itemStyle: { color: '#52c41a' },
-          data: trendWeeks.map((week) =>
-            week.total_play > 0 ? Number(((week.total_cost / week.total_play) * 1000).toFixed(2)) : 0
-          )
+          // 直接用后端 avg_cpm（无有效 latest 样本时为 null → 图上留空断点，不再画成 0）
+          data: trendWeeks.map((week) => (Number.isFinite(week.avg_cpm) ? week.avg_cpm : null))
         }
       ]
     }),
     [trendWeeks]
   )
 
-  // 明细列表列（与投放管理页保持一致）
+  // 明细列表列
   const detailColumns = [
     {
       title: '时间周期',
@@ -632,25 +661,32 @@ export default function Dashboard() {
       render: (value) => formatMoney(value)
     },
     {
-      title: '首发播放',
+      title: '7日累计播放量',
       dataIndex: 'first_play',
-      width: 100,
+      width: 130,
       align: 'right',
       render: (value) => formatPlays(value)
     },
     {
-      title: '次周播放',
+      title: '最新累计播放量',
       dataIndex: 'second_week_play',
-      width: 100,
+      width: 130,
       align: 'right',
       render: (value) => formatPlays(value)
     },
     {
-      title: 'CPM数据',
-      key: 'cpm',
-      width: 100,
+      title: '最新CPM',
+      key: 'latestCpm',
+      width: 105,
       align: 'right',
-      render: (_, record) => formatCpm(calcCpm(record.total_cost, record.second_week_play))
+      render: (_, record) => formatCpm(recordLatestCpm(record))
+    },
+    {
+      title: '7日后新增播放量',
+      key: 'post7dGrowth',
+      width: 145,
+      align: 'right',
+      render: (_, record) => formatPlays(recordPost7dGrowth(record))
     },
     { title: '发布日期', dataIndex: 'publish_date', width: 110, render: (value) => value || '-' }
   ]
@@ -686,7 +722,6 @@ export default function Dashboard() {
   }, [
     loading,
     statsLoading,
-    scopeRecords.length,
     pieData,
     pieOption,
     barData,
@@ -738,6 +773,8 @@ export default function Dashboard() {
   }
   const playSplitLabelStyle = { fontSize: 12 }
   const playSplitValueStyle = { fontSize: 18, lineHeight: '24px', fontWeight: 500 }
+  // 数据完整性提示（小号辅助文案）
+  const metricFootnoteStyle = { fontSize: 12, lineHeight: '18px', color: 'rgba(0, 0, 0, 0.45)' }
 
   return (
     <div>
@@ -755,13 +792,23 @@ export default function Dashboard() {
               }}
             >
               <Space size={16} wrap>
-                {/* 统计口径切换：默认发生周口径；切换不改变当前选中的周 */}
+                {/* 统计口径：投放周口径（主口径，固定）；发生周口径待周级快照，本轮停用 */}
                 <Segmented
                   value={caliber}
-                  onChange={(value) => setCaliber(value)}
+                  onChange={(value) => {
+                    if (value === 'campaign') setCaliber(value)
+                  }}
                   options={[
                     { label: '投放周口径', value: 'campaign' },
-                    { label: '发生周口径', value: 'occurrence' }
+                    {
+                      label: (
+                        <Tooltip title="当前仅保存 7日累计与最新累计，无法准确还原每周新增播放；后续接入周级快照后恢复。">
+                          <span>发生周口径（待周级快照）</span>
+                        </Tooltip>
+                      ),
+                      value: 'occurrence',
+                      disabled: true
+                    }
                   ]}
                 />
                 {/* 快捷范围：近 4 周 / 近 8 周 / 全部 */}
@@ -977,7 +1024,7 @@ export default function Dashboard() {
             {/* 顶部核心指标行：桌面端一行四张（lg 7+5+5+7=24），左右稍宽、中间稍窄，四张等高 */}
             <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
               <Col xs={24} sm={12} lg={7}>
-                {/* 播放量卡：主指标 + 卡内 secondary（当周首发 / 当周次周），不再另挂两张独立 Card */}
+                {/* 播放量卡：主指标最新累计播放量 + 卡内 secondary（7日累计 / 7日后新增） */}
                 <Card style={metricCardStyle} styles={{ body: metricCardBodyStyle }}>
                   {loading || statsLoading ? (
                     <Skeleton active paragraph={{ rows: 3 }} />
@@ -988,38 +1035,32 @@ export default function Dashboard() {
                           <span>
                             {playCaliberTip}
                             <br />
-                            首发 {formatPlays(metrics.firstPlayTotal)} + 次周{' '}
-                            {formatPlays(metrics.secondPlayTotal)} = 合计{' '}
-                            {formatPlays(metrics.totalPlays)}
+                            最新累计播放量 = 该周投放记录的最新累计播放量之和（不再使用 7日累计 + 最新累计）
                           </span>
                         }
                       >
                         <Statistic
-                          title={`本周总播放量（${caliberLabel}）`}
-                          value={metrics.totalPlays}
+                          title={`最新累计播放量（${caliberLabel}）`}
+                          value={metrics.latestPlayTotal}
                           formatter={(value) => formatPlays(value)}
                           valueStyle={metricValueStyle}
                         />
                       </Tooltip>
-                      {/* 播放量拆分：当周首发 / 当周次周（接口字段 first_play_total / second_play_total） */}
+                      {/* secondary：7日累计播放量 / 7日后新增播放量（均为后端聚合值） */}
                       <div style={playSplitStyle}>
-                        <Tooltip title={`${playCaliberTip}（首发部分）`}>
+                        <Tooltip title="7日累计播放量：内容发布约 7 天时的累计播放量（对应 first_play）之和">
                           <Statistic
-                            title={<span style={playSplitLabelStyle}>当周首发播放量</span>}
-                            value={metrics.firstPlayTotal > 0 ? formatPlays(metrics.firstPlayTotal) : '-'}
+                            title={<span style={playSplitLabelStyle}>7日累计播放量</span>}
+                            value={formatPlays(metrics.firstPlayTotal)}
                             valueStyle={playSplitValueStyle}
                           />
                         </Tooltip>
                         <Tooltip
-                          title={
-                            caliber === 'campaign'
-                              ? '投放周口径：当周投放记录的次周播放量（计入投放当周）'
-                              : '发生周口径：来自上周投放、在本周产生的次周播放量'
-                          }
+                          title="7日后新增播放量 = 最新累计播放量 − 7日累计播放量（仅统计 latest 有效且 latest ≥ 7日累计的记录）"
                         >
                           <Statistic
-                            title={<span style={playSplitLabelStyle}>当周次周播放量</span>}
-                            value={metrics.secondPlayTotal > 0 ? formatPlays(metrics.secondPlayTotal) : '-'}
+                            title={<span style={playSplitLabelStyle}>7日后新增播放量</span>}
+                            value={formatPlays(metrics.post7dGrowthTotal)}
                             valueStyle={playSplitValueStyle}
                           />
                         </Tooltip>
@@ -1033,9 +1074,9 @@ export default function Dashboard() {
                   {loading || statsLoading ? (
                     <Skeleton active paragraph={{ rows: 1 }} />
                   ) : (
-                    <Tooltip title="投放周口径：按投放记录归属周汇总总花费，不随播放量口径开关变化">
+                    <Tooltip title="总花费：所选投放周范围内全部投放记录的花费之和（按投放记录归属周统计）">
                       <Statistic
-                        title="本周总花销"
+                        title="总花费"
                         value={metrics.totalCost}
                         formatter={(value) => formatMoney(value)}
                         suffix="元"
@@ -1048,17 +1089,59 @@ export default function Dashboard() {
               <Col xs={24} sm={12} lg={5}>
                 <Card style={metricCardStyle} styles={{ body: metricCardBodyStyle }}>
                   {loading || statsLoading ? (
-                    <Skeleton active paragraph={{ rows: 1 }} />
+                    <Skeleton active paragraph={{ rows: 3 }} />
                   ) : (
-                    <Tooltip
-                      title={`平均CPM = 总花费（投放周口径）÷ 当周总播放量（${caliberLabel}）× 1000；无播放量时显示 -`}
-                    >
-                      <Statistic
-                        title="本周平均CPM"
-                        value={formatCpm(metrics.avgCpm)}
-                        valueStyle={metricValueStyle}
-                      />
-                    </Tooltip>
+                    <>
+                      <Tooltip
+                        title={
+                          <span>
+                            最新平均CPM = 有有效最新累计播放记录的花费 ÷ 这些记录的最新累计播放量 × 1000
+                            <br />
+                            最新累计待更新 / 异常（latest &lt; 7日累计）/ 播放为 0 时不参与；无有效样本显示 -
+                          </span>
+                        }
+                      >
+                        <Statistic
+                          title="最新平均CPM"
+                          value={formatCpm(metrics.avgCpm)}
+                          valueStyle={metricValueStyle}
+                        />
+                      </Tooltip>
+                      {/* secondary：7日CPM + 最新累计数据完整性提示 */}
+                      <div style={playSplitStyle}>
+                        <Tooltip title="7日CPM = 有 7日累计数据记录的花费 ÷ 这些记录的 7日累计播放量 × 1000（7日累计为 0 时显示 -）">
+                          <Statistic
+                            title={<span style={playSplitLabelStyle}>7日CPM</span>}
+                            value={formatCpm(metrics.cpm7d)}
+                            valueStyle={playSplitValueStyle}
+                          />
+                        </Tooltip>
+                        <Tooltip title="最新累计数据完整性：已更新 = 有有效最新累计播放的记录数；待更新 = 尚未填写（null/空）；异常 = 最新累计 < 7日累计">
+                          <div style={{ alignSelf: 'center' }}>
+                            <div>
+                              <Typography.Text style={metricFootnoteStyle}>
+                                最新数据已更新 {formatInteger(metrics.latestSampleCount)} /{' '}
+                                {formatInteger(metrics.recordCount)}
+                              </Typography.Text>
+                            </div>
+                            {metrics.latestPendingCount > 0 && (
+                              <div>
+                                <Typography.Text style={metricFootnoteStyle}>
+                                  待更新 {formatInteger(metrics.latestPendingCount)} 条
+                                </Typography.Text>
+                              </div>
+                            )}
+                            {metrics.anomalyCount > 0 && (
+                              <div>
+                                <Typography.Text style={{ ...metricFootnoteStyle, color: '#d4380d' }}>
+                                  异常数据 {formatInteger(metrics.anomalyCount)} 条
+                                </Typography.Text>
+                              </div>
+                            )}
+                          </div>
+                        </Tooltip>
+                      </div>
+                    </>
                   )}
                 </Card>
               </Col>
@@ -1068,7 +1151,7 @@ export default function Dashboard() {
                   {loading || statsLoading ? (
                     <Skeleton active paragraph={{ rows: 1 }} />
                   ) : (
-                    <Tooltip title="投放周口径：按投放记录归属周对达人昵称去重，不随播放量口径开关变化">
+                    <Tooltip title="投放达人数量：所选投放周范围内有投放记录的达人昵称去重数量（不是发生播放达人数量）">
                       <Statistic
                         title="投放达人数量"
                         value={formatInteger(metrics.creatorCount)}
@@ -1084,12 +1167,16 @@ export default function Dashboard() {
             {/* 下方双列图表区 */}
             <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
               <Col xs={24} md={12}>
-                <Card title={`达人播放量占比（${caliberLabel}）`}>
+                <Card title="达人最新累计播放量占比">
                   {loading ? (
                     <Skeleton active paragraph={{ rows: 8 }} />
                   ) : pieData.length === 0 ? (
                     <Empty
-                      description={rangeEnabled ? '所选范围无播放量数据' : '该周无播放量数据'}
+                      description={
+                        rangeEnabled
+                          ? '所选范围暂无有效最新累计播放量'
+                          : '该周暂无有效最新累计播放量'
+                      }
                       style={{ padding: 40 }}
                     />
                   ) : (
@@ -1098,16 +1185,14 @@ export default function Dashboard() {
                 </Card>
               </Col>
               <Col xs={24} md={12}>
-                <Card title="爆款类型分布（投放周口径）">
+                <Card title="爆款类型分布（累计爆款 / 7日爆款）">
                   {loading ? (
                     <Skeleton active paragraph={{ rows: 8 }} />
-                  ) : scopeRecords.length === 0 ? (
+                  ) : barData.length === 0 ? (
                     <Empty
-                      description={rangeEnabled ? '所选范围暂无投放数据' : '该周暂无投放数据'}
+                      description="暂无爆款记录（最新累计播放量 ≥ 10 万）"
                       style={{ padding: 40 }}
                     />
-                  ) : barData.length === 0 ? (
-                    <Empty description="暂无爆款记录（首发播放量≥10万）" style={{ padding: 40 }} />
                   ) : (
                     <div ref={barRef} style={{ width: '100%', height: 360 }} />
                   )}
@@ -1120,10 +1205,12 @@ export default function Dashboard() {
               <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
                 <Col span={24}>
                   <Card
-                    title={`周度趋势（${caliberLabel}${activeFilterCount ? ' · 已筛选' : ''}）`}
+                    title={`周度趋势（投放周口径 · 最新累计表现${
+                      activeFilterCount ? ' · 已筛选' : ''
+                    }）`}
                     extra={
                       <Typography.Text type="secondary">
-                        近 {trendWeeks.length} 周 · 空数据周自动补零
+                        近 {trendWeeks.length} 周 · 每点为「该投放周投出去的内容截至目前的最新累计表现」
                       </Typography.Text>
                     }
                   >
@@ -1168,7 +1255,7 @@ export default function Dashboard() {
                       showSizeChanger: false,
                       showTotal: (total) => `共 ${total} 条`
                     }}
-                    scroll={{ x: 900 }}
+                    scroll={{ x: 1180 }}
                   />
                 </Card>
               </Col>

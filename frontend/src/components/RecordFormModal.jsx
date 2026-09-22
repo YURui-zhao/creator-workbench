@@ -178,8 +178,8 @@ export default function RecordFormModal({ open, editingRecord, onCancel, onSucce
           <Col span={12}>
             <Form.Item
               name="first_play"
-              label="7日累计播放量"
-              extra="内容发布约 7 天时记录的累计播放量"
+              label="7日播放量"
+              extra="内容发布约7天时记录的累计播放量"
               rules={[{ type: 'number', min: 0, message: '播放量不能为负数' }]}
             >
               <InputNumber min={0} precision={0} style={{ width: '100%' }} placeholder="0" />
@@ -188,8 +188,8 @@ export default function RecordFormModal({ open, editingRecord, onCancel, onSucce
           <Col span={12}>
             <Form.Item
               name="second_week_play"
-              label="最新累计播放量"
-              extra="最近一次更新时的累计播放量，可在后续继续更新；留空表示待更新"
+              label="累计播放量"
+              extra="最近一次更新时的累计播放量，可后续继续更新；留空表示待更新"
               dependencies={['first_play']}
               rules={[
                 { type: 'number', min: 0, message: '播放量不能为负数' },
@@ -208,7 +208,7 @@ export default function RecordFormModal({ open, editingRecord, onCancel, onSucce
                     // 产品规则：最新累计播放量不得小于 7日累计播放量
                     if (Number.isFinite(latest) && Number.isFinite(first) && latest < first) {
                       return Promise.reject(
-                        new Error('最新累计播放量不能小于7日累计播放量，请检查数据是否录入正确。')
+                        new Error('累计播放量不能小于7日播放量，请检查数据是否录入正确。')
                       )
                     }
                     return Promise.resolve()

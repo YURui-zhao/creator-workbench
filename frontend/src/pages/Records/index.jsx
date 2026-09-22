@@ -443,7 +443,7 @@ export default function Records() {
       firstRaw === null || firstRaw === undefined || firstRaw === '' ? null : Number(firstRaw)
     if (Number.isFinite(latest) && first !== null && Number.isFinite(first) && latest < first) {
       return (
-        <Tooltip title="最新累计播放量小于7日累计播放量">
+        <Tooltip title="累计播放量小于7日播放量">
           <span style={{ color: '#d4380d' }}>{formatPlays(value)}</span>
         </Tooltip>
       )
@@ -514,28 +514,28 @@ export default function Records() {
       render: formatMoney
     },
     {
-      title: '最新CPM',
+      title: 'CPM',
       key: 'latestCpm',
       width: 110,
       align: 'right',
       render: cpmRender
     },
     {
-      title: '7日累计播放量',
+      title: '7日播放量',
       dataIndex: 'first_play',
       width: 130,
       align: 'right',
       render: formatPlays
     },
     {
-      title: '最新累计播放量',
+      title: '累计播放量',
       dataIndex: 'second_week_play',
       width: 130,
       align: 'right',
       render: latestPlayRender
     },
     {
-      title: '7日后新增播放量',
+      title: '后续新增播放量',
       key: 'post7dGrowth',
       width: 150,
       align: 'right',

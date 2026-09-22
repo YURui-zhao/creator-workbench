@@ -61,7 +61,8 @@ export default function CreatorSummary() {
   const [rangeStart, setRangeStart] = useState(null)
   const [rangeEnd, setRangeEnd] = useState(null)
   const [filterTypes, setFilterTypes] = useState([])
-  const [caliber, setCaliber] = useState('occurrence')
+  // 统计口径：campaign 投放周（主口径，固定）。occurrence 缺周级快照，本轮前端停用（Segmented 选项 disabled）
+  const [caliber, setCaliber] = useState('campaign')
   // 新增筛选：达人昵称（防抖 500ms）+ 最小投放次数
   const [keywordInput, setKeywordInput] = useState('')
   const [keyword, setKeyword] = useState('')
@@ -77,7 +78,7 @@ export default function CreatorSummary() {
   const [detailLoading, setDetailLoading] = useState(false)
   const [allRecords, setAllRecords] = useState([])
 
-  const caliberLabel = caliber === 'campaign' ? '投放周口径' : '发生周口径'
+  const caliberLabel = caliber === 'campaign' ? '按投放周' : '按发生周'
 
   // 筛选元数据 + 全量记录（用于下钻明细与周下拉）
   const loadBaseData = useCallback(async () => {
@@ -265,18 +266,18 @@ export default function CreatorSummary() {
       render: (value) => formatMoney(value)
     },
     {
-      title: '总播放',
-      dataIndex: 'total_play',
-      width: 120,
+      title: '累计播放量',
+      dataIndex: 'latest_play_total',
+      width: 135,
       align: 'right',
       sorter: true,
-      sortOrder: sortOrderOf('total_play'),
-      render: (value) => formatPlays(value)
+      sortOrder: sortOrderOf('latest_play_total'),
+      render: (value, record) => formatPlays(value ?? record?.total_play ?? 0)
     },
     {
       title: '平均CPM',
       dataIndex: 'avg_cpm',
-      width: 110,
+      width: 120,
       align: 'right',
       sorter: true,
       sortOrder: sortOrderOf('avg_cpm'),
@@ -284,18 +285,33 @@ export default function CreatorSummary() {
     },
     {
       title: '爆款数',
-      dataIndex: 'hit_count',
-      width: 100,
+      dataIndex: 'hit_latest_count',
+      width: 115,
       align: 'right',
       sorter: true,
-      sortOrder: sortOrderOf('hit_count'),
-      render: (value) =>
-        Number(value) >= 1 ? <Tag color="volcano">{formatInteger(value)}</Tag> : formatInteger(value)
+      sortOrder: sortOrderOf('hit_latest_count'),
+      render: (value, record) => {
+        const hits = value ?? record?.hit_count ?? 0
+        return Number(hits) >= 1 ? (
+          <Tag color="volcano">{formatInteger(hits)}</Tag>
+        ) : (
+          formatInteger(hits)
+        )
+      }
     },
     {
-      title: '平均单条播放',
+      title: '爆款率',
+      dataIndex: 'hit_rate_latest',
+      width: 115,
+      align: 'right',
+      sorter: true,
+      sortOrder: sortOrderOf('hit_rate_latest'),
+      render: (value, record) => formatPercent(value ?? record?.hit_rate)
+    },
+    {
+      title: '平均播放量',
       dataIndex: 'avg_play',
-      width: 130,
+      width: 165,
       align: 'right',
       sorter: true,
       sortOrder: sortOrderOf('avg_play'),
@@ -318,7 +334,8 @@ export default function CreatorSummary() {
     {
       title: '操作',
       key: 'action',
-      width: 110,
+      width: 130,
+      fixed: 'right',
       render: (_, record) => (
         <Button size="small" type="link" onClick={() => openCreatorDrawer(record)}>
           查看明细
@@ -326,6 +343,56 @@ export default function CreatorSummary() {
       )
     }
   ]
+
+  // 单条记录的最新累计口径：latest 已填写且不违反 latest >= first 时才可信
+  const recordLatestPlay = (record) => {
+    const latestRaw = record?.second_week_play
+    if (latestRaw === null || latestRaw === undefined || latestRaw === '') return null
+    const latest = Number(latestRaw)
+    if (!Number.isFinite(latest)) return null
+    const firstRaw = record?.first_play
+    if (firstRaw !== null && firstRaw !== undefined && firstRaw !== '') {
+      const first = Number(firstRaw)
+      // latest < first 属于异常数据，不可信
+      if (Number.isFinite(first) && latest < first) return null
+    }
+    return latest
+  }
+
+  // 最新累计播放量：未填写显示「待更新」；异常（latest < first）保留原始数值并标红 + 悬浮提示
+  const latestPlayRender = (value, record) => {
+    if (value === null || value === undefined || value === '') {
+      return <Typography.Text type="secondary">待更新</Typography.Text>
+    }
+    const latest = Number(value)
+    const firstRaw = record?.first_play
+    const first =
+      firstRaw === null || firstRaw === undefined || firstRaw === '' ? null : Number(firstRaw)
+    if (Number.isFinite(latest) && first !== null && Number.isFinite(first) && latest < first) {
+      return (
+        <Tooltip title="累计播放量小于7日播放量">
+          <span style={{ color: '#d4380d' }}>{formatPlays(value)}</span>
+        </Tooltip>
+      )
+    }
+    return formatPlays(value)
+  }
+
+  // 最新CPM = 总花费 ÷ 最新累计播放量 × 1000；latest 待更新 / 异常 / ≤ 0 → -
+  const latestCpmRender = (_, record) => {
+    const latest = recordLatestPlay(record)
+    return formatCpm(latest === null ? null : calcCpm(record.total_cost, latest))
+  }
+
+  // 7日后新增播放量 = 最新累计播放量 − 7日累计播放量（仅 latest 有效且 ≥ 7日累计时展示，否则 -）
+  const post7dGrowthRender = (_, record) => {
+    const latest = recordLatestPlay(record)
+    const firstRaw = record?.first_play
+    if (latest === null || firstRaw === null || firstRaw === undefined || firstRaw === '') return '-'
+    const first = Number(firstRaw)
+    if (!Number.isFinite(first)) return '-'
+    return formatPlays(latest - first)
+  }
 
   // 抽屉明细列（与投放管理保持一致）
   const detailColumns = [
@@ -348,79 +415,142 @@ export default function CreatorSummary() {
       render: (value) => formatMoney(value)
     },
     {
-      title: '首发播放',
+      title: '7日播放量',
       dataIndex: 'first_play',
-      width: 100,
+      width: 130,
       align: 'right',
       render: (value) => formatPlays(value)
     },
     {
-      title: '次周播放',
+      title: '累计播放量',
       dataIndex: 'second_week_play',
-      width: 100,
+      width: 130,
       align: 'right',
-      render: (value) => formatPlays(value)
+      render: latestPlayRender
     },
     {
-      title: 'CPM数据',
-      key: 'cpm',
-      width: 100,
+      title: 'CPM',
+      key: 'latestCpm',
+      width: 105,
       align: 'right',
-      render: (_, record) => formatCpm(calcCpm(record.total_cost, record.second_week_play))
+      render: latestCpmRender
+    },
+    {
+      title: '后续新增播放量',
+      key: 'post7dGrowth',
+      width: 145,
+      align: 'right',
+      render: post7dGrowthRender
     },
     { title: '发布日期', dataIndex: 'publish_date', width: 110, render: (value) => value || '-' }
   ]
 
-  // ---------- 顶部指标卡片（仅布局/样式：数值格式、tooltip 文案、loading 逻辑保持不变） ----------
+  // 百分比格式化：null / undefined → -
+  const formatPercent = (value) =>
+    value === null || value === undefined ? '-' : `${value}%`
+  // 数据完整性提示（小号辅助文案；在卡片定义前声明，供 metricCards 内联使用）
+  const metricFootnoteStyle = { fontSize: 11, lineHeight: '16px', color: 'rgba(0, 0, 0, 0.45)' }
+
+  // ---------- 顶部指标卡片（新口径：最新累计为主，7日累计/7日爆款为辅助） ----------
   const metricCards = [
     {
       key: 'creators',
-      title: '总达人数',
+      title: '达人数',
       value: formatInteger(totalSummary?.creator_count ?? 0),
-      suffix: '人'
+      suffix: '人',
+      tooltip: '所选范围内有投放记录的达人昵称去重数量'
     },
     {
       key: 'campaigns',
-      title: '总投放次数',
+      title: '投放次数',
       value: formatInteger(totalSummary?.total_campaigns ?? 0),
-      suffix: '次'
+      suffix: '次',
+      tooltip: '所选范围内全部投放记录条数（不因「播放数据待更新」而减少）'
     },
     {
       key: 'cost',
       title: '总花费',
       value: formatMoney(totalSummary?.total_cost ?? 0),
       suffix: '元',
-      tooltip: '投放周口径：按投放记录归属周汇总总花费，不随口径切换'
+      tooltip: '总花费：按投放记录归属周汇总，不随口径切换'
     },
     {
       key: 'play',
-      title: '总播放',
-      value: formatPlays(totalSummary?.total_play ?? 0),
-      tooltip: `${caliberLabel}：当周首发 + ${
-        caliber === 'campaign' ? '当周投放的次周' : '上周投放的次周'
-      }`
+      title: '累计播放量',
+      value: formatPlays(totalSummary?.latest_play_total ?? totalSummary?.total_play ?? 0),
+      tooltip: '按各条内容最近一次更新的累计播放量汇总',
+      secondary: [
+        {
+          label: '7日播放量',
+          value: formatPlays(totalSummary?.first_play_total ?? 0),
+          tooltip: '内容发布约7天时记录的累计播放量'
+        },
+        {
+          label: '后续新增播放量',
+          value: formatPlays(totalSummary?.post_7d_growth_total ?? 0),
+          tooltip: '当前累计播放量减去7日播放量'
+        }
+      ]
     },
     {
       key: 'cpm',
       title: '平均CPM',
       value: formatCpm(totalSummary?.avg_cpm),
-      tooltip: '整体平均CPM = 总花费 ÷ 总播放 × 1000；无播放量显示 -'
+      tooltip: '基于已有有效累计播放数据计算的平均CPM',
+      secondary: [
+        {
+          label: '7日CPM',
+          value: formatCpm(totalSummary?.cpm_7d),
+          tooltip: '基于内容发布约7天时的播放数据计算'
+        }
+      ],
+      footnote: (
+        <Space size={6} wrap style={{ justifyContent: 'center' }}>
+          <Typography.Text type="secondary" style={metricFootnoteStyle}>
+            播放数据已更新 {formatInteger(totalSummary?.latest_sample_count ?? 0)} /{' '}
+            {formatInteger(totalSummary?.record_count ?? 0)}
+          </Typography.Text>
+          {(totalSummary?.latest_pending_count ?? 0) > 0 && (
+            <Typography.Text type="secondary" style={metricFootnoteStyle}>
+              待更新 {formatInteger(totalSummary?.latest_pending_count)} 条
+            </Typography.Text>
+          )}
+          {(totalSummary?.anomaly_count ?? 0) > 0 && (
+            <Typography.Text style={{ ...metricFootnoteStyle, color: '#d4380d' }}>
+              异常数据 {formatInteger(totalSummary?.anomaly_count)} 条
+            </Typography.Text>
+          )}
+        </Space>
+      )
     },
     {
       key: 'hits',
-      title: '爆款总数',
-      value: formatInteger(totalSummary?.total_hits ?? 0),
+      title: '爆款数',
+      value: formatInteger(
+        totalSummary?.hit_latest_count ?? totalSummary?.total_hits ?? totalSummary?.hit_count ?? 0
+      ),
       suffix: '条',
-      tooltip: '爆款口径：范围内首发播放量 ≥ 10 万的投放记录条数（不随口径切换）'
+      tooltip: '当前累计播放量达到爆款阈值的投放数量',
+      secondary: [
+        {
+          label: '7日爆款数',
+          value: `${formatInteger(totalSummary?.hit_7d_count ?? 0)} 条`,
+          tooltip: '用于衡量内容前7天的起量能力'
+        }
+      ]
     },
     {
       key: 'hitRate',
       title: '爆款率',
-      value:
-        totalSummary?.hit_rate === null || totalSummary?.hit_rate === undefined
-          ? '-'
-          : `${totalSummary.hit_rate}%`,
-      tooltip: '爆款率 = 爆款总数 ÷ 记录总数 × 100%；无记录显示 -'
+      value: formatPercent(totalSummary?.hit_rate_latest ?? totalSummary?.hit_rate),
+      tooltip: '爆款数 ÷ 已有有效累计播放数据的投放数',
+      secondary: [
+        {
+          label: '7日爆款率',
+          value: formatPercent(totalSummary?.hit_rate_7d),
+          tooltip: '用于衡量内容前7天的起量能力'
+        }
+      ]
     }
   ]
   // 卡片标题：13px 灰色小字在上 + 水平居中 + 收紧行高，超长省略，避免撑高卡片
@@ -442,7 +572,25 @@ export default function CreatorSummary() {
   }
   // 卡片标题/数值：Statistic 根节点撑满栅格单元并整体居中（仅作用于这 7 张卡片，不影响其他 Statistic）
   const metricStatisticStyle = { width: '100%', textAlign: 'center' }
-  // 卡片内容：内边距 12px 16px + 标题/数值水平居中 + 垂直居中 + 撑满卡片高度（同一行卡片高度一致）
+  // secondary 区（7日指标）：浅灰分隔线 + 居中排版；单条时占满整行
+  const metricSecondaryStyle = {
+    borderTop: '1px solid #f0f0f0',
+    marginTop: 8,
+    paddingTop: 8,
+    width: '100%',
+    display: 'grid',
+    columnGap: 8
+  }
+  const metricSecondaryLabelStyle = {
+    fontSize: 11,
+    lineHeight: '16px',
+    color: 'rgba(0, 0, 0, 0.45)',
+    whiteSpace: 'nowrap',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis'
+  }
+  const metricSecondaryValueStyle = { fontSize: 13, lineHeight: '20px', fontWeight: 500 }
+  // 卡片内容：内边距 12px 16px + 标题/数值水平居中 + 撑满卡片高度（同一行卡片高度一致）
   const metricCardBodyStyle = {
     padding: '12px 16px',
     display: 'flex',
@@ -477,10 +625,20 @@ export default function CreatorSummary() {
           <Space size={16} wrap>
             <Segmented
               value={caliber}
-              onChange={setCaliber}
+              onChange={(value) => {
+                if (value === 'campaign') setCaliber(value)
+              }}
               options={[
-                { label: '投放周口径', value: 'campaign' },
-                { label: '发生周口径', value: 'occurrence' }
+                { label: '按投放周', value: 'campaign' },
+                {
+                  label: (
+                    <Tooltip title="当前没有逐周播放快照，暂时无法准确统计每周新增播放；后续接入周级数据后开放。">
+                      <span>按发生周（暂未开放）</span>
+                    </Tooltip>
+                  ),
+                  value: 'occurrence',
+                  disabled: true
+                }
               ]}
             />
             <Space size={8} wrap>
@@ -620,8 +778,8 @@ export default function CreatorSummary() {
           marginTop: 16
         }}
       >
-        {metricCards.map((item) => {
-          const card = (
+        {metricCards.map((item) => (
+          <div key={item.key} style={metricCardWrapStyle}>
             <Card
               size="small"
               style={{
@@ -636,28 +794,41 @@ export default function CreatorSummary() {
               {loading ? (
                 <Skeleton active paragraph={{ rows: 1 }} style={{ width: '100%' }} />
               ) : (
-                <Statistic
-                  title={<span style={metricTitleStyle}>{item.title}</span>}
-                  value={item.value}
-                  suffix={item.suffix ? <span style={{ fontSize: 12 }}>{item.suffix}</span> : undefined}
-                  style={metricStatisticStyle}
-                  valueStyle={metricValueStyle}
-                />
+                <>
+                  <Tooltip title={item.tooltip}>
+                    <Statistic
+                      title={<span style={metricTitleStyle}>{item.title}</span>}
+                      value={item.value}
+                      suffix={item.suffix ? <span style={{ fontSize: 12 }}>{item.suffix}</span> : undefined}
+                      style={metricStatisticStyle}
+                      valueStyle={metricValueStyle}
+                    />
+                  </Tooltip>
+                  {item.secondary?.length ? (
+                    <div
+                      style={{
+                        ...metricSecondaryStyle,
+                        gridTemplateColumns: item.secondary.length > 1 ? '1fr 1fr' : '1fr'
+                      }}
+                    >
+                      {item.secondary.map((sub) => (
+                        <Tooltip key={sub.label} title={sub.tooltip}>
+                          <div style={{ minWidth: 0, textAlign: 'center' }}>
+                            <div style={metricSecondaryLabelStyle}>{sub.label}</div>
+                            <div style={metricSecondaryValueStyle}>{sub.value}</div>
+                          </div>
+                        </Tooltip>
+                      ))}
+                    </div>
+                  ) : null}
+                  {item.footnote ? (
+                    <div style={{ marginTop: 6, width: '100%' }}>{item.footnote}</div>
+                  ) : null}
+                </>
               )}
             </Card>
-          )
-          return (
-            <div key={item.key} style={metricCardWrapStyle}>
-              {item.tooltip ? (
-                <Tooltip title={item.tooltip}>
-                  <div style={{ width: '100%', height: '100%' }}>{card}</div>
-                </Tooltip>
-              ) : (
-                card
-              )}
-            </div>
-          )
-        })}
+          </div>
+        ))}
       </div>
 
       {/* 按博主类型分组的达人汇总 */}
@@ -680,8 +851,11 @@ export default function CreatorSummary() {
                 <Typography.Text strong>{group.creator_type}</Typography.Text>
                 <Tag color="blue">{formatInteger(group.creator_count)} 位达人</Tag>
                 <Tag>花费 {formatMoney(group.total_cost)} 元</Tag>
-                <Tag>播放 {formatPlays(group.total_play)}</Tag>
-                <Tag color="green">CPM {formatCpm(group.avg_cpm)}</Tag>
+                <Tag>累计播放 {formatPlays(group.latest_play_total ?? group.total_play)}</Tag>
+                <Tag color="green">平均CPM {formatCpm(group.avg_cpm)}</Tag>
+                <Tag color="volcano">
+                  爆款 {formatInteger(group.hit_latest_count ?? group.total_hits ?? 0)}
+                </Tag>
                 <Tag>投放 {formatInteger(group.total_campaigns)} 次</Tag>
               </Space>
             ),
@@ -699,7 +873,7 @@ export default function CreatorSummary() {
                   onChange: (keys) => setCompareKeys(keys),
                   columnWidth: 46
                 }}
-                scroll={{ x: 1080 }}
+                scroll={{ x: 1400 }}
               />
             )
           }))}
@@ -728,7 +902,7 @@ export default function CreatorSummary() {
             columns={detailColumns}
             dataSource={detailRecords}
             pagination={{ pageSize: 20, showSizeChanger: false }}
-            scroll={{ x: 800 }}
+            scroll={{ x: 1230 }}
           />
         </Space>
       </Drawer>
@@ -770,7 +944,7 @@ export default function CreatorSummary() {
               rowKey="nickname"
               dataSource={compareRows}
               pagination={false}
-              scroll={{ x: 900 }}
+              scroll={{ x: 1180 }}
               columns={[
                 { title: '达人昵称', dataIndex: 'nickname', width: 140, fixed: 'left' },
                 { title: '博主类型', dataIndex: 'creator_type', width: 110 },
@@ -789,31 +963,44 @@ export default function CreatorSummary() {
                   render: (value) => formatMoney(value)
                 },
                 {
-                  title: '总播放',
-                  dataIndex: 'total_play',
-                  width: 110,
+                  title: '累计播放量',
+                  dataIndex: 'latest_play_total',
+                  width: 135,
                   align: 'right',
-                  render: (value) => formatPlays(value)
+                  render: (value, record) => formatPlays(value ?? record?.total_play ?? 0)
                 },
                 {
                   title: '平均CPM',
                   dataIndex: 'avg_cpm',
-                  width: 100,
+                  width: 120,
                   align: 'right',
                   render: (value) => formatCpm(value)
                 },
                 {
                   title: '爆款数',
-                  dataIndex: 'hit_count',
-                  width: 90,
+                  dataIndex: 'hit_latest_count',
+                  width: 115,
                   align: 'right',
-                  render: (value) =>
-                    Number(value) >= 1 ? <Tag color="volcano">{formatInteger(value)}</Tag> : formatInteger(value)
+                  render: (value, record) => {
+                    const hits = value ?? record?.hit_count ?? 0
+                    return Number(hits) >= 1 ? (
+                      <Tag color="volcano">{formatInteger(hits)}</Tag>
+                    ) : (
+                      formatInteger(hits)
+                    )
+                  }
                 },
                 {
-                  title: '平均单条播放',
+                  title: '爆款率',
+                  dataIndex: 'hit_rate_latest',
+                  width: 115,
+                  align: 'right',
+                  render: (value, record) => formatPercent(value ?? record?.hit_rate)
+                },
+                {
+                  title: '平均播放量',
                   dataIndex: 'avg_play',
-                  width: 130,
+                  width: 165,
                   align: 'right',
                   render: (value) => formatPlays(value)
                 },

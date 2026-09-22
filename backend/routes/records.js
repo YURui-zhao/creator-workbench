@@ -1469,17 +1469,19 @@ router.get('/filters', (req, res) => {
 })
 
 // ---------- 明细导出（复用后端 xlsx 工具，筛选参数与周度聚合保持一致） ----------
+// 记录明细导出表头（V2 术语，与前端 utils/excel.js 的 EXPORT_COLUMNS 保持一致）
 const EXPORT_HEADERS = [
   '时间周期',
   '达人昵称',
-  '博主类型',
+  '达人类型',
   '达人主页',
   '植入链接',
   '视频链接',
   '总花费(元)',
-  'CPM数据',
-  '首发播放量',
-  '次周播放量',
+  'CPM',
+  '7日播放量',
+  '累计播放量',
+  '后续新增播放量',
   '发布日期'
 ]
 
@@ -1522,27 +1524,45 @@ router.get('/export', (req, res) => {
       sortBy: exportSortBy,
       sortOrder: exportSortOrder
     })
+    // 达人汇总导出（V2 术语，与前端 exportCreatorStatsToExcel 列名/口径保持一致）
     const summaryHeaders = [
-      '博主类型',
       '达人昵称',
+      '达人类型',
       '投放次数',
-      '总花费(元)',
-      '总播放',
+      '总花费',
+      '累计播放量',
+      '平均播放量',
       '平均CPM',
       '爆款数',
-      '平均单条播放',
-      '复投次数'
+      '爆款率',
+      '复投次数',
+      '7日播放量',
+      '后续新增播放量',
+      '7日CPM',
+      '7日爆款数',
+      '7日爆款率'
     ]
+    const cpmCell = (value) =>
+      value === null || value === undefined ? '' : Number(Number(value).toFixed(2))
+    const rateCell = (value) => (value === null || value === undefined ? '' : `${value}%`)
+    const emptyCell = (value) => (value === null || value === undefined ? '' : value)
     const summaryRows = summary.creators.map((item) => [
-      item.creator_type || '未分类',
       item.nickname,
+      item.creator_type || '未分类',
       item.total_campaigns,
       item.total_cost.toFixed(2),
-      item.total_play,
-      item.avg_cpm === null ? '-' : item.avg_cpm.toFixed(2),
-      item.hit_count,
-      item.avg_play === null ? '-' : item.avg_play.toFixed(1),
-      item.repeat_count
+      item.latest_play_total ?? item.total_play ?? 0,
+      emptyCell(item.avg_play),
+      cpmCell(item.avg_cpm),
+      item.hit_latest_count ?? item.hit_count ?? 0,
+      rateCell(item.hit_rate_latest),
+      item.repeat_count,
+      // 达人级字段名为 first_play_sum（summary 层才叫 first_play_total），两者都兼容
+      item.first_play_sum ?? item.first_play_total ?? 0,
+      item.post_7d_growth_total ?? 0,
+      cpmCell(item.cpm_7d),
+      item.hit_7d_count ?? 0,
+      rateCell(item.hit_rate_7d)
     ])
     const summaryContent = buildXlsx('达人汇总', summaryHeaders, summaryRows)
     const summaryFileName = `达人汇总_${startWeek || summary.range.startWeek || '全部'}_${
@@ -1563,9 +1583,13 @@ router.get('/export', (req, res) => {
 
   const data = rows.map((row) => {
     const info = getCycleInfo(row.time_cycle)
-    const cost = Number(row.total_cost) || 0
-    const secondPlay = Number(row.second_week_play) || 0
-    const cpm = secondPlay > 0 ? ((cost / secondPlay) * 1000).toFixed(2) : '-'
+    // V2 单条口径：latest 未填写 / 异常（latest < first）→ 不参与 CPM 与后续新增
+    const metrics = computePlayMetrics(row)
+    const cost = metrics.cost
+    const cpm =
+      metrics.hasLatest && !metrics.latestAnomaly && metrics.latest > 0
+        ? Number(((cost / metrics.latest) * 1000).toFixed(2))
+        : ''
     return [
       info ? info.label : row.time_cycle,
       row.nickname || '',
@@ -1575,8 +1599,11 @@ router.get('/export', (req, res) => {
       row.video_link || '',
       cost.toFixed(2),
       cpm,
-      Number(row.first_play) || 0,
-      secondPlay,
+      // 0 是真实观察值：保留 0；未填写导出空单元格
+      metrics.hasFirst ? metrics.first : '',
+      // 异常数据仍导出原始累计播放量（不静默丢值），CPM / 后续新增为空
+      metrics.hasLatest ? metrics.latest : '',
+      metrics.post7dGrowth !== null ? metrics.post7dGrowth : '',
       row.publish_date || ''
     ]
   })

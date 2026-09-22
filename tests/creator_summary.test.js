@@ -281,15 +281,36 @@ async function main() {
   const sheetRows = xlsx.utils.sheet_to_json(workbook.Sheets['达人明细'], { defval: '' })
   check('导出行数与所选达人一致', exported === 3 && sheetRows.length === 3, `exported=${exported} rows=${sheetRows.length}`)
   check(
-    '导出表头包含新增三列',
-    ['爆款数', '平均单条播放', '复投次数'].every((key) => key in sheetRows[0]),
+    '导出表头为 V2 术语（累计播放量 / 平均播放量 / 爆款数 / 爆款率 / 复投次数 + 7日辅助列）',
+    [
+      '达人昵称',
+      '达人类型',
+      '投放次数',
+      '总花费',
+      '累计播放量',
+      '平均播放量',
+      '平均CPM',
+      '爆款数',
+      '爆款率',
+      '复投次数',
+      '7日播放量',
+      '后续新增播放量',
+      '7日CPM',
+      '7日爆款数',
+      '7日爆款率'
+    ].every((key) => key in sheetRows[0]),
     Object.keys(sheetRows[0]).join('|')
   )
   check(
-    '导出数值与接口一致',
+    '导出数值与接口一致（累计播放量 / 爆款数 / 平均CPM）',
     String(sheetRows[0]['达人昵称']) === compareRows[0].nickname &&
-      Number(sheetRows[0]['爆款数']) === compareRows[0].hit_count &&
-      String(sheetRows[0]['平均CPM']) === compareRows[0].avg_cpm.toFixed(2),
+      Number(sheetRows[0]['累计播放量']) ===
+        Number(compareRows[0].latest_play_total ?? compareRows[0].total_play ?? 0) &&
+      Number(sheetRows[0]['7日播放量']) ===
+        Number(compareRows[0].first_play_sum ?? compareRows[0].first_play_total ?? 0) &&
+      Number(sheetRows[0]['爆款数']) ===
+        Number(compareRows[0].hit_latest_count ?? compareRows[0].hit_count ?? 0) &&
+      Number(sheetRows[0]['平均CPM']) === Number(Number(compareRows[0].avg_cpm).toFixed(2)),
     JSON.stringify(sheetRows[0])
   )
   fs.unlinkSync(outFile)

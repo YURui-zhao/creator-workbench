@@ -572,17 +572,51 @@ export function applyTimeCycleMapping(result, mapping = {}) {
 }
 
 // ---------- 导出 ----------
+// V2 单条播放口径（与 Records 页面 / 导入校验保持一致）：
+// latest 未填写 或 异常（latest < first）→ null；0 是有效真实值
+function recordLatestPlay(row = {}) {
+  const latestRaw = row?.second_week_play
+  if (latestRaw === undefined || latestRaw === null || latestRaw === '') return null
+  const latest = Number(latestRaw)
+  if (!Number.isFinite(latest)) return null
+  const firstRaw = row?.first_play
+  if (firstRaw !== undefined && firstRaw !== null && firstRaw !== '') {
+    const first = Number(firstRaw)
+    if (Number.isFinite(first) && latest < first) return null
+  }
+  return latest
+}
+
+// 后续新增播放量 = 累计播放量 − 7日播放量（仅两者都有值且 latest >= first 时有值）
+function recordPost7dGrowth(row = {}) {
+  const latest = recordLatestPlay(row)
+  const firstRaw = row?.first_play
+  if (latest === null || firstRaw === undefined || firstRaw === null || firstRaw === '') return null
+  const first = Number(firstRaw)
+  if (!Number.isFinite(first)) return null
+  return latest - first
+}
+
+// 空值（null / undefined / ''）导出为空单元格；0 必须是数字 0
+function toOptionalNumber(value) {
+  if (value === undefined || value === null || value === '') return ''
+  const num = Number(value)
+  return Number.isFinite(num) ? num : ''
+}
+
 const EXPORT_COLUMNS = [
   ['时间周期', 'time_cycle'],
   ['达人昵称', 'nickname'],
-  ['博主类型', 'creator_type'],
+  ['达人类型', 'creator_type'],
   ['达人主页', 'homepage'],
   ['植入链接', 'content_link'],
   ['视频链接', 'video_link'],
   ['总花费(元)', 'total_cost'],
-  ['CPM数据', 'cpm'],
-  ['首发播放量', 'first_play'],
-  ['次周播放量', 'second_week_play'],
+  ['CPM', 'cpm'],
+  ['7日播放量', 'first_play'],
+  ['累计播放量', 'second_week_play'],
+  // 计算列（导入时可忽略）
+  ['后续新增播放量', 'post7dGrowth'],
   ['发布日期', 'publish_date']
 ]
 
@@ -615,7 +649,10 @@ function applyColumnWidths(worksheet, rows) {
  */
 export function exportRecordsToExcel(rows, fileName) {
   const data = rows.map((row) => {
-    const cpm = calcCpm(row.total_cost, row.second_week_play)
+    // V2：CPM 使用最新累计口径；latest 未更新 / 异常 / ≤0 → 空
+    const latest = recordLatestPlay(row)
+    const cpm = latest === null ? null : calcCpm(row.total_cost, latest)
+    const growth = recordPost7dGrowth(row)
     const item = {}
     for (const [zhHeader, field] of EXPORT_COLUMNS) {
       let value = row[field]
@@ -623,9 +660,15 @@ export function exportRecordsToExcel(rows, fileName) {
         // 导出：时间周期显示为月日区间（08/13-08/19）
         value = weekCodeToLabel(value)
       } else if (field === 'total_cost') {
-        value = value === undefined || value === null ? '' : Number(value).toFixed(2)
+        value = value === undefined || value === null || value === '' ? '' : Number(value).toFixed(2)
       } else if (field === 'cpm') {
-        value = cpm === null ? '-' : cpm.toFixed(2)
+        // 计算列：无有效累计播放时导出为空（不是 0，也不是 -）
+        value = cpm === null ? '' : Number(cpm.toFixed(2))
+      } else if (field === 'post7dGrowth') {
+        value = growth === null ? '' : growth
+      } else if (field === 'first_play' || field === 'second_week_play') {
+        // 0 必须导出为数字 0；空值导出空单元格
+        value = toOptionalNumber(value)
       }
       item[zhHeader] = value === undefined || value === null ? '' : value
     }
@@ -673,33 +716,59 @@ export function exportCreatorStatsToExcel(creators = [], options = {}) {
   const list = Array.isArray(creators) ? creators : []
   const fileName = options.fileName || buildCreatorSummaryFileName()
   const sheetName = options.sheetName || '达人汇总'
+  // V2 术语与列顺序：核心指标在前，7日辅助指标在后
+  // 数值全部直接取后端聚合字段，导出层不做任何重算
+  const CREATOR_EXPORT_HEADERS = [
+    '达人昵称',
+    '达人类型',
+    '投放次数',
+    '总花费',
+    '累计播放量',
+    '平均播放量',
+    '平均CPM',
+    '爆款数',
+    '爆款率',
+    '复投次数',
+    '7日播放量',
+    '后续新增播放量',
+    '7日CPM',
+    '7日爆款数',
+    '7日爆款率'
+  ]
+  const cpmCell = (value) =>
+    value === null || value === undefined ? '' : Number((Number(value) || 0).toFixed(2))
+  const rateCell = (value) => (value === null || value === undefined ? '' : `${value}%`)
   const data = list.map((item) => ({
-    博主类型: item.creator_type || '未分类',
     达人昵称: item.nickname || '未命名达人',
+    达人类型: item.creator_type || '未分类',
     投放次数: Number(item.total_campaigns) || 0,
     总花费: (Number(item.total_cost) || 0).toFixed(2),
-    总播放: Number(item.total_play) || 0,
-    平均CPM: item.avg_cpm === null || item.avg_cpm === undefined ? '-' : Number(item.avg_cpm).toFixed(2),
-    爆款数: Number(item.hit_count) || 0,
-    平均单条播放:
-      item.avg_play === null || item.avg_play === undefined ? '-' : Number(item.avg_play).toFixed(1),
-    复投次数: Number(item.repeat_count) || 0
+    // 累计播放量 = Σ有效最新累计播放（后端字段优先，兼容旧字段名 total_play）
+    累计播放量: Number(item.latest_play_total ?? item.total_play ?? 0),
+    平均播放量: toOptionalNumber(item.avg_play),
+    平均CPM: cpmCell(item.avg_cpm),
+    爆款数: Number(item.hit_latest_count ?? item.hit_count ?? 0),
+    爆款率: rateCell(item.hit_rate_latest),
+    复投次数: Number(item.repeat_count) || 0,
+    // 达人级字段名为 first_play_sum（summary 层才叫 first_play_total），两者都兼容
+    '7日播放量': Number(item.first_play_sum ?? item.first_play_total ?? 0),
+    后续新增播放量: Number(item.post_7d_growth_total ?? 0),
+    '7日CPM': cpmCell(item.cpm_7d),
+    '7日爆款数': Number(item.hit_7d_count ?? 0),
+    '7日爆款率': rateCell(item.hit_rate_7d)
   }))
-  const sheetRows = data.length ? data : [{
-    博主类型: '',
-    达人昵称: '',
-    投放次数: '',
-    总花费: '',
-    总播放: '',
-    平均CPM: '',
-    爆款数: '',
-    平均单条播放: '',
-    复投次数: '暂无数据'
-  }]
+  const sheetRows = data.length
+    ? data
+    : [
+        Object.fromEntries(
+          CREATOR_EXPORT_HEADERS.map((key, index) => [
+            key,
+            index === CREATOR_EXPORT_HEADERS.length - 1 ? '暂无数据' : ''
+          ])
+        )
+      ]
 
-  const worksheet = XLSX.utils.json_to_sheet(sheetRows, {
-    header: ['博主类型', '达人昵称', '投放次数', '总花费', '总播放', '平均CPM', '爆款数', '平均单条播放', '复投次数']
-  })
+  const worksheet = XLSX.utils.json_to_sheet(sheetRows, { header: CREATOR_EXPORT_HEADERS })
   applyColumnWidths(worksheet, sheetRows)
   const workbook = XLSX.utils.book_new()
   XLSX.utils.book_append_sheet(workbook, worksheet, sheetName)

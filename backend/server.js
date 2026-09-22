@@ -1,0 +1,79 @@
+import express from 'express'
+import cors from 'cors'
+import dotenv from 'dotenv'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import db from './db.js'
+import aiRouter from './routes/ai.js'
+import cyclesRouter from './routes/cycles.js'
+import importBatchesRouter from './routes/importBatches.js'
+import recordsRouter from './routes/records.js'
+import projectsRouter from './routes/projects.js'
+import statsRouter from './routes/stats.js'
+import { isDeepSeekConfigured } from './services/deepseek.js'
+
+// 加载 backend/.env（与启动目录无关）
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+dotenv.config({ path: path.join(__dirname, '.env') })
+
+// 启动时校验 AI 配置（未配置不阻塞启动，AI 功能自动降级）
+if (isDeepSeekConfigured()) {
+  console.log('[ai] DeepSeek API Key 已配置，AI 智能校验可用')
+} else {
+  console.warn('[ai] 未配置 DEEPSEEK_API_KEY，AI 智能校验将降级为普通导入（不影响基础功能）')
+}
+
+const app = express()
+const PORT = process.env.PORT || 3001
+
+// 跨域：开发环境放开所有来源
+app.use(cors())
+
+// 请求体大小限制：支持批量导入/批量 AI 校验数据
+app.use(express.json({ limit: '5mb' }))
+
+// 健康检查
+app.get('/api/health', (req, res) => {
+  let dbOk = false
+  try {
+    db.prepare('SELECT 1 AS ok').get()
+    dbOk = true
+  } catch {
+    dbOk = false
+  }
+  res.json({
+    status: dbOk ? 'ok' : 'error',
+    db: dbOk ? 'ok' : 'error',
+    time: new Date().toISOString(),
+    port: PORT
+  })
+})
+
+// 业务路由
+app.use('/api/ai', aiRouter)
+app.use('/api/cycles', cyclesRouter)
+app.use('/api/import', importBatchesRouter)
+app.use('/api/records', recordsRouter)
+app.use('/api/projects', projectsRouter)
+app.use('/api/stats', statsRouter)
+
+// 404
+app.use((req, res) => {
+  res.status(404).json({ code: 404, data: null, msg: '接口不存在', message: '接口不存在' })
+})
+
+// 统一错误处理
+app.use((err, req, res, next) => {
+  console.error('[backend] 未捕获异常:', err)
+  res.status(500).json({ code: 500, data: null, msg: '服务器内部错误', message: '服务器内部错误' })
+})
+
+app.listen(PORT, () => {
+  console.log(`[backend] 服务已启动: http://localhost:${PORT}`)
+})
+
+// 优雅退出时关闭数据库
+process.on('SIGINT', () => {
+  db.close()
+  process.exit(0)
+})

@@ -376,9 +376,191 @@ function queryDetailRows(filters = {}) {
  * @param {Array<Object>} rows 投放记录（已按筛选条件过滤）
  * @returns {{ campaignMap: Map, occurrenceMap: Map }}
  */
+// ---------- 播放口径核心（产品已冻结的新定义；纯函数，便于单测） ----------
+//   first_play       = 7日累计播放量（内容发布约 7 天时的累计值，不是「首周新增」）
+//   second_week_play = 最新累计播放量（最近一次更新时的累计总播放，不限于第 2 周）
+//   latest_play      = second_week_play
+//   post_7d_growth   = second_week_play - first_play（仅当 latest 有值且 latest >= first）
+//   latest_cpm       = cost / latest_play × 1000（主 CPM）
+//   cpm_7d           = cost / first_play  × 1000（first 无有效值时返回 null）
+// 注意：total_play 不再是 first_play + second_week_play —— 两个字段都是累计值，相加会重复计数。
+export const HOT_PLAY_THRESHOLD = 100000 // 爆款阈值（沿用现有系统阈值，本轮不改）
+
+// null / undefined / '' 表示「未填写/待更新」；0 是真实记录值。两者不可混为一谈。
+function toOptionalPlayNumber(value) {
+  if (value === undefined || value === null) return null
+  if (typeof value === 'string' && value.trim() === '') return null
+  const num = Number(value)
+  return Number.isFinite(num) ? num : null
+}
+
+function round2(value) {
+  return Number(value.toFixed(2))
+}
+
+function round1(value) {
+  return Number(value.toFixed(1))
+}
+
+/**
+ * 解析单条记录的播放口径
+ * @param {Object} row 记录（含 total_cost / first_play / second_week_play）
+ */
+export function computePlayMetrics(row = {}) {
+  const cost = Number(row.total_cost) || 0
+  const first = toOptionalPlayNumber(row.first_play)
+  const latest = toOptionalPlayNumber(row.second_week_play)
+  const hasFirst = first !== null
+  const hasLatest = latest !== null
+  // latest < first 属于异常历史数据：不产生负增长，只计入 anomaly
+  const latestAnomaly = hasFirst && hasLatest && latest < first
+  const post7dGrowth = hasFirst && hasLatest && !latestAnomaly ? latest - first : null
+  return {
+    cost,
+    first,
+    latest,
+    hasFirst,
+    hasLatest,
+    firstPositive: hasFirst && first > 0,
+    post7dGrowth,
+    latestAnomaly
+  }
+}
+
+/** 播放口径累计器（周 / 范围 / 达人三级共用） */
+export function createPlayAccumulator() {
+  return {
+    total_cost: 0, // 全部记录花费
+    record_count: 0, // 全部记录数（真实投放次数，不因 latest 缺失而减少）
+    creatorSet: new Set(),
+    creatorPlay: new Map(), // 达人 -> Σ有效 latest（播放占比图使用最新累计口径）
+    first_play_total: 0, // Σ 7日累计
+    latest_play_total: 0, // Σ 有效 latest
+    post_7d_growth_total: 0, // Σ 有效(latest - first)
+    first_sample_count: 0, // 有有效 first（含 0）的记录数 → 7日爆款率分母 / 7日CPM 样本
+    first_positive_sample_count: 0, // first > 0 的记录数（仅统计参考，不参与分子口径）
+    // 有效 latest 样本：latest 已填写 **且 latest >= first**（latest < first 视为异常、不可信，不计入）
+    latest_sample_count: 0,
+    // 7日CPM 分子：只要 first_play 是「已填写」的有效观察值（含 0）就计入其花费
+    // （0 是真实表现，不是缺失；缺失 = null/undefined/空字符串，其花费不进分子）
+    first_valid_cost: 0,
+    latest_valid_cost: 0, // 有有效 latest 的记录花费 → 最新平均CPM 分子
+    hit_7d_count: 0, // 7日爆款：first >= 阈值
+    hit_latest_count: 0, // 累计爆款：latest >= 阈值（仅有效 latest 样本）
+    anomaly_count: 0 // latest < first 的异常记录数（不参与任何 latest 指标）
+  }
+}
+
+/** 把一条记录的播放口径累加进累计器 */
+export function accumulatePlay(acc, metrics, nickname = '') {
+  const name = String(nickname || '').trim()
+  acc.total_cost += metrics.cost
+  acc.record_count += 1
+  if (name) acc.creatorSet.add(name)
+
+  if (metrics.hasFirst) {
+    acc.first_play_total += metrics.first
+    acc.first_sample_count += 1
+    // first_play 已填写（含 0）即视为有效观察值：其花费进入 7日CPM 分子
+    acc.first_valid_cost += metrics.cost
+    if (metrics.first > 0) acc.first_positive_sample_count += 1
+    if (metrics.first >= HOT_PLAY_THRESHOLD) acc.hit_7d_count += 1
+  }
+
+  // latest 只有「已填写且 latest >= first」才算有效观察值。
+  // latest < first 判定为异常、不可信：不参与 total_play / avg_cpm / 累计爆款 / 7日后新增 / 播放占比，
+  // 但仍然参与 total_cost / 投放次数 / 达人数 / 7日累计 / 7日CPM / 7日爆款等不依赖 latest 的指标。
+  const latestUsable = metrics.hasLatest && !metrics.latestAnomaly
+  if (latestUsable) {
+    acc.latest_play_total += metrics.latest
+    acc.latest_sample_count += 1
+    acc.latest_valid_cost += metrics.cost
+    if (metrics.latest >= HOT_PLAY_THRESHOLD) acc.hit_latest_count += 1
+    if (name && metrics.latest > 0) {
+      acc.creatorPlay.set(name, (acc.creatorPlay.get(name) || 0) + metrics.latest)
+    }
+  }
+
+  if (metrics.post7dGrowth !== null) acc.post_7d_growth_total += metrics.post7dGrowth
+  if (metrics.latestAnomaly) acc.anomaly_count += 1
+  return acc
+}
+
+/**
+ * 累计器 → 对外汇总字段
+ * - total_play 采用「最新累计播放量」口径（Σ有效 latest）
+ * - 分子只统计与分母同一样本的记录花费，避免把「最新累计待更新」记录的花费算进 CPM
+ * - 无有效样本时 CPM / 爆款率返回 null，绝不返回 0 / NaN / Infinity
+ */
+export function finalizePlayAccumulator(acc) {
+  const avgCpm =
+    acc.latest_play_total > 0 ? round2((acc.latest_valid_cost / acc.latest_play_total) * 1000) : null
+  // 7日CPM：分母 = Σ所有「已填写」first_play（含 0）；分子 = 这些记录的花费（含 first=0 的记录）
+  // Σfirst = 0（全部观察值都是 0）时返回 null，不返回 Infinity / 0
+  const cpm7d =
+    acc.first_play_total > 0 ? round2((acc.first_valid_cost / acc.first_play_total) * 1000) : null
+  const hitRateLatest =
+    acc.latest_sample_count > 0
+      ? round1((acc.hit_latest_count / acc.latest_sample_count) * 100)
+      : null
+  const hitRate7d =
+    acc.first_sample_count > 0 ? round1((acc.hit_7d_count / acc.first_sample_count) * 100) : null
+
+  return {
+    total_cost: round2(acc.total_cost),
+    record_count: acc.record_count,
+    creator_count: acc.creatorSet.size,
+    total_play: acc.latest_play_total,
+    latest_play_total: acc.latest_play_total,
+    first_play_total: acc.first_play_total,
+    post_7d_growth_total: acc.post_7d_growth_total,
+    avg_cpm: avgCpm,
+    cpm_7d: cpm7d,
+    hit_7d_count: acc.hit_7d_count,
+    hit_latest_count: acc.hit_latest_count,
+    // 兼容旧字段：hit_count / hit_rate 暂时等于「累计爆款 / 累计爆款率」（主爆款）
+    hit_count: acc.hit_latest_count,
+    hit_rate_latest: hitRateLatest,
+    hit_rate_7d: hitRate7d,
+    hit_rate: hitRateLatest,
+    first_sample_count: acc.first_sample_count,
+    first_positive_sample_count: acc.first_positive_sample_count,
+    latest_sample_count: acc.latest_sample_count,
+    // 最新累计「待更新」投放数（null / undefined / 空字符串）；
+    // 异常记录（latest < first）单独计入 anomaly_count，不算「待更新」
+    latest_pending_count: acc.record_count - acc.latest_sample_count - acc.anomaly_count,
+    anomaly_count: acc.anomaly_count
+  }
+}
+
+/** 一组记录的播放口径汇总（纯函数，供单测与聚合复用） */
+export function summarizePlayRecords(rows = []) {
+  const acc = createPlayAccumulator()
+  for (const row of rows) {
+    accumulatePlay(acc, computePlayMetrics(row), row?.nickname)
+  }
+  return finalizePlayAccumulator(acc)
+}
+
+/**
+ * 按周聚合播放量/花费，同时产出两套口径：
+ * - campaign（投放周，主口径）：按新定义聚合，latest 归投放周
+ * - occurrence（发生周）：**保持旧的迁移实现**（把 second_week_play 当作「下一周新增」）
+ *
+ * TODO(occurrence): 现有 occurrence 建立在「second_week_play = 下一周新增播放」的旧假设上，
+ * 与新产品定义（second_week_play = 最新累计播放量）不兼容；当前库里只有「7日累计 + 最新累计」
+ * 两个快照，没有周级 snapshot，无法还原每周新增。本轮不重构 occurrence、不发明替代算法，
+ * 待后续 snapshot Batch 处理；同时保证 campaign 新逻辑不再依赖 first + second。
+ *
+ * @param {Array<Object>} rows 投放记录（已按筛选条件过滤）
+ * @returns {{ campaignMap: Map, occurrenceMap: Map }}
+ */
 function aggregateWeekly(rows) {
 
-  const createBucket = (weekCode) => ({
+  // campaign（投放周，主口径）：新定义累计器（latest 归投放周）
+  const createCampaignBucket = (weekCode) => ({ weekCode, play: createPlayAccumulator() })
+  // occurrence（发生周）：旧口径结构，保持原实现（TODO(occurrence)：待 snapshot Batch 重构）
+  const createLegacyBucket = (weekCode) => ({
     weekCode,
     total_play: 0,
     first_play_total: 0,
@@ -388,40 +570,34 @@ function aggregateWeekly(rows) {
     creators: new Map(),
     creatorSet: new Set()
   })
-  // 同时构建两套口径：campaign（投放周）/ occurrence（发生周）
   const campaignMap = new Map()
   const occurrenceMap = new Map()
-  const getBucket = (map, weekCode) => {
-    if (!map.has(weekCode)) map.set(weekCode, createBucket(weekCode))
-    return map.get(weekCode)
+  const getCampaignBucket = (weekCode) => {
+    if (!campaignMap.has(weekCode)) campaignMap.set(weekCode, createCampaignBucket(weekCode))
+    return campaignMap.get(weekCode)
+  }
+  const getLegacyBucket = (weekCode) => {
+    if (!occurrenceMap.has(weekCode)) occurrenceMap.set(weekCode, createLegacyBucket(weekCode))
+    return occurrenceMap.get(weekCode)
   }
 
   for (const row of rows) {
     const weekCode = normalizeWeekCode(row.time_cycle)
     if (!weekCode) continue
 
+    const nickname = String(row.nickname || '').trim()
+
+    // 投放周口径（新定义）：latest（最新累计播放）归投放周；不再使用 first + second
+    const campaign = getCampaignBucket(weekCode)
+    accumulatePlay(campaign.play, computePlayMetrics(row), nickname)
+
+    // ---- 以下为 occurrence 旧口径（TODO(occurrence)：与新产品定义不兼容，待 snapshot Batch 重构）----
     const cost = Number(row.total_cost) || 0
     const firstPlay = Number(row.first_play) || 0
     const secondPlay = Number(row.second_week_play) || 0
-    const nickname = String(row.nickname || '').trim()
-
-    // 投放周口径：当周投放记录的首发 + 次周都计入当周；花费/达人/记录数同样按投放周
-    const campaign = getBucket(campaignMap, weekCode)
-    campaign.total_cost += cost
-    campaign.record_count += 1
-    if (nickname) campaign.creatorSet.add(nickname)
-    campaign.first_play_total += firstPlay
-    campaign.second_week_play_total += secondPlay
-    campaign.total_play += firstPlay + secondPlay
-    if (nickname && firstPlay + secondPlay > 0) {
-      campaign.creators.set(
-        nickname,
-        (campaign.creators.get(nickname) || 0) + firstPlay + secondPlay
-      )
-    }
 
     // 发生周口径：首发归投放周；次周播放量归投放周的下一周（空值/0 不产生事件；跨年自动正确）
-    const occurrence = getBucket(occurrenceMap, weekCode)
+    const occurrence = getLegacyBucket(weekCode)
     occurrence.total_cost += cost
     occurrence.record_count += 1
     if (nickname) occurrence.creatorSet.add(nickname)
@@ -434,7 +610,7 @@ function aggregateWeekly(rows) {
     if (secondPlay > 0) {
       const nextWeekCode = getNextWeek(weekCode)
       if (nextWeekCode) {
-        const nextBucket = getBucket(occurrenceMap, nextWeekCode)
+        const nextBucket = getLegacyBucket(nextWeekCode)
         nextBucket.second_week_play_total += secondPlay
         nextBucket.total_play += secondPlay
         if (nickname) {
@@ -450,8 +626,26 @@ function aggregateWeekly(rows) {
   return { campaignMap, occurrenceMap }
 }
 
-// 周度结果序列化（字段保持不变，额外提供 week_code 别名，便于 BI 侧使用）
+// 周度结果序列化（额外提供 week_code 别名，便于 BI 侧使用）
+// - campaign：新口径字段（total_play = Σ有效最新累计播放）
+// - occurrence：旧字段保持不变，新口径字段显式返回 null（TODO(occurrence)）
 function serializeBucket(bucket, caliber) {
+  if (caliber === 'campaign') {
+    const summary = finalizePlayAccumulator(bucket.play)
+    return {
+      weekCode: bucket.weekCode,
+      week_code: bucket.weekCode,
+      caliber,
+      ...summary,
+      // 兼容旧字段命名：second_week_play_total / second_play_total = Σ最新累计播放
+      second_week_play_total: summary.latest_play_total,
+      second_play_total: summary.latest_play_total,
+      creators: [...bucket.play.creatorPlay.entries()]
+        .map(([nickname, play]) => ({ nickname, play }))
+        .sort((a, b) => b.play - a.play)
+    }
+  }
+
   return {
     weekCode: bucket.weekCode,
     week_code: bucket.weekCode,
@@ -466,12 +660,31 @@ function serializeBucket(bucket, caliber) {
     record_count: bucket.record_count,
     creators: [...bucket.creators.entries()]
       .map(([nickname, play]) => ({ nickname, play }))
-      .sort((a, b) => b.play - a.play)
+      .sort((a, b) => b.play - a.play),
+    // 新口径字段在 occurrence 下暂不可用（TODO(occurrence)）：显式 null，避免被当成 0
+    latest_play_total: null,
+    post_7d_growth_total: null,
+    avg_cpm: null,
+    cpm_7d: null,
+    hit_7d_count: null,
+    hit_latest_count: null,
+    hit_count: null,
+    hit_rate_7d: null,
+    hit_rate_latest: null,
+    hit_rate: null,
+    first_sample_count: null,
+    first_positive_sample_count: null,
+    latest_sample_count: null,
+    latest_pending_count: null,
+    anomaly_count: null
   }
 }
 
 // 空周结构（无数据周补零，保证趋势图连续）
-function emptyBucket(weekCode) {
+function emptyBucket(weekCode, caliber = 'campaign') {
+  if (caliber === 'campaign') {
+    return { weekCode, play: createPlayAccumulator() }
+  }
   return {
     weekCode,
     total_play: 0,
@@ -500,7 +713,8 @@ function expandWeekRange(startWeek, endWeek) {
 // ---------- 周度播放量聚合（caliber：campaign 投放周 / occurrence 发生周，默认 occurrence） ----------
 router.get('/week-stats', (req, res) => {
   const rawWeekCode = req.query.weekCode
-  const caliber = String(req.query.caliber || 'occurrence').trim().toLowerCase()
+  // 默认主口径 = campaign（投放周）；occurrence 仍支持显式传入（TODO(occurrence)：待 snapshot Batch 重构）
+  const caliber = String(req.query.caliber || 'campaign').trim().toLowerCase()
   if (!['campaign', 'occurrence'].includes(caliber)) {
     return fail(res, 400, 'caliber 必须为 campaign 或 occurrence')
   }
@@ -539,13 +753,28 @@ router.get('/week-stats', (req, res) => {
               week_code: targetWeekCode,
               caliber,
               total_play: 0,
+              latest_play_total: 0,
               first_play_total: 0,
               second_week_play_total: 0,
               second_play_total: 0,
+              post_7d_growth_total: 0,
               total_cost: 0,
               creator_count: 0,
               record_count: 0,
-              creators: []
+              creators: [],
+              avg_cpm: null,
+              cpm_7d: null,
+              hit_7d_count: 0,
+              hit_latest_count: 0,
+              hit_count: 0,
+              hit_rate_7d: null,
+              hit_rate_latest: null,
+              hit_rate: null,
+              first_sample_count: 0,
+              first_positive_sample_count: 0,
+              latest_sample_count: 0,
+              latest_pending_count: 0,
+              anomaly_count: 0
             }
       )
     }
@@ -590,10 +819,10 @@ router.get('/week-stats', (req, res) => {
   // 空数据周补零，保证趋势图连续无断点
   const weeks = weekCodes.map((code) => {
     const bucket = activeMap.get(code)
-    return serializeBucket(bucket || emptyBucket(code), caliber)
+    return serializeBucket(bucket || emptyBucket(code, caliber), caliber)
   })
 
-  // 范围汇总：花费/达人/记录数始终按投放周统计（落在所选周范围内的记录），播放量按所选口径累加
+  // 范围汇总：花费/达人/记录数按投放周统计（落在所选周范围内的记录）
   const inRangeRecords = rows.filter((row) => {
     const code = normalizeWeekCode(row.time_cycle)
     if (!code) return false
@@ -601,25 +830,53 @@ router.get('/week-stats', (req, res) => {
     if (rangeEnd && code > rangeEnd) return false
     return true
   })
-  const rangeCreatorSet = new Set()
-  let summaryCost = 0
-  for (const row of inRangeRecords) {
-    summaryCost += Number(row.total_cost) || 0
-    const nickname = String(row.nickname || '').trim()
-    if (nickname) rangeCreatorSet.add(nickname)
-  }
-  const totalPlay = weeks.reduce((sum, week) => sum + week.total_play, 0)
-  const totalSummary = {
-    startWeek: rangeStart,
-    endWeek: rangeEnd,
-    weekCount: weeks.length,
-    total_play: totalPlay,
-    first_play_total: weeks.reduce((sum, week) => sum + week.first_play_total, 0),
-    second_play_total: weeks.reduce((sum, week) => sum + week.second_play_total, 0),
-    total_cost: Number(summaryCost.toFixed(2)),
-    avg_cpm: totalPlay > 0 ? Number(((summaryCost / totalPlay) * 1000).toFixed(2)) : null,
-    creator_count: rangeCreatorSet.size,
-    record_count: inRangeRecords.length
+
+  let totalSummary
+  if (caliber === 'campaign') {
+    // 新口径：total_play = Σ有效最新累计播放；CPM 分子只统计与分母同一样本记录的花费
+    const summary = summarizePlayRecords(inRangeRecords)
+    totalSummary = {
+      startWeek: rangeStart,
+      endWeek: rangeEnd,
+      weekCount: weeks.length,
+      ...summary,
+      // 兼容旧字段命名：second_play_total = Σ最新累计播放
+      second_play_total: summary.latest_play_total
+    }
+  } else {
+    // TODO(occurrence): 保持旧实现（second_week_play 视为下一周新增），与新产品定义不兼容，
+    // 待 snapshot Batch 重构；新口径字段在 occurrence 下显式返回 null，避免被当成 0。
+    const rangeCreatorSet = new Set()
+    let summaryCost = 0
+    for (const row of inRangeRecords) {
+      summaryCost += Number(row.total_cost) || 0
+      const nickname = String(row.nickname || '').trim()
+      if (nickname) rangeCreatorSet.add(nickname)
+    }
+    const totalPlay = weeks.reduce((sum, week) => sum + week.total_play, 0)
+    totalSummary = {
+      startWeek: rangeStart,
+      endWeek: rangeEnd,
+      weekCount: weeks.length,
+      total_play: totalPlay,
+      first_play_total: weeks.reduce((sum, week) => sum + week.first_play_total, 0),
+      second_play_total: weeks.reduce((sum, week) => sum + week.second_play_total, 0),
+      total_cost: Number(summaryCost.toFixed(2)),
+      avg_cpm: totalPlay > 0 ? Number(((summaryCost / totalPlay) * 1000).toFixed(2)) : null,
+      creator_count: rangeCreatorSet.size,
+      record_count: inRangeRecords.length,
+      latest_play_total: null,
+      post_7d_growth_total: null,
+      cpm_7d: null,
+      hit_7d_count: null,
+      hit_latest_count: null,
+      hit_count: null,
+      hit_rate_7d: null,
+      hit_rate_latest: null,
+      hit_rate: null,
+      first_sample_count: null,
+      latest_sample_count: null
+    }
   }
 
   return ok(res, {
@@ -632,7 +889,7 @@ router.get('/week-stats', (req, res) => {
 })
 
 // 数据覆盖的周范围（发生周口径包含「有次周播放量的下一周」，与筛选元数据一致）
-function resolveDataWeekRange(caliber = 'occurrence') {
+function resolveDataWeekRange(caliber = 'campaign') {
   const rows = db
     .prepare(
       `SELECT time_cycle, second_week_play
@@ -663,8 +920,7 @@ function resolveDataWeekRange(caliber = 'occurrence') {
  * - 总花费 / 投放次数：按投放周统计（记录归属周落在筛选范围内）
  * - 播放量：campaign = 范围内记录的首发+次周；occurrence = 范围内记录的首发 + 落到范围内的上一周投放的次周
  */
-// 爆款口径：首发播放量 >= 10 万（与看板「爆款类型分布」保持一致）
-const HOT_PLAY_THRESHOLD = 100000
+// 爆款阈值统一定义在文件上方的「播放口径核心」处（7日爆款 = first_play >= 阈值；累计爆款 = second_week_play >= 阈值）
 // 达人汇总可排序字段（白名单，避免注入）
 const CREATOR_SORT_FIELDS = [
   'total_cost',
@@ -675,10 +931,196 @@ const CREATOR_SORT_FIELDS = [
   'avg_play',
   'repeat_count',
   'first_play_sum',
-  'second_play_sum'
+  'second_play_sum',
+  // 新口径字段（Batch 1 新增）
+  'latest_play_total',
+  'post_7d_growth_total',
+  'cpm_7d',
+  'hit_7d_count',
+  'hit_latest_count',
+  'hit_rate_7d',
+  'hit_rate_latest',
+  'latest_sample_count',
+  'latest_pending_count'
 ]
 
-function buildCreatorSummary({
+/**
+ * 达人维度汇总统一入口
+ * - campaign（投放周，主口径）：新定义（second_week_play = 最新累计播放量）
+ * - occurrence：保持旧实现（TODO(occurrence)：与新产品定义不兼容，待 snapshot Batch 重构）
+ */
+function buildCreatorSummary(options = {}) {
+  const caliber = String(options?.caliber || 'campaign').trim().toLowerCase()
+  if (caliber === 'occurrence') return buildCreatorSummaryLegacyOccurrence(options)
+  return buildCreatorSummaryLatest(options)
+}
+
+/**
+ * 达人维度汇总（新口径 / campaign 投放周）
+ * - 每条记录：latest（最新累计播放）归投放周；total_play = Σ有效 latest（不再用 first + second）
+ * - 最新平均CPM = 有 latest 记录的花费 ÷ 这些记录的 latest 总和 × 1000
+ * - 7日平均CPM = first>0 记录的花费 ÷ 这些记录 first 总和 × 1000
+ * - 累计爆款 = latest >= 阈值（主爆款）；7日爆款 = first >= 阈值
+ * - total_campaigns / total_cost 统计范围内全部记录，不因 latest 缺失而减少
+ */
+function buildCreatorSummaryLatest({
+  startWeek,
+  endWeek,
+  creatorTypes = [],
+  keyword = '',
+  minCampaigns = 0,
+  sortBy = 'total_cost',
+  sortOrder = 'desc'
+} = {}) {
+  const rows = queryAggregateRows({ startWeek, endWeek, creatorTypes, keyword })
+  const creatorMap = new Map()
+  const getCreator = (nickname, creatorType) => {
+    if (!creatorMap.has(nickname)) {
+      creatorMap.set(nickname, {
+        nickname,
+        creator_type: creatorType,
+        acc: createPlayAccumulator()
+      })
+    }
+    const entry = creatorMap.get(nickname)
+    // 同一昵称出现多个类型时，保留首个非空类型
+    if (!entry.creator_type && creatorType) entry.creator_type = creatorType
+    return entry
+  }
+
+  for (const row of rows) {
+    const code = normalizeWeekCode(row.time_cycle)
+    if (!code) continue
+    if (startWeek && code < startWeek) continue
+    if (endWeek && code > endWeek) continue
+    const nickname = String(row.nickname || '').trim() || '未命名达人'
+    const creatorType = String(row.creator_type || '').trim() || '未分类'
+    const entry = getCreator(nickname, creatorType)
+    accumulatePlay(entry.acc, computePlayMetrics(row), nickname)
+  }
+
+  const serializeCreator = (entry) => {
+    const summary = finalizePlayAccumulator(entry.acc)
+    return {
+      nickname: entry.nickname,
+      creator_type: entry.creator_type,
+      total_campaigns: summary.record_count,
+      total_cost: summary.total_cost,
+      // 主口径：总播放 = Σ有效最新累计播放（字段名保持兼容，语义已更新）
+      total_play: summary.total_play,
+      latest_play_total: summary.latest_play_total,
+      // 兼容旧字段名：first_play_sum = Σ7日累计；second_play_sum = Σ最新累计
+      first_play_sum: summary.first_play_total,
+      second_play_sum: summary.latest_play_total,
+      post_7d_growth_total: summary.post_7d_growth_total,
+      avg_cpm: summary.avg_cpm,
+      cpm_7d: summary.cpm_7d,
+      hit_count: summary.hit_count,
+      hit_7d_count: summary.hit_7d_count,
+      hit_latest_count: summary.hit_latest_count,
+      hit_rate_7d: summary.hit_rate_7d,
+      hit_rate_latest: summary.hit_rate_latest,
+      first_sample_count: summary.first_sample_count,
+      latest_sample_count: summary.latest_sample_count,
+      latest_pending_count: summary.latest_pending_count,
+      anomaly_count: summary.anomaly_count,
+      // 平均单条播放：按「已更新最新累计」的样本平均
+      // （旧定义除以全部投放次数，会把「最新累计待更新」的记录当成 0 拉低均值）
+      avg_play:
+        summary.latest_sample_count > 0
+          ? round1(summary.latest_play_total / summary.latest_sample_count)
+          : null,
+      repeat_count: summary.record_count > 0 ? summary.record_count - 1 : 0,
+      // 供分组聚合精确计算组级 CPM 使用（分子必须与分母同一样本）
+      latest_valid_cost: round2(entry.acc.latest_valid_cost),
+      first_valid_cost: round2(entry.acc.first_valid_cost)
+    }
+  }
+
+  const minCampaignsValue = Number(minCampaigns) > 0 ? Math.floor(Number(minCampaigns)) : 0
+  const sortField = CREATOR_SORT_FIELDS.includes(sortBy) ? sortBy : 'total_cost'
+  const sortDirection = String(sortOrder).toLowerCase() === 'asc' ? 'asc' : 'desc'
+
+  const creators = [...creatorMap.values()]
+    .map(serializeCreator)
+    // 最小投放次数过滤（默认不限）
+    .filter((item) => item.total_campaigns >= minCampaignsValue)
+    .sort((a, b) => {
+      const left = a[sortField]
+      const right = b[sortField]
+      // 空值（如无有效 latest 时的 avg_cpm / cpm_7d / 爆款率）始终排在最后
+      const leftNull = left === null || left === undefined
+      const rightNull = right === null || right === undefined
+      if (leftNull && rightNull) return 0
+      if (leftNull) return 1
+      if (rightNull) return -1
+      if (left === right) {
+        return b.total_cost - a.total_cost || b.total_play - a.total_play
+      }
+      return sortDirection === 'asc' ? left - right : right - left
+    })
+
+  // 总汇总：与达人明细同一套口径（成本/次数按全部记录，播放/CPM/爆款按有效样本）
+  const totalSummary = {
+    creator_count: creators.length,
+    record_count: creators.reduce((sum, item) => sum + item.total_campaigns, 0),
+    total_cost: round2(creators.reduce((sum, item) => sum + item.total_cost, 0)),
+    first_play_total: creators.reduce((sum, item) => sum + item.first_play_sum, 0),
+    latest_play_total: creators.reduce((sum, item) => sum + item.latest_play_total, 0),
+    post_7d_growth_total: creators.reduce((sum, item) => sum + item.post_7d_growth_total, 0),
+    first_sample_count: creators.reduce((sum, item) => sum + item.first_sample_count, 0),
+    latest_sample_count: creators.reduce((sum, item) => sum + item.latest_sample_count, 0),
+    hit_7d_count: creators.reduce((sum, item) => sum + item.hit_7d_count, 0),
+    hit_latest_count: creators.reduce((sum, item) => sum + item.hit_latest_count, 0),
+    anomaly_count: creators.reduce((sum, item) => sum + item.anomaly_count, 0),
+    latest_valid_cost: round2(creators.reduce((sum, item) => sum + item.latest_valid_cost, 0)),
+    first_valid_cost: round2(creators.reduce((sum, item) => sum + item.first_valid_cost, 0))
+  }
+  totalSummary.total_play = totalSummary.latest_play_total
+  totalSummary.total_campaigns = totalSummary.record_count
+  // 兼容旧字段名
+  totalSummary.first_play_sum = totalSummary.first_play_total
+  totalSummary.second_play_sum = totalSummary.latest_play_total
+  totalSummary.avg_cpm =
+    totalSummary.latest_play_total > 0
+      ? round2((totalSummary.latest_valid_cost / totalSummary.latest_play_total) * 1000)
+      : null
+  totalSummary.cpm_7d =
+    totalSummary.first_play_total > 0
+      ? round2((totalSummary.first_valid_cost / totalSummary.first_play_total) * 1000)
+      : null
+  totalSummary.hit_count = totalSummary.hit_latest_count
+  totalSummary.total_hits = totalSummary.hit_latest_count
+  totalSummary.hit_rate_latest =
+    totalSummary.latest_sample_count > 0
+      ? round1((totalSummary.hit_latest_count / totalSummary.latest_sample_count) * 100)
+      : null
+  totalSummary.hit_rate_7d =
+    totalSummary.first_sample_count > 0
+      ? round1((totalSummary.hit_7d_count / totalSummary.first_sample_count) * 100)
+      : null
+  totalSummary.hit_rate = totalSummary.hit_rate_latest
+  totalSummary.latest_pending_count =
+    totalSummary.record_count - totalSummary.latest_sample_count
+
+  return {
+    range: { startWeek: startWeek || null, endWeek: endWeek || null },
+    creatorTypes,
+    keyword,
+    minCampaigns: minCampaignsValue,
+    sort: { sortBy: sortField, sortOrder: sortDirection },
+    creators,
+    total_summary: totalSummary
+  }
+}
+
+/**
+ * 达人维度汇总（旧实现 / occurrence 发生周）
+ * TODO(occurrence): 该实现把 second_week_play 当作「下一周新增播放」并跨周搬移，
+ * 与新产品定义（second_week_play = 最新累计播放量）不兼容；本轮保留以维持既有接口可用性，
+ * 待后续 snapshot Batch 重构（不发明替代算法）。
+ */
+function buildCreatorSummaryLegacyOccurrence({
   startWeek,
   endWeek,
   caliber = 'occurrence',
@@ -835,9 +1277,69 @@ function buildCreatorSummary({
   }
 }
 
+/**
+ * 博主类型分组汇总：与达人明细 / 总汇总使用同一套口径
+ * - campaign：总播放 = Σ有效最新累计播放；最新平均CPM 的分子只含同一样本记录的花费
+ * - occurrence：保持旧实现（TODO(occurrence)：待 snapshot Batch 重构）
+ */
+function buildGroupSummary(creatorType, list, caliber = 'campaign') {
+  const totalCost = round2(list.reduce((sum, item) => sum + item.total_cost, 0))
+  const totalCampaigns = list.reduce((sum, item) => sum + item.total_campaigns, 0)
+
+  if (caliber !== 'campaign') {
+    const totalPlay = list.reduce((sum, item) => sum + item.total_play, 0)
+    return {
+      creator_type: creatorType,
+      creator_count: list.length,
+      total_campaigns: totalCampaigns,
+      total_cost: totalCost,
+      first_play_sum: list.reduce((sum, item) => sum + item.first_play_sum, 0),
+      second_play_sum: list.reduce((sum, item) => sum + item.second_play_sum, 0),
+      total_play: totalPlay,
+      avg_cpm: totalPlay > 0 ? round2((totalCost / totalPlay) * 1000) : null,
+      total_hits: list.reduce((sum, item) => sum + item.hit_count, 0),
+      creators: list
+    }
+  }
+
+  const latestPlayTotal = list.reduce((sum, item) => sum + item.latest_play_total, 0)
+  const firstPlayTotal = list.reduce((sum, item) => sum + item.first_play_sum, 0)
+  const latestValidCost = list.reduce((sum, item) => sum + (item.latest_valid_cost || 0), 0)
+  const firstValidCost = list.reduce((sum, item) => sum + (item.first_valid_cost || 0), 0)
+  const latestSampleCount = list.reduce((sum, item) => sum + item.latest_sample_count, 0)
+  const firstSampleCount = list.reduce((sum, item) => sum + item.first_sample_count, 0)
+  const hitLatestCount = list.reduce((sum, item) => sum + item.hit_latest_count, 0)
+  const hit7dCount = list.reduce((sum, item) => sum + item.hit_7d_count, 0)
+
+  return {
+    creator_type: creatorType,
+    creator_count: list.length,
+    total_campaigns: totalCampaigns,
+    total_cost: totalCost,
+    first_play_sum: firstPlayTotal,
+    second_play_sum: latestPlayTotal,
+    total_play: latestPlayTotal,
+    latest_play_total: latestPlayTotal,
+    post_7d_growth_total: list.reduce((sum, item) => sum + item.post_7d_growth_total, 0),
+    avg_cpm: latestPlayTotal > 0 ? round2((latestValidCost / latestPlayTotal) * 1000) : null,
+    cpm_7d: firstPlayTotal > 0 ? round2((firstValidCost / firstPlayTotal) * 1000) : null,
+    hit_count: hitLatestCount,
+    total_hits: hitLatestCount,
+    hit_latest_count: hitLatestCount,
+    hit_7d_count: hit7dCount,
+    hit_rate_latest:
+      latestSampleCount > 0 ? round1((hitLatestCount / latestSampleCount) * 100) : null,
+    hit_rate_7d: firstSampleCount > 0 ? round1((hit7dCount / firstSampleCount) * 100) : null,
+    latest_sample_count: latestSampleCount,
+    first_sample_count: firstSampleCount,
+    creators: list
+  }
+}
+
 // ---------- 达人维度汇总接口（按博主类型分组，支持周范围/类型筛选/口径） ----------
 router.get('/creator-summary', (req, res) => {
-  const caliber = String(req.query.caliber || 'occurrence').trim().toLowerCase()
+  // 默认主口径 = campaign（投放周）；occurrence 仍支持显式传入（TODO(occurrence)：待 snapshot Batch 重构）
+  const caliber = String(req.query.caliber || 'campaign').trim().toLowerCase()
   if (!['campaign', 'occurrence'].includes(caliber)) {
     return fail(res, 400, 'caliber 必须为 campaign 或 occurrence')
   }
@@ -903,38 +1405,10 @@ router.get('/creator-summary', (req, res) => {
       typeMap.get(type).push(creator)
     }
     groups = [...typeMap.entries()]
-      .map(([creatorType, list]) => {
-        const totalCost = list.reduce((sum, item) => sum + item.total_cost, 0)
-        const totalPlay = list.reduce((sum, item) => sum + item.total_play, 0)
-        return {
-          creator_type: creatorType,
-          creator_count: list.length,
-          total_campaigns: list.reduce((sum, item) => sum + item.total_campaigns, 0),
-          total_cost: Number(totalCost.toFixed(2)),
-          first_play_sum: list.reduce((sum, item) => sum + item.first_play_sum, 0),
-          second_play_sum: list.reduce((sum, item) => sum + item.second_play_sum, 0),
-          total_play: totalPlay,
-          avg_cpm: totalPlay > 0 ? Number(((totalCost / totalPlay) * 1000).toFixed(2)) : null,
-          total_hits: list.reduce((sum, item) => sum + item.hit_count, 0),
-          creators: list
-        }
-      })
+      .map(([creatorType, list]) => buildGroupSummary(creatorType, list, caliber))
       .sort((a, b) => b.total_cost - a.total_cost || b.total_play - a.total_play)
   } else {
-    groups = [
-      {
-        creator_type: '全部达人',
-        creator_count: summary.creators.length,
-        total_campaigns: summary.total_summary.total_campaigns,
-        total_cost: summary.total_summary.total_cost,
-        first_play_sum: summary.total_summary.first_play_sum,
-        second_play_sum: summary.total_summary.second_play_sum,
-        total_play: summary.total_summary.total_play,
-        avg_cpm: summary.total_summary.avg_cpm,
-        total_hits: summary.total_summary.total_hits,
-        creators: summary.creators
-      }
-    ]
+    groups = [buildGroupSummary('全部达人', summary.creators, caliber)]
   }
 
   ok(res, {
@@ -1026,7 +1500,8 @@ router.get('/export', (req, res) => {
 
   // 达人维度汇总导出：博主类型 / 达人昵称 / 投放次数 / 总花费 / 总播放 / 平均CPM
   if (exportType === 'creator-summary') {
-    const caliber = String(req.query.caliber || 'occurrence').trim().toLowerCase()
+    // 默认主口径 = campaign（投放周），与 creator-summary / week-stats 保持一致
+    const caliber = String(req.query.caliber || 'campaign').trim().toLowerCase()
     if (!['campaign', 'occurrence'].includes(caliber)) {
       return fail(res, 400, 'caliber 必须为 campaign 或 occurrence')
     }

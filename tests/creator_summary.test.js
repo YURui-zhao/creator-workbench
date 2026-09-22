@@ -81,23 +81,108 @@ async function main() {
   const costs = base.data.creators.map((item) => item.total_cost)
   check('默认排序结果确实降序', costs.every((value, i) => i === 0 || costs[i - 1] >= value), JSON.stringify(costs.slice(0, 5)))
 
-  console.log('\n===== 2. 新增统计字段计算正确性 =====')
+  console.log('\n===== 2. 统计字段计算正确性（Batch 1 新口径）=====')
   const byName = Object.fromEntries(base.data.creators.map((item) => [item.nickname, item]))
   const travel = byName['旅行小李']
-  check('hit_count 爆款数正确（首发 15 万 → 1）', travel?.hit_count === 1, JSON.stringify(travel))
   check(
-    'avg_play = total_play / total_campaigns（保留 1 位小数）',
-    travel?.avg_play === Number((travel.total_play / travel.total_campaigns).toFixed(1)),
+    '总播放 = 最新累计播放（旅行小李 latest 26 万，而不是 first + second = 41 万）',
+    travel?.total_play === 260000 && travel?.first_play_sum === 150000,
+    `total_play=${travel?.total_play} first_play_sum=${travel?.first_play_sum}`
+  )
+  check('latest_play_total = 26 万', travel?.latest_play_total === 260000)
+  check(
+    '7日后新增 = latest - first = 11 万',
+    travel?.post_7d_growth_total === 110000,
+    `growth=${travel?.post_7d_growth_total}`
+  )
+  check(
+    'hit_count（主爆款 = 累计爆款）正确（latest 26 万 → 1）',
+    travel?.hit_count === 1 && travel?.hit_latest_count === 1
+  )
+  check('7日爆款数正确（first 15 万 → 1）', travel?.hit_7d_count === 1)
+  check(
+    '最新平均CPM = 有 latest 记录的花费 ÷ latest 总和 × 1000',
+    travel?.avg_cpm === Number(((travel.total_cost / travel.latest_play_total) * 1000).toFixed(2)),
+    `avg_cpm=${travel?.avg_cpm}`
+  )
+  check(
+    '7日平均CPM = 全部有效 first 记录的花费 ÷ Σfirst × 1000（该达人 first>0）',
+    travel?.cpm_7d === Number(((travel.total_cost / travel.first_play_sum) * 1000).toFixed(2)),
+    `cpm_7d=${travel?.cpm_7d}`
+  )
+  check(
+    'avg_play = 最新累计播放 ÷ 有 latest 的样本数（保留 1 位小数）',
+    travel?.avg_play === Number((travel.latest_play_total / travel.latest_sample_count).toFixed(1)),
     `avg_play=${travel?.avg_play}`
   )
   check('repeat_count = 投放次数 - 1（单次投放 → 0）', travel?.repeat_count === travel.total_campaigns - 1)
-  const expectedHits = base.data.creators.reduce((sum, item) => sum + item.hit_count, 0)
-  check('total_summary.total_hits = 各达人爆款数之和', base.data.total_summary.total_hits === expectedHits, `hits=${expectedHits}`)
-  const recordCount = base.data.total_summary.record_count
+  const expectedHits = base.data.creators.reduce((sum, item) => sum + item.hit_latest_count, 0)
   check(
-    'total_summary.hit_rate = 爆款总数 / 记录总数 × 100（1 位小数）',
-    base.data.total_summary.hit_rate === Number(((expectedHits / recordCount) * 100).toFixed(1)),
-    `hit_rate=${base.data.total_summary.hit_rate} (hits=${expectedHits}, records=${recordCount})`
+    'total_summary.total_hits = 各达人累计爆款数之和',
+    base.data.total_summary.total_hits === expectedHits,
+    `hits=${expectedHits}`
+  )
+  const latestSampleCount = base.data.total_summary.latest_sample_count
+  check(
+    'total_summary.hit_rate = 累计爆款数 / 有 latest 的有效记录数 × 100（1 位小数）',
+    base.data.total_summary.hit_rate === Number(((expectedHits / latestSampleCount) * 100).toFixed(1)),
+    `hit_rate=${base.data.total_summary.hit_rate} (hits=${expectedHits}, latestSamples=${latestSampleCount})`
+  )
+  check(
+    'total_summary 新增口径字段齐全',
+    [
+      'latest_play_total',
+      'first_play_total',
+      'post_7d_growth_total',
+      'avg_cpm',
+      'cpm_7d',
+      'hit_7d_count',
+      'hit_latest_count',
+      'hit_rate_7d',
+      'hit_rate_latest',
+      'latest_sample_count',
+      'latest_pending_count'
+    ].every((key) => key in base.data.total_summary),
+    JSON.stringify(Object.keys(base.data.total_summary))
+  )
+  check(
+    '口径回归保护：总播放 = Σ最新累计，且不等于 first + second',
+    base.data.total_summary.total_play === base.data.total_summary.latest_play_total &&
+      base.data.total_summary.total_play !==
+        base.data.total_summary.first_play_total + base.data.total_summary.latest_play_total,
+    `total_play=${base.data.total_summary.total_play} first=${base.data.total_summary.first_play_total} latest=${base.data.total_summary.latest_play_total}`
+  )
+  check(
+    '7日爆款率 / 累计爆款率分别按各自样本计算',
+    base.data.total_summary.hit_rate_7d ===
+      Number(
+        ((base.data.total_summary.hit_7d_count / base.data.total_summary.first_sample_count) * 100).toFixed(1)
+      ) &&
+      base.data.total_summary.hit_rate_latest ===
+        Number(
+          (
+            (base.data.total_summary.hit_latest_count / base.data.total_summary.latest_sample_count) *
+            100
+          ).toFixed(1)
+        )
+  )
+  check(
+    '总汇总 7日平均CPM 分子含 first=0 的记录花费（= 全部有效 first 记录 cost ÷ Σfirst × 1000）',
+    base.data.total_summary.cpm_7d ===
+      Number(((base.data.total_summary.total_cost / base.data.total_summary.first_play_total) * 1000).toFixed(2)),
+    `cpm_7d=${base.data.total_summary.cpm_7d} (cost=${base.data.total_summary.total_cost}, first=${base.data.total_summary.first_play_total})`
+  )
+  check(
+    '当前真实数据无异常记录（anomaly_count = 0 / 无待更新）',
+    base.data.total_summary.anomaly_count === 0 && base.data.total_summary.latest_pending_count === 0,
+    `anomaly=${base.data.total_summary.anomaly_count} pending=${base.data.total_summary.latest_pending_count}`
+  )
+  check(
+    '待更新数 = 记录数 − 有效 latest 样本 − 异常数（异常不算待更新）',
+    base.data.total_summary.latest_pending_count ===
+      base.data.total_summary.record_count -
+        base.data.total_summary.latest_sample_count -
+        base.data.total_summary.anomaly_count
   )
 
   console.log('\n===== 3. keyword 模糊搜索 =====')

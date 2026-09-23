@@ -128,8 +128,8 @@ const BASE_PROMPT = `
 - video_link: 视频发布链接
 - total_cost: 总花费（元，数字）
 - publish_date: 发布日期，YYYY-MM-DD
-- first_play: 首发播放量（整数）
-- second_week_play: 次周播放量（整数）
+- first_play: 7日播放量（整数，内容发布约 7 天时记录的累计播放量）
+- second_week_play: 累计播放量（整数，最近一次更新时的累计播放量；这只是历史字段名，绝不代表「第二周新增播放量」）
 - cpm_quote: CPM报价（可选字段，存在时才参与判定）
 - rowIndex: Excel 行号（输入记录里原样携带，输出必须原样返回，禁止改写为数组下标）
 
@@ -137,17 +137,17 @@ const BASE_PROMPT = `
 {"records":[{"rowIndex":2,"pass":true,"level":"info","issues":[],"suggestions":[],"warnings":[],"errors":[],"corrected":null}]}
 
 结构化问题项（warnings / errors 数组的元素）必须是对象，四个字段缺一不可：
-{"rowIndex":2,"field":"second_week_play","reason":"次周播放量缺失，CPM 无法核算","suggestion":"补充次周播放量，或将该记录标记为待观察后再入库"}
+{"rowIndex":2,"field":"second_week_play","reason":"累计播放量小于7日播放量，数据自相矛盾","suggestion":"核对原始数据后修正累计播放量，或先清空累计播放量标记为待更新"}
 - rowIndex：该问题所属的 Excel 行号（与输入记录一致）
 - field：涉及的字段名（如 time_cycle/nickname/total_cost/publish_date/first_play/second_week_play/creator_type/homepage/content_link/video_link）；无法定位具体字段时用 "record"
 - reason：问题原因（中文，说明「哪里不对、为什么不合理」，不要只写「数据异常」）
 - suggestion：可执行的优化/修正建议（中文，说明「怎么改」）
 
 基础判定规则：
-1. 必填字段：time_cycle、nickname、total_cost、publish_date、first_play 任一为空 → pass=false，level=error
+1. 必填字段：time_cycle、nickname、total_cost、publish_date 任一为空 → pass=false，level=error；first_play（7日播放量）与 second_week_play（累计播放量）均为可选，为空表示「未采集 / 待更新」，不得因二者为空判错
 2. 格式判定：homepage/content_link/video_link 必须是合法 URL（http/https）；publish_date 必须是 YYYY-MM-DD；time_cycle 应形如 2024-W30
-3. 数值合理性：total_cost 必须大于 0；first_play、second_week_play 必须是非负整数；若存在 cpm_quote，应在 5-200 合理区间
-4. 业务逻辑：实际CPM = total_cost / second_week_play * 1000（按次周播放量计算）；若记录含 cpm_quote 且实际CPM与报价偏差超过 ±30% → 标记异常；若不含 cpm_quote，实际CPM 超出 5-200 合理区间 → 标记 warning
+3. 数值合理性：total_cost 必填且为非负数字（0 是合法真实值，不得判为错误、不得要求大于 0）；first_play、second_week_play 为非负整数（0 是真实观察值，与「空值 = 未采集/待更新」严格区分）；若存在 cpm_quote，应在 5-200 合理区间
+4. 业务逻辑：实际CPM（按累计播放量）= total_cost / second_week_play * 1000；7日CPM（按7日播放量）= total_cost / first_play * 1000（分母为空或 0 时不计算）；当 7日播放量与累计播放量同时有值时，累计播放量必须 ≥ 7日播放量，若「累计播放量 < 7日播放量」则该记录数据自相矛盾，必须标记 error；若记录含 cpm_quote 且实际CPM与报价偏差超过 ±30% → 标记异常；若不含 cpm_quote，实际CPM 超出 5-200 合理区间 → 标记 warning
 5. 数据质量：明显录入错误或异常值（如昵称含乱码、链接含空格、播放量/金额异常巨大或为负数）→ 标记 warning 或 error
 
 输出要求：
@@ -160,7 +160,8 @@ const BASE_PROMPT = `
 - warnings：warning 级结构化问题数组，元素必须是 {rowIndex, field, reason, suggestion}
 - errors：error 级结构化问题数组，元素必须是 {rowIndex, field, reason, suggestion}
 - 常见警告必须给出明确建议（禁止模糊表述），参考：
-  · 次周播放量为空或 0 → 建议「补充次周播放量后再评估，或确认该投放是否已结束」
+  · 累计播放量为空 → 建议「补充最近一次累计播放量后再评估（未采集期间可保持留空，表示待更新）」
+  · 累计播放量 < 7日播放量 → 标记 error，建议「核对原始数据，累计播放量不应小于7日播放量」
   · CPM 偏离合理区间（<5 或 >200）→ 建议「核对总花费与播放量口径，确认是否为异常投放」
   · 花费高但播放量低 → 建议「复核投放效果，考虑减少同类型达人投放」
   · 播放量异常巨大 → 建议「核对数据来源，确认是否存在刷量或统计口径错误」

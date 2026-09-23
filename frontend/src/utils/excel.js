@@ -684,9 +684,10 @@ function normalizeCellValue(field, value) {
  * 展开合并单元格：把每个合并区域左上角的值回填到该区域覆盖的所有行
  * （sheet_to_json 默认只读取合并区域的左上角单元格，其余覆盖行为空）
  * @param {Object} sheet 工作表对象
- * @param {Array<Object>} rawRows sheet_to_json 解析出的原始行（第 1 行为表头，数据从下标 0 开始）
+ * @param {Array<Object>} rawRows 按 Excel 物理行号排列的原始数据行（包含空白行）
+ * @param {number} firstDataRow 第一条数据行的 SheetJS 零基行号
  */
-function expandMergedCells(sheet, rawRows) {
+function expandMergedCells(sheet, rawRows, firstDataRow) {
   const merges = sheet['!merges']
   if (!Array.isArray(merges) || merges.length === 0) return
 
@@ -715,7 +716,7 @@ function expandMergedCells(sheet, rawRows) {
         .filter((item) => item !== '')
       const totalRows = e.r - s.r + 1
       for (let i = 0; i < totalRows; i += 1) {
-        const row = rawRows[s.r + i - 1] // sheet 行号 -> 数据行下标（表头行号为 0）
+        const row = rawRows[s.r + i - firstDataRow]
         if (!row) continue
         row[headerName] = i < values.length ? values[i] : undefined
       }
@@ -724,7 +725,7 @@ function expandMergedCells(sheet, rawRows) {
 
     // 场景二：合并单元格单值，回填到该区域覆盖的所有行（跳过左上角首行，其本身已有值）
     for (let r = s.r + 1; r <= e.r; r += 1) {
-      const row = rawRows[r - 1] // sheet 行号 -> 数据行下标（表头行号为 0）
+      const row = rawRows[r - firstDataRow]
       if (row) row[headerName] = rawValue
     }
   }
@@ -760,9 +761,18 @@ export async function parseRecordsExcel(file, cycles = [], options = {}) {
   const buffer = await file.arrayBuffer()
   const workbook = XLSX.read(buffer, { type: 'array' })
   const sheet = workbook.Sheets[workbook.SheetNames[0]]
-  const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: '' })
+  const sheetRange = XLSX.utils.decode_range(sheet['!ref'] || 'A1')
+  const firstDataRow = sheetRange.s.r + 1
+  const parsedRows = XLSX.utils.sheet_to_json(sheet, { defval: '' })
+  // sheet_to_json 默认省略完全空白的行；按 __rowNum__ 恢复物理行序，
+  // 以免合并区域回填、周期继承与报错行号被压缩后的数组下标带偏。
+  const rowsBySheetRow = new Map(parsedRows.map((row) => [row.__rowNum__, row]))
+  const rawRows = Array.from(
+    { length: Math.max(0, sheetRange.e.r - firstDataRow + 1) },
+    (_, index) => rowsBySheetRow.get(firstDataRow + index) || {}
+  )
   // 合并单元格展开补值：确保覆盖行都能读到完整值（如合并的时间周期列）
-  expandMergedCells(sheet, rawRows)
+  expandMergedCells(sheet, rawRows, firstDataRow)
 
   // 原始表头（保持首次出现顺序、去重）
   const headers = []
@@ -836,15 +846,16 @@ export async function parseRecordsExcel(file, cycles = [], options = {}) {
   const unrecognizedCycles = new Set()
   // 发布日期不在 Excel 原业务周期内的行（数据质量异常 → 该行判失败，不参与导入）
   const sourceRangeViolations = []
-  // 时间周期向下继承：上一条「有效业务行」的时间周期（空行 / 重复表头行不更新）
+  // 非合并空周期的兜底继承，仅在同一段连续业务行内生效。
   let carriedCycle = ''
 
   rawRows.forEach((raw, index) => {
-    const rowIndex = index + 2 // Excel 第 1 行为表头，数据从第 2 行开始
+    const rowIndex = firstDataRow + index + 1
 
     // 重复表头行：整行与表头同名 → 跳过（既不继承周期，也不参与校验 / 入库）
     if (isRepeatedHeaderRow(raw, fieldByHeader)) {
       headerRowIndexes.push(rowIndex)
+      carriedCycle = ''
       return
     }
 
@@ -862,11 +873,10 @@ export async function parseRecordsExcel(file, cycles = [], options = {}) {
       if (field === 'publish_date') value = normalizeDate(value)
       if (field === 'time_cycle') {
         sourceCycleRaw = value === undefined || value === null ? '' : String(value).trim()
-        let rawText = sourceCycleRaw
         // 合并单元格之外的空周期：继承上方最近一条有效业务行的周期（不修改原始 Excel）
-        if (!rawText && carriedCycle) {
+        if (!sourceCycleRaw && carriedCycle) {
           value = carriedCycle
-          rawText = carriedCycle
+          sourceCycleRaw = carriedCycle
         }
         value = normalizeTimeCycleValue(value, cycles)
         // 注意：这里的中间结果只用于「来源信息 / 无发布日期时的兜底」，
@@ -876,13 +886,13 @@ export async function parseRecordsExcel(file, cycles = [], options = {}) {
     }
 
     if (!hasValue) {
-      // 跳过完全空白的行（计入「跳过」统计，不产生任何报错；也不更新继承周期）
+      // 物理空白行是业务分组边界，不能把上组周期带到下一组。
       blankRowIndexes.push(rowIndex)
+      carriedCycle = ''
       return
     }
 
-    // 该行是有效业务行：把本行的时间周期记为后续空行的继承来源
-    if (mapped.time_cycle) carriedCycle = mapped.time_cycle
+    if (sourceCycleRaw) carriedCycle = sourceCycleRaw
 
     // ---------- 时间周期归属（发布日前优先，确定性计算）----------
     // canonicalCycle：发布日期所属标准周（唯一事实来源）
@@ -903,6 +913,7 @@ export async function parseRecordsExcel(file, cycles = [], options = {}) {
         sourceRangeError = sourceCheck.reason
         sourceRangeViolations.push({
           rowIndex,
+          nickname: mapped.nickname,
           publishDate: mapped.publish_date,
           sourceTimeCycle: sourceCycleRaw,
           timeCycle: canonicalCycle,
@@ -1048,6 +1059,7 @@ export function applyTimeCycleMapping(result, mapping = {}) {
         sourceRangeError = sourceCheck.reason
         sourceRangeViolations.push({
           rowIndex: next.rowIndex,
+          nickname: next.nickname,
           publishDate: next.publish_date,
           sourceTimeCycle: next.sourceTimeCycleRaw || next.sourceTimeCycle,
           timeCycle: canonicalCycle,

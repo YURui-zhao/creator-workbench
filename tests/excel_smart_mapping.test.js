@@ -609,6 +609,111 @@ async function main() {
     groupResult.blankRows === 2 && groupResult.failedRows.length === 0,
     `blank=${groupResult.blankRows} failed=${groupResult.failedRows.length}`
   )
+  const carryReset = await parseRecordsExcel(
+    makeFile(['时间周期', '达人昵称', '总花费', '发布日期'], [
+      ['08/27-09/02', '前组', 1000, '2026-08-27'],
+      ['', '', '', ''],
+      ['', '无源周期', 1000, '2026-09-04']
+    ])
+  )
+  check(
+    '非合并空周期不得跨越物理空白行继承',
+    carryReset.blankRowIndexes.join(',') === '3' &&
+      carryReset.validRows.find((row) => row.nickname === '无源周期')?.rowIndex === 4 &&
+      !carryReset.validRows.find((row) => row.nickname === '无源周期')?.sourceTimeCycleRaw,
+    JSON.stringify(carryReset.allRows.map((row) => [row.rowIndex, row.sourceTimeCycleRaw]))
+  )
+
+  console.log('\n===== 试验.xlsx 真实结构回归：42 条 / 四段合并 / 五个空白分隔行 =====')
+  const fixtureRows = Array.from({ length: 47 }, () => ['', '', '', ''])
+  const groups = [
+    [2, 8, '08/13-08/19', '2026-08-14'],
+    [10, 22, '08/20-08/26', '2026-08-20'],
+    [25, 37, '08/27-09/02', '2026-08-27'],
+    [40, 48, '09/03-09/09', '2026-09-03']
+  ]
+  const fixtureExpected = new Map()
+  for (const [start, end, source, date] of groups) {
+    for (let excelRow = start; excelRow <= end; excelRow += 1) {
+      const nickname = `fixture-${excelRow}`
+      fixtureRows[excelRow - 2] = [excelRow === start ? source : '', nickname, 1000, date]
+      fixtureExpected.set(excelRow, { nickname, source, date })
+    }
+  }
+  const realNamedRows = [
+    [27, '探花Gary', '2026-08-26'],
+    [40, '小趴蔡', '2026-09-04'],
+    [41, '猪永绿', '2026-09-09'],
+    [42, '宣传员乐乐', '2026-09-08'],
+    [43, '猫meme芝士焗', '2026-09-08'],
+    [44, '小陈不懂明史', '2026-09-04'],
+    [45, '人生日记（副本）', '2026-09-03'],
+    [46, '你好 秘老丝儿', '2026-09-05'],
+    [47, 'V宗主', '2026-09-04'],
+    [48, '呆瓜小姐', '2026-09-05']
+  ]
+  for (const [excelRow, nickname, date] of realNamedRows) {
+    fixtureRows[excelRow - 2][1] = nickname
+    fixtureRows[excelRow - 2][3] = date
+    fixtureExpected.set(excelRow, { ...fixtureExpected.get(excelRow), nickname, date })
+  }
+  const fixtureMerges = groups.map(([start, end]) => ({
+    s: { r: start - 1, c: 0 },
+    e: { r: end - 1, c: 0 }
+  }))
+  const makeRealStructureFixture = () =>
+    makeFile(['时间周期', '达人昵称', '总花费', '发布日期'], fixtureRows, fixtureMerges)
+  const fixtureResult = await parseRecordsExcel(makeRealStructureFixture())
+  const fixtureByRow = new Map(fixtureResult.allRows.map((row) => [row.rowIndex, row]))
+  check(
+    '真实结构 fixture 的 42 条业务记录逐行绑定 Excel 物理行号与所属 merge 周期',
+    fixtureResult.allRows.length === 42 &&
+      [...fixtureExpected].every(([excelRow, expected]) => {
+        const row = fixtureByRow.get(excelRow)
+        return row?.nickname === expected.nickname &&
+          row.sourceTimeCycleRaw === expected.source &&
+          row.publish_date === expected.date
+      }),
+    JSON.stringify(fixtureResult.allRows.map((row) => [row.rowIndex, row.nickname, row.sourceTimeCycleRaw]))
+  )
+  check(
+    '五个空白分隔行保留真实行号，且不变成业务记录',
+    fixtureResult.blankRowIndexes.join(',') === '9,23,24,38,39',
+    JSON.stringify(fixtureResult.blankRowIndexes)
+  )
+  check(
+    '真实结构 fixture：42 条中仅 Excel 第27行 探花Gary 违反源周期',
+    fixtureResult.validRows.length === 41 &&
+      fixtureResult.failedRows.length === 1 &&
+      fixtureResult.failedRows[0].rowIndex === 27 &&
+      fixtureResult.sourceRangeViolationRows === 1 &&
+      fixtureResult.sourceRangeViolations[0].rowIndex === 27 &&
+      fixtureResult.sourceRangeViolations[0].nickname === '探花Gary' &&
+      fixtureResult.sourceRangeViolations[0].sourceTimeCycle === '08/27-09/02' &&
+      fixtureResult.failedRows[0].reason.includes('发布日期 2026-08-26 不在源时间周期 08/27-09/02 内'),
+    JSON.stringify(fixtureResult.sourceRangeViolations)
+  )
+  check(
+    'Excel 第40–48行九位达人均合法且来源严格为 09/03-09/09',
+    realNamedRows.slice(1).every(([excelRow, nickname]) => {
+      const row = fixtureResult.validRows.find((item) => item.rowIndex === excelRow)
+      return row?.nickname === nickname && row.sourceTimeCycleRaw === '09/03-09/09'
+    }),
+    JSON.stringify(fixtureResult.validRows.filter((row) => row.rowIndex >= 40).map((row) => [row.rowIndex, row.nickname, row.sourceTimeCycleRaw]))
+  )
+  const fixtureReparsed = await parseRecordsExcel(makeRealStructureFixture(), [], {
+    overrides: { '时间周期': 'time_cycle' }
+  })
+  const fixtureRemapped = excel.applyTimeCycleMapping(fixtureResult, {})
+  check(
+    '映射确认后二次解析与时间周期映射重校验均保持 42 条 / 1 条源周期异常及真实行号',
+    [fixtureReparsed, fixtureRemapped].every((result) =>
+      result.allRows.length === 42 &&
+      result.sourceRangeViolationRows === 1 &&
+      result.sourceRangeViolations[0].rowIndex === 27 &&
+      result.allRows.find((row) => row.rowIndex === 40)?.sourceTimeCycleRaw === '09/03-09/09'
+    )
+  )
 
   console.log('\n===== rowIndex 绑定审计（禁止数组下标对齐）=====')
   const alignRows = [

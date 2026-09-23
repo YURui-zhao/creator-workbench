@@ -1482,7 +1482,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
                 <div style={{ maxHeight: 140, overflow: 'auto' }}>
                   {preview.sourceRangeViolations.map((item) => (
                     <div key={item.rowIndex}>
-                      第 {item.rowIndex} 行：发布日期 {item.publishDate} 不在源时间周期{' '}
+                      Excel 第{item.rowIndex}行：{item.nickname} 发布日期 {item.publishDate} 不在源时间周期{' '}
                       {item.sourceTimeCycle} 内，请检查原始数据。
                     </div>
                   ))}

@@ -66,9 +66,13 @@ async function main() {
   const postCreate = getHandler(router, '/', 'post')
   const putRecord = getHandler(router, '/:id', 'put')
   const postBatch = getHandler(router, '/batch', 'post')
+  const postBatchUpdate = getHandler(router, '/batch-update', 'post')
   check(
-    '写接口 handler 可用（POST / PUT / batch）',
-    typeof postCreate === 'function' && typeof putRecord === 'function' && typeof postBatch === 'function'
+    '写接口 handler 可用（POST / PUT / batch / batch-update）',
+    typeof postCreate === 'function' &&
+      typeof putRecord === 'function' &&
+      typeof postBatch === 'function' &&
+      typeof postBatchUpdate === 'function'
   )
 
   const baselineCount = db.prepare('SELECT COUNT(*) AS n FROM creator_records').get().n
@@ -104,6 +108,11 @@ async function main() {
   const put = async (id, body) => {
     const res = createRes()
     await putRecord({ params: { id: String(id) }, body }, res)
+    return { status: res.statusCode, data: res.payload?.data, msg: res.payload?.msg }
+  }
+  const batchUpdate = async (ids, field, value) => {
+    const res = createRes()
+    await postBatchUpdate({ body: { ids, field, value } }, res)
     return { status: res.statusCode, data: res.payload?.data, msg: res.payload?.msg }
   }
 
@@ -353,6 +362,129 @@ async function main() {
       'COST-7：PUT total_cost=0 → 成功且数据库真实保存 0',
       putCostZero.status === 200 && getRow(recCost.row.id).total_cost === 0,
       JSON.stringify(getRow(recCost.row.id))
+    )
+
+    console.log('\n===== 时间周期 与 发布日期 一致性（Batch 6A-2 后端保护）=====')
+    const cycleOf = (id) =>
+      db.prepare('SELECT time_cycle FROM creator_records WHERE id = ?').get(id)?.time_cycle
+    const CYCLE_DATE_MSG = '时间周期与发布日期所属周不一致'
+
+    const postCycleMismatch = await postRaw({
+      time_cycle: '2026-W34',
+      nickname: uniqueNickname(),
+      total_cost: 1000,
+      publish_date: '2026-09-03'
+    })
+    check(
+      'CYCLE-1：POST 周期与发布日期不一致 → 400（不依赖前端即可拦截）',
+      postCycleMismatch.status === 400 && String(postCycleMismatch.msg).includes(CYCLE_DATE_MSG),
+      `${postCycleMismatch.status} ${postCycleMismatch.msg}`
+    )
+    check(
+      'CYCLE-1b：拒绝提示给出「正确的周」= 2026-W35（08/31 ~ 09/06），不再误导为 08/24-08/30',
+      String(postCycleMismatch.msg).includes('2026-W35') &&
+        String(postCycleMismatch.msg).includes('2026-08-31 ~ 2026-09-06') &&
+        !String(postCycleMismatch.msg).includes('2026-08-24'),
+      postCycleMismatch.msg
+    )
+
+    const postCycleMatch = await postRaw({
+      time_cycle: '2026-W35',
+      nickname: uniqueNickname(),
+      total_cost: 1000,
+      publish_date: '2026-09-03'
+    })
+    check(
+      'CYCLE-2：POST 周期 = 发布日期所属标准周 → 成功',
+      postCycleMatch.status === 200 && cycleOf(postCycleMatch.row?.id) === '2026-W35',
+      `${postCycleMatch.status} ${cycleOf(postCycleMatch.row?.id)}`
+    )
+
+    const cycleRecordId = postCycleMatch.row.id
+    const putDateMismatch = await put(cycleRecordId, { publish_date: '2026-09-08' })
+    check(
+      'CYCLE-3：PUT 只改发布日期（最终状态冲突）→ 400 且原值不变',
+      putDateMismatch.status === 400 && cycleOf(cycleRecordId) === '2026-W35',
+      `${putDateMismatch.status} ${cycleOf(cycleRecordId)}`
+    )
+
+    const putCycleMismatch = await put(cycleRecordId, { time_cycle: '2026-W34' })
+    check(
+      'CYCLE-4：PUT 只改周期为不匹配的周 → 400 且原值不变',
+      putCycleMismatch.status === 400 && cycleOf(cycleRecordId) === '2026-W35',
+      `${putCycleMismatch.status} ${cycleOf(cycleRecordId)}`
+    )
+
+    const putBothMatch = await put(cycleRecordId, {
+      publish_date: '2026-09-08',
+      time_cycle: '2026-W36'
+    })
+    check(
+      'CYCLE-5：PUT 同时改日期与周期且一致 → 成功',
+      putBothMatch.status === 200 && cycleOf(cycleRecordId) === '2026-W36',
+      `${putBothMatch.status} ${cycleOf(cycleRecordId)}`
+    )
+
+    const putNoDate = await put(cycleRecordId, { publish_date: null })
+    const putManualCycle = await put(cycleRecordId, { time_cycle: '2026-W20' })
+    check(
+      'CYCLE-6：发布日期为空时周期允许人工指定（不做日期归属校验）',
+      putNoDate.status === 200 &&
+        putManualCycle.status === 200 &&
+        cycleOf(cycleRecordId) === '2026-W20',
+      `${putNoDate.status}/${putManualCycle.status} ${cycleOf(cycleRecordId)}`
+    )
+
+    // ---- batch-update 批量改周期：必须逐条按最终状态满足日期归属（堵住绕过口）----
+    const cycleBatchRecord = await postRaw({
+      time_cycle: '2026-W35',
+      nickname: uniqueNickname(),
+      total_cost: 1000,
+      publish_date: '2026-09-03'
+    })
+    const cycleBatchId = cycleBatchRecord.row.id
+    const buMismatch = await batchUpdate([cycleBatchId], 'time_cycle', '08/24-08/30')
+    check(
+      'CYCLE-BU-1：batch-update 把 09/03 的记录改成 08/24-08/30 → 拒绝，且不写入错误周期',
+      buMismatch.status === 200 &&
+        buMismatch.data?.successCount === 0 &&
+        buMismatch.data?.failCount === 1 &&
+        String(buMismatch.data?.failList?.[0]?.reason).includes(CYCLE_DATE_MSG) &&
+        cycleOf(cycleBatchId) === '2026-W35',
+      `${buMismatch.status} ${JSON.stringify(buMismatch.data)} cycle=${cycleOf(cycleBatchId)}`
+    )
+    const buMatch = await batchUpdate([cycleBatchId], 'time_cycle', '08/31-09/06')
+    check(
+      'CYCLE-BU-2：batch-update 改成 08/31-09/06（= 09/03 的标准周）→ 成功',
+      buMatch.status === 200 &&
+        buMatch.data?.successCount === 1 &&
+        buMatch.data?.failCount === 0 &&
+        cycleOf(cycleBatchId) === '2026-W35',
+      `${buMatch.status} ${JSON.stringify(buMatch.data)} cycle=${cycleOf(cycleBatchId)}`
+    )
+    // 无发布日期的记录不受日期归属限制（仍可人工指定周期）
+    const buNoDate = await batchUpdate([cycleRecordId], 'time_cycle', '2026-W34')
+    check(
+      'CYCLE-BU-3：无发布日期的记录仍可批量改周期（不做日期归属校验）',
+      buNoDate.status === 200 &&
+        buNoDate.data?.successCount === 1 &&
+        cycleOf(cycleRecordId) === '2026-W34',
+      `${buNoDate.status} ${JSON.stringify(buNoDate.data)} cycle=${cycleOf(cycleRecordId)}`
+    )
+
+    const countBeforeCycleBatch = db.prepare('SELECT COUNT(*) AS n FROM creator_records').get().n
+    const batchCycleRes = createRes()
+    await postBatch(
+      { body: [basePayload({ time_cycle: '2026-W34', publish_date: '2026-09-03' })] },
+      batchCycleRes
+    )
+    check(
+      'CYCLE-BATCH：batch 行周期错配 → 400 + 行号，且不写库',
+      batchCycleRes.statusCode === 400 &&
+        String(batchCycleRes.payload?.msg).includes('第 1 条数据校验失败') &&
+        String(batchCycleRes.payload?.msg).includes(CYCLE_DATE_MSG) &&
+        db.prepare('SELECT COUNT(*) AS n FROM creator_records').get().n === countBeforeCycleBatch,
+      `${batchCycleRes.statusCode} ${batchCycleRes.payload?.msg}`
     )
 
     console.log('\n===== BATCH 批量导入 =====')

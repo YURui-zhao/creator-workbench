@@ -61,6 +61,32 @@ export function weekToDateRange(weekNum, year = config.businessYear) {
 }
 
 /**
+ * 任意日期 -> 所属自然周的周码（周一为每周第一天；跨年按周一所在年归属）
+ * 与前端 frontend/src/utils/dateCycle.js 的 dateToWeekCode 保持完全一致的 Monday-Sunday 定义：
+ * 前端负责导入时推导 time_cycle，后端负责写入校验，两边必须同源同结果。
+ * @param {Date|string} date 日期对象或 YYYY-MM-DD 字符串
+ * @param {number} [year] 参考年份（缺省取该日期所在年）
+ * @returns {string|null} 如 2026-W32
+ */
+export function dateToWeekCode(date, year) {
+  const d = date instanceof Date ? date : parseDate(date)
+  if (!d || Number.isNaN(d.getTime())) return null
+  const monday = getMonday(d)
+  const refYear = Number(year) || monday.getFullYear()
+  const weekYear = monday.getFullYear() !== refYear ? monday.getFullYear() : refYear
+  const firstMonday = firstMondayOfYear(weekYear)
+  let week = Math.floor((monday - firstMonday) / DAY_MS / 7) + 1
+  if (week < 1) {
+    // 兜底：归属上一年最后一个自然周
+    const prevYear = weekYear - 1
+    const prevFirstMonday = firstMondayOfYear(prevYear)
+    week = Math.floor((monday - prevFirstMonday) / DAY_MS / 7) + 1
+    return `${prevYear}-W${String(week).padStart(2, '0')}`
+  }
+  return `${weekYear}-W${String(week).padStart(2, '0')}`
+}
+
+/**
  * 日期范围 -> 周数（以起始日所在自然周为准，跨年自动归属）
  * @param {string} startDate YYYY-MM-DD
  * @param {string} endDate YYYY-MM-DD

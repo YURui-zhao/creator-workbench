@@ -2,8 +2,10 @@ import * as XLSX from 'xlsx'
 import dayjs from 'dayjs'
 import { calcCpm } from './calc.js'
 import {
+  dateToWeekCode,
   normalizeTimeCycleValue,
   parseTimeCycleToWeekCode,
+  weekCodeToDateRange,
   weekCodeToLabel
 } from './dateCycle.js'
 
@@ -47,11 +49,11 @@ export const FIELD_LABELS = {
   time_cycle: '时间周期',
   nickname: '达人昵称',
   homepage: '达人主页',
-  creator_type: '博主类型',
-  content_link: '植入内容链接',
+  creator_type: '达人类型',
+  content_link: '植入链接',
   total_cost: '总花费',
   publish_date: '发布日期',
-  video_link: '视频发布链接',
+  video_link: '视频链接',
   first_play: '7日播放量',
   second_week_play: '累计播放量'
 }
@@ -72,6 +74,244 @@ const FIELD_RULES = {
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
 const DATE_FUZZY_RE = /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/
+
+// ---------- 字段映射（Batch 6A：未知表头不得静默丢失）----------
+
+/** 「忽略此列」的哨兵值（用户显式选择，或系统计算列自动忽略） */
+export const IGNORE_FIELD = 'IGNORE'
+
+/** 允许作为导入目标字段的白名单（也是映射下拉的顺序） */
+export const IMPORT_FIELD_WHITELIST = [
+  'time_cycle',
+  'nickname',
+  'creator_type',
+  'homepage',
+  'content_link',
+  'video_link',
+  'total_cost',
+  'publish_date',
+  'first_play',
+  'second_week_play'
+]
+
+/** 字段映射下拉选项（含「忽略此列」） */
+export const MAPPING_FIELD_OPTIONS = [
+  { value: 'time_cycle', label: '时间周期' },
+  { value: 'nickname', label: '达人昵称' },
+  { value: 'creator_type', label: '达人类型' },
+  { value: 'homepage', label: '达人主页' },
+  { value: 'content_link', label: '植入链接' },
+  { value: 'video_link', label: '视频链接' },
+  { value: 'total_cost', label: '总花费' },
+  { value: 'publish_date', label: '发布日期' },
+  { value: 'first_play', label: '7日播放量' },
+  { value: 'second_week_play', label: '累计播放量' },
+  { value: IGNORE_FIELD, label: '忽略此列' }
+]
+
+// 系统计算列：导出文件自带、重新导入时天然忽略（属于「已知列」，不是未知字段）
+const SYSTEM_IGNORED_HEADER_KEYS = new Set([
+  'cpm',
+  'cpm数据',
+  '后续新增播放量',
+  '7日后新增播放量'
+])
+
+// 归一化表头用于关键词匹配：去空格、全角括号转半角、小写
+function normalizeHeaderKey(text) {
+  return String(text ?? '')
+    .trim()
+    .replace(/（/g, '(')
+    .replace(/）/g, ')')
+    .replace(/\s+/g, '')
+    .toLowerCase()
+}
+
+function isPlaceholderHeader(header) {
+  return /^__EMPTY(_\d+)?$/i.test(String(header ?? '').trim())
+}
+
+/**
+ * 本地确定性「字段建议」：仅根据表头关键词给出建议，绝不直接当作正式映射。
+ * 结果只用于「建议映射」列，用户确认后才生效。
+ * @param {string} header 原始表头
+ * @returns {{ field: string, confidence: 'high'|'medium'|'low', reason: string }|null}
+ */
+export function suggestFieldForHeader(header) {
+  const key = normalizeHeaderKey(header)
+  if (!key) return null
+  const has = (...words) => words.some((word) => key.includes(word))
+
+  // 报价 / CPM / 单价：不是本系统字段，明确不给出映射建议（交由用户选择忽略）
+  if (has('cpm', '报价', '单价')) return null
+
+  // 播放量：先看限定词，避免「播放量（新）」被泛匹配成 7日播放量
+  if (has('播放量', '播放数', '播放')) {
+    if (has('7日', '七日', '首发', '首周', '第一周')) {
+      return { field: 'first_play', confidence: 'high', reason: '表头含「首发 / 7日」，对应 7日播放量' }
+    }
+    if (has('累计', '最新', '次周', '第二周', '当前')) {
+      return {
+        field: 'second_week_play',
+        confidence: 'high',
+        reason: '表头含「累计 / 最新」，对应累计播放量'
+      }
+    }
+    if (has('新')) {
+      return {
+        field: 'second_week_play',
+        confidence: 'medium',
+        reason: '表头含「新」，疑似最新累计播放量，请确认'
+      }
+    }
+    return { field: '', confidence: 'low', reason: '仅含「播放」，无法区分 7日 / 累计播放量，请手动选择' }
+  }
+
+  // 链接类（先判断植入 / 视频，避免与「达人主页」混淆）
+  if (has('植入')) return { field: 'content_link', confidence: 'high', reason: '表头含「植入」' }
+  if (has('视频')) return { field: 'video_link', confidence: 'high', reason: '表头含「视频」链接' }
+  if (has('主页', '首页')) return { field: 'homepage', confidence: 'high', reason: '表头含「主页」' }
+
+  // 日期 / 周期
+  if (has('时间周期', '周期', '周次', '投放周')) {
+    return { field: 'time_cycle', confidence: 'high', reason: '表头含「周期 / 周」' }
+  }
+  if (has('日期', '发布时间', '发布日')) {
+    return { field: 'publish_date', confidence: 'high', reason: '表头含「日期」' }
+  }
+
+  // 昵称 / 类型 / 花费
+  if (has('昵称', '达人名', '博主名', '账号名', '达人')) {
+    return { field: 'nickname', confidence: 'high', reason: '表头含「昵称 / 达人」' }
+  }
+  if (has('类型', '品类', '分类')) {
+    return { field: 'creator_type', confidence: 'high', reason: '表头含「类型」' }
+  }
+  if (has('花费', '费用', '金额', '成本', '预算', '支出')) {
+    return { field: 'total_cost', confidence: 'high', reason: '表头含「花费 / 金额」' }
+  }
+  return null
+}
+
+/**
+ * 表头分类：内置映射 / 系统计算列 / 未识别
+ * overrides 为「用户或 AI 显式指定」的映射（header -> 字段名 | IGNORE）
+ * @returns {Array<{ header: string, field: string|null, status: 'mapped'|'ignored'|'system'|'unknown', source: string }>}
+ */
+export function classifyHeaders(headers, overrides = {}) {
+  const list = Array.isArray(headers) ? headers : []
+  const hasOverride = (header) => Object.prototype.hasOwnProperty.call(overrides, header)
+
+  return list.map((header) => {
+    const name = String(header ?? '')
+    if (hasOverride(header)) {
+      const target = overrides[header]
+      if (target && IMPORT_FIELD_WHITELIST.includes(target)) {
+        return { header: name, field: target, status: 'mapped', source: 'manual' }
+      }
+      // 显式忽略（IGNORE）或非法目标值：都按「用户已知情地忽略」处理，不再当作未知字段
+      return { header: name, field: null, status: 'ignored', source: 'manual' }
+    }
+    const builtin = HEADER_MAP[name] || (FIELD_RULES[name] ? name : null)
+    if (builtin) return { header: name, field: builtin, status: 'mapped', source: 'builtin' }
+    if (SYSTEM_IGNORED_HEADER_KEYS.has(normalizeHeaderKey(name))) {
+      return { header: name, field: null, status: 'system', source: 'system' }
+    }
+    return { header: name, field: null, status: 'unknown', source: 'unknown' }
+  })
+}
+
+/**
+ * 目标字段冲突检测：同一目标字段不允许有两个来源列（本轮不做字段合并）
+ * @param {Array<{ header: string, target?: string, field?: string }>} mappings
+ * @returns {Array<{ field: string, headers: string[] }>}
+ */
+export function detectMappingConflicts(mappings = []) {
+  const byField = new Map()
+  for (const item of Array.isArray(mappings) ? mappings : []) {
+    const field = item?.target || item?.field
+    if (!field || field === IGNORE_FIELD) continue
+    if (!byField.has(field)) byField.set(field, [])
+    byField.get(field).push(String(item.header ?? ''))
+  }
+  const conflicts = []
+  for (const [field, headers] of byField) {
+    if (headers.length > 1) conflicts.push({ field, headers })
+  }
+  return conflicts
+}
+
+/**
+ * 构造「字段映射确认」面板初始数据
+ * 规则：未识别字段一律默认「未选择」——即使系统 / AI 给出了建议，也**不会**自动选中；
+ *      用户必须主动选择映射字段或「忽略此列」后才能继续导入。
+ * @param {Object} result parseRecordsExcel 的解析结果
+ * @returns {{ items: Array, loading: boolean, error: string, notice: string }|null}
+ */
+export function buildHeaderMappingReview(result) {
+  const unknown = Array.isArray(result?.unknownHeaders) ? result.unknownHeaders : []
+  if (!unknown.length) return null
+  const suggestionMap = new Map(
+    (result.headerSuggestions || []).map((item) => [item.header, item])
+  )
+  const samples = result.headerSamples || {}
+  return {
+    loading: false,
+    error: '',
+    notice: '',
+    items: unknown.map((header) => {
+      const suggestion = suggestionMap.get(header)
+      return {
+        header,
+        samples: Array.isArray(samples[header]) ? samples[header] : [],
+        // 未选择：建议不等于用户确认
+        target: '',
+        suggestion: suggestion?.field || '',
+        confidence: suggestion?.confidence || '',
+        reason: suggestion?.reason || '未能自动识别，请选择对应字段或选择「忽略此列」',
+        source: suggestion?.field ? 'local' : 'none'
+      }
+    })
+  }
+}
+
+/**
+ * 是否所有未识别字段都已被用户明确选择（映射字段 或 忽略此列）
+ */
+export function isMappingReviewComplete(items = []) {
+  return (Array.isArray(items) ? items : []).every((item) => Boolean(item?.target))
+}
+
+// 每列前 N 个非空样例值（供未知字段建议与 AI 参考）
+function buildHeaderSamples(rawRows, headers, limit = 5) {
+  const samples = new Map()
+  for (const header of headers) {
+    const values = []
+    for (const row of rawRows) {
+      const value = row?.[header]
+      const text = value === undefined || value === null ? '' : String(value).trim()
+      if (!text) continue
+      if (values.includes(text)) continue
+      values.push(text)
+      if (values.length >= limit) break
+    }
+    samples.set(header, values)
+  }
+  return samples
+}
+
+// 重复表头行：整行与表头同名（≥2 列命中）→ 视为表头重复，跳过而不作为业务数据
+function isRepeatedHeaderRow(raw, fieldByHeader) {
+  let hits = 0
+  for (const header of fieldByHeader.keys()) {
+    const value = raw?.[header]
+    if (value === undefined || value === null) continue
+    if (String(value).trim() === String(header).trim()) hits += 1
+    if (hits >= 2) return true
+  }
+  return false
+}
+
 // 合并单元格内换行分隔符（兼容 \n、\r\n、\r）
 const NEWLINE_RE = /\r\n|\r|\n/
 // 数值字段的「无数据」占位写法：必填按 0、非必填按 null（不报错）
@@ -199,6 +439,140 @@ function normalizeDate(value) {
   return text
 }
 
+// ---------- 发布时间 -> 标准投放周（time_cycle 的唯一事实来源）----------
+// 语义（已冻结）：time_cycle = 发布日期所属的标准自然周（周一 ~ 周日）
+// 纯确定性日期计算，绝不交给 AI 推理，也不做字符串硬算。
+
+// 源业务周期（Excel 原分组）与发布日期不匹配时的提示文案。
+// 注意：sourceTimeCycle 是「业务/考核分组区间」，不要求周一起始、不要求 7 天，
+// 因此它天然可能不等于 canonical 自然周 —— 这本身不是问题，不得报警。
+// 只有「发布日期实际落在源区间之外」才是数据质量问题。
+export const SOURCE_RANGE_ERROR = '不在源时间周期'
+
+// 源业务区间文本：M/D、M.D、M月D日 等写法，分隔符支持 - ~ ～ 至 到
+const BUSINESS_RANGE_RE =
+  /^(\d{1,2})[./月](\d{1,2})日?[-–—~～至到](\d{1,2})[./月](\d{1,2})日?$/
+
+function pad2(value) {
+  return String(value).padStart(2, '0')
+}
+
+function buildValidDate(year, month, day) {
+  const date = new Date(year, month - 1, day)
+  // 拒绝 2 月 30 日这类溢出后被自动进位的写法
+  if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) {
+    return null
+  }
+  return date
+}
+
+function toDateText(date) {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`
+}
+
+/**
+ * 解析 Excel 原业务/考核分组周期（sourceTimeCycle）为日期区间。
+ * - 不要求周一起始、不要求恰好 7 天（如 09/01-09/08、09/03-09/09 都是合法业务区间）
+ * - 年份按 referenceDate（通常是发布日期）就近推断，跨月 / 跨年正确
+ * - 完全不使用 parseTimeCycleToWeekCode（该方法只接受标准自然周）
+ * @param {string} text 原始文本
+ * @param {string|Date} [referenceDate] 参考日期（发布日期），用于年份推断
+ * @returns {{ startDate: string, endDate: string }|null}
+ */
+export function parseBusinessDateRange(text, referenceDate) {
+  const raw = String(text ?? '').replace(/\s+/g, '')
+  if (!raw) return null
+
+  // 显式周码写法（2026-W35）：按标准自然周展开
+  const weekMatch = /^(\d{4})-W(\d{1,2})$/i.exec(raw)
+  if (weekMatch) {
+    const range = weekCodeToDateRange(`${weekMatch[1]}-W${weekMatch[2]}`)
+    return range ? { startDate: range.startDate, endDate: range.endDate } : null
+  }
+
+  const match = BUSINESS_RANGE_RE.exec(raw)
+  if (!match) return null
+  const [, m1, d1, m2, d2] = match
+  const ref = referenceDate instanceof Date ? referenceDate : new Date(`${String(referenceDate ?? '').trim()}T00:00:00`)
+  const refValid = !Number.isNaN(ref.getTime())
+  const refText = refValid ? toDateText(ref) : ''
+
+  // 候选区间：参考年 / 参考年±1，取「包含参考日期」的那个；都不包含时取参考年
+  const candidates = []
+  const baseYear = refValid ? ref.getFullYear() : new Date().getFullYear()
+  for (const year of [baseYear, baseYear - 1, baseYear + 1]) {
+    const start = buildValidDate(year, Number(m1), Number(d1))
+    if (!start) continue
+    let end = buildValidDate(year, Number(m2), Number(d2))
+    if (!end) continue
+    // 跨年（如 12/28-01/03）：结束日期早于开始日期时，视为次年
+    if (end.getTime() < start.getTime()) {
+      end = buildValidDate(year + 1, Number(m2), Number(d2))
+      if (!end) continue
+    }
+    candidates.push({ startDate: toDateText(start), endDate: toDateText(end) })
+  }
+  if (!candidates.length) return null
+  if (!refValid || !refText) return candidates[0]
+
+  const containing = candidates.find(
+    (item) => refText >= item.startDate && refText <= item.endDate
+  )
+  if (containing) return containing
+  // 没有包含参考日期的候选：返回与参考日期距离最近的那个（用于给出「不在区间内」的判断）
+  const distance = (item) => {
+    if (refText < item.startDate) return new Date(`${item.startDate}T00:00:00`) - ref
+    if (refText > item.endDate) return ref - new Date(`${item.endDate}T00:00:00`)
+    return 0
+  }
+  return candidates.slice().sort((a, b) => distance(a) - distance(b))[0]
+}
+
+/**
+ * 源业务区间一致性检查：发布日期是否落在 Excel 原业务周期内。
+ * - sourceTimeCycle 缺失 / 不是可解析的日期范围 → 无法检查，返回 null（不报错）
+ * - 落在区间内 → null（合法，不产生任何警告）
+ * - 落在区间外 → 返回错误文案（数据质量异常）
+ * @param {Object} row 解析行（需含 publish_date 与 sourceTimeCycleRaw/sourceTimeCycle）
+ * @returns {{ reason: string, range: Object }|null}
+ */
+export function checkSourceTimeCycleRange(row = {}) {
+  const sourceText = String(row.sourceTimeCycleRaw || row.sourceTimeCycle || '').trim()
+  const publishDate = typeof row.publish_date === 'string' ? row.publish_date.trim() : ''
+  if (!sourceText || !publishDate) return null
+  const range = parseBusinessDateRange(sourceText, publishDate)
+  if (!range) return null
+  if (publishDate >= range.startDate && publishDate <= range.endDate) return null
+  return {
+    // 文案按业务要求明确给出「发布日期 / 源周期」，便于在预览与失败明细中追溯
+    reason: `发布日期 ${publishDate} ${SOURCE_RANGE_ERROR} ${sourceText} 内，请检查原始数据。`,
+    range
+  }
+}
+
+/**
+ * 发布日期 -> 标准周码（YYYY-Wxx，周一为每周第一天）
+ * @param {string|Date} date 发布日期（YYYY-MM-DD / Date）
+ * @returns {string|null} 标准周码；日期非法或为空时返回 null
+ */
+export function publishDateToWeekCode(date) {
+  const text = date instanceof Date ? '' : String(date ?? '').trim()
+  const parsed = date instanceof Date ? date : new Date(`${text}T00:00:00`)
+  if (!parsed || Number.isNaN(parsed.getTime())) return null
+  // 以该日期所属年份作为跨年归属基准（周一所在年优先，年末/年初都正确）
+  return dateToWeekCode(parsed, parsed.getFullYear())
+}
+
+/**
+ * 发布日期 -> 标准周区间标签（08/31-09/06）
+ * @param {string|Date} date 发布日期
+ * @returns {string|null}
+ */
+export function publishDateToTimeCycle(date) {
+  const weekCode = publishDateToWeekCode(date)
+  return weekCode ? weekCodeToLabel(weekCode) : null
+}
+
 // ---------- 单元格清洗与校验 ----------
 // 数值解析：去掉货币符号/千分位/空格/「元」后缀，并支持「1.2万」「1万」「1.5亿」写法
 function parseQuantity(value) {
@@ -266,6 +640,11 @@ function normalizeCellValue(field, value) {
   }
 
   if (spec.type === 'number' || spec.type === 'int') {
+    // 总花费业务写法：'免费' = 0（仅 total_cost 生效；不泛化成「所有文字 → 0」）
+    if (field === 'total_cost') {
+      const text = String(value).trim()
+      if (text === '免费') return { value: 0, error: null }
+    }
     // 占位写法（/ - -- 无 空 暂无 等）：必填字段按 0，非必填字段按 null（不报错）
     if (isEmptyNumberToken(value)) {
       return spec.required ? { value: 0, error: null } : { value: undefined, error: null }
@@ -355,17 +734,29 @@ function expandMergedCells(sheet, rawRows) {
  * 解析 Excel 文件并完成字段映射与行级校验
  * @param {File} file 上传的 .xlsx / .xls 文件
  * @param {Array<Object>} [cycles] 后端周期选项（用于月日区间自动识别为周码）
+ * @param {{ overrides?: Object }} [options] overrides：用户 / AI 显式指定的字段映射
+ *        （header -> 字段名 | IGNORE_FIELD；未列出的表头仍走内置映射）
  * @returns {Promise<{
  *   fileName: string,
  *   headers: string[],
  *   mappedFields: string[],
  *   missingFields: string[],
+ *   recognizedHeaders: string[],
+ *   unknownHeaders: string[],
+ *   ignoredHeaders: string[],
+ *   headerMappings: Array<Object>,
+ *   headerSuggestions: Array<Object>,
+ *   headerSamples: Object,
  *   previewRows: Array<Object>,
  *   validRows: Array<Object>,
  *   failedRows: Array<{ rowIndex: number, reason: string }>
  * }>}
  */
-export async function parseRecordsExcel(file, cycles = []) {
+export async function parseRecordsExcel(file, cycles = [], options = {}) {
+  const overrides =
+    options && typeof options.overrides === 'object' && options.overrides !== null
+      ? options.overrides
+      : {}
   const buffer = await file.arrayBuffer()
   const workbook = XLSX.read(buffer, { type: 'array' })
   const sheet = workbook.Sheets[workbook.SheetNames[0]]
@@ -385,9 +776,50 @@ export async function parseRecordsExcel(file, cycles = []) {
     }
   }
 
+  // 每列样例值（未知字段建议 / AI 识别参考）
+  const sampleMap = buildHeaderSamples(rawRows, headers)
+  // 表头分类：内置映射 / 手工映射 / 系统计算列 / 未识别
+  const classified = classifyHeaders(headers, overrides)
+  // 未识别的「无表头空列」（__EMPTY）没有任何列名与数据，直接不算「未识别字段」，避免无效打扰
+  const unknownHeaders = classified
+    .filter((item) => item.status === 'unknown')
+    .filter((item) => !isPlaceholderHeader(item.header) || (sampleMap.get(item.header) || []).length > 0)
+    .map((item) => item.header)
+  const recognizedHeaders = classified.filter((item) => item.field).map((item) => item.header)
+  const ignoredHeaders = classified.filter((item) => item.status === 'ignored').map((item) => item.header)
+  const systemIgnoredHeaders = classified.filter((item) => item.status === 'system').map((item) => item.header)
+
+  // 列 -> 目标字段（仅已映射的列参与行解析；未映射 / 忽略的列不会读写任何字段）
+  const fieldByHeader = new Map(
+    classified.filter((item) => item.field).map((item) => [item.header, item.field])
+  )
+
+  // 未知字段的本地确定性建议（只作「建议」，用户确认后才生效）
+  const headerSuggestions = unknownHeaders
+    .map((header) => {
+      const suggestion = suggestFieldForHeader(header)
+      if (!suggestion) return null
+      return { header, field: suggestion.field, confidence: suggestion.confidence, reason: suggestion.reason }
+    })
+    .filter(Boolean)
+
+  const suggestionMap = new Map(headerSuggestions.map((item) => [item.header, item]))
+  const headerMappings = classified.map((item) => {
+    const suggestion = suggestionMap.get(item.header) || null
+    return {
+      header: item.header,
+      field: item.field,
+      status: item.status,
+      source: item.source,
+      suggestion: suggestion ? suggestion.field : '',
+      confidence: suggestion ? suggestion.confidence : '',
+      reason: suggestion ? suggestion.reason : ''
+    }
+  })
+
   // 已匹配到的数据库字段（表头 -> 字段名，去重）
   const mappedFields = headers
-    .map((h) => HEADER_MAP[h] || (FIELD_RULES[h] ? h : null))
+    .map((h) => fieldByHeader.get(h))
     .filter(Boolean)
   const missingFields = Object.keys(FIELD_RULES).filter(
     (f) => FIELD_RULES[f].required && !mappedFields.includes(f)
@@ -398,36 +830,94 @@ export async function parseRecordsExcel(file, cycles = []) {
   const failedRows = []
   // 自动跳过的空白行（整行无有效值，不进入校验与报错列表）
   const blankRowIndexes = []
+  // 重复表头行（整行与表头同名）：跳过，不继承时间周期、不作为业务数据
+  const headerRowIndexes = []
   // 本地规则无法识别的时间周期原始值（去重，供 AI 兜底识别）
   const unrecognizedCycles = new Set()
+  // 发布日期不在 Excel 原业务周期内的行（数据质量异常 → 该行判失败，不参与导入）
+  const sourceRangeViolations = []
+  // 时间周期向下继承：上一条「有效业务行」的时间周期（空行 / 重复表头行不更新）
+  let carriedCycle = ''
 
   rawRows.forEach((raw, index) => {
     const rowIndex = index + 2 // Excel 第 1 行为表头，数据从第 2 行开始
+
+    // 重复表头行：整行与表头同名 → 跳过（既不继承周期，也不参与校验 / 入库）
+    if (isRepeatedHeaderRow(raw, fieldByHeader)) {
+      headerRowIndexes.push(rowIndex)
+      return
+    }
+
     const mapped = { rowIndex }
     let hasValue = false
+    // Excel 自带的「时间周期」列：只作为来源信息（sourceTimeCycle），不再是最终事实来源
+    let sourceCycleRaw = ''
 
     for (const header of headers) {
-      const field = HEADER_MAP[header] || (FIELD_RULES[header] ? header : null)
+      const field = fieldByHeader.get(header)
       if (!field) continue
       let value = raw[header]
       // 纯空白（空格/制表符）也视为空，避免空白行误报必填错误
       if (value !== undefined && String(value).trim() !== '') hasValue = true
       if (field === 'publish_date') value = normalizeDate(value)
       if (field === 'time_cycle') {
-        const rawText = value === undefined || value === null ? '' : String(value).trim()
-        value = normalizeTimeCycleValue(value, cycles)
-        // 本地无法识别（非标准周码且不满足自然周规则）时收集原始值
-        if (rawText && parseTimeCycleToWeekCode(rawText) === null) {
-          unrecognizedCycles.add(rawText)
+        sourceCycleRaw = value === undefined || value === null ? '' : String(value).trim()
+        let rawText = sourceCycleRaw
+        // 合并单元格之外的空周期：继承上方最近一条有效业务行的周期（不修改原始 Excel）
+        if (!rawText && carriedCycle) {
+          value = carriedCycle
+          rawText = carriedCycle
         }
+        value = normalizeTimeCycleValue(value, cycles)
+        // 注意：这里的中间结果只用于「来源信息 / 无发布日期时的兜底」，
+        // 是否进入 AI 识别面板在下面按「有没有可用的发布日期」决定
       }
       mapped[field] = value === undefined || value === '' ? undefined : value
     }
 
     if (!hasValue) {
-      // 跳过完全空白的行（计入「跳过」统计，不产生任何报错）
+      // 跳过完全空白的行（计入「跳过」统计，不产生任何报错；也不更新继承周期）
       blankRowIndexes.push(rowIndex)
       return
+    }
+
+    // 该行是有效业务行：把本行的时间周期记为后续空行的继承来源
+    if (mapped.time_cycle) carriedCycle = mapped.time_cycle
+
+    // ---------- 时间周期归属（发布日前优先，确定性计算）----------
+    // canonicalCycle：发布日期所属标准周（唯一事实来源）
+    const sourceWeekCode = mapped.time_cycle || '' // 标准化后的来源/继承周期（可能为空）
+    const canonicalCycle = mapped.publish_date ? publishDateToWeekCode(mapped.publish_date) : null
+    // 记录来源信息（仅解析过程使用，不写数据库）
+    mapped.sourceTimeCycle = sourceWeekCode || undefined
+    mapped.sourceTimeCycleRaw = sourceCycleRaw || undefined
+    // 源业务周期一致性检查的结果（作为该行的数据质量错误）
+    let sourceRangeError = null
+
+    if (canonicalCycle) {
+      // 发布日期存在且合法 → 最终周期一律由发布日期推导（与源分组是否相同无关，不做「不一致」警告）
+      mapped.time_cycle = canonicalCycle
+      // 数据质量检查：发布日期必须落在 Excel 原业务周期内（业务区间不要求周一起始 / 不要求 7 天）
+      const sourceCheck = checkSourceTimeCycleRange(mapped)
+      if (sourceCheck) {
+        sourceRangeError = sourceCheck.reason
+        sourceRangeViolations.push({
+          rowIndex,
+          publishDate: mapped.publish_date,
+          sourceTimeCycle: sourceCycleRaw,
+          timeCycle: canonicalCycle,
+          timeCycleLabel: weekCodeToLabel(canonicalCycle),
+          range: sourceCheck.range
+        })
+      }
+    } else {
+      // 无可用发布日期：只能依赖来源周期；无法确定时进入人工 / AI 识别面板
+      mapped.time_cycle = sourceWeekCode || undefined
+      // 源周期存在但本地无法确定（非标准周码、也不是完整自然周）→ 收集原始值交人工 / AI 确认
+      if (sourceCycleRaw && parseTimeCycleToWeekCode(sourceCycleRaw) === null) {
+        unrecognizedCycles.add(sourceCycleRaw)
+      }
+      // 源周期与发布日期都拿不到 → 保留原样，由必填校验给出「时间周期不能为空」，不做猜测
     }
 
     // 逐行逐列判定：每个单元格按所属列规则清洗与校验
@@ -440,6 +930,8 @@ export async function parseRecordsExcel(file, cycles = []) {
     // 跨字段校验：累计播放量不得小于 7日播放量（V2 规则）
     const playRangeError = findPlayRangeError(mapped)
     if (playRangeError) cellErrors.push(playRangeError)
+    // 源业务周期一致性：发布日期不在源周期内 → 该行判失败（要求修正 / 确认后再导入）
+    if (sourceRangeError) cellErrors.push({ field: 'time_cycle', reason: sourceRangeError })
 
     if (cellErrors.length) {
       failedRows.push({
@@ -458,12 +950,24 @@ export async function parseRecordsExcel(file, cycles = []) {
     headers,
     mappedFields,
     missingFields,
+    // 字段识别结果（Batch 6A）：未识别字段必须显式暴露，不能静默丢弃
+    recognizedHeaders,
+    unknownHeaders,
+    ignoredHeaders,
+    systemIgnoredHeaders,
+    headerMappings,
+    headerSuggestions,
+    headerSamples: Object.fromEntries(sampleMap),
     previewRows: mappedRows.slice(0, 5),
     allRows: mappedRows,
     validRows,
     failedRows,
     blankRows: blankRowIndexes.length,
     blankRowIndexes,
+    repeatedHeaderRows: headerRowIndexes.length,
+    headerRowIndexes,
+    sourceRangeViolations,
+    sourceRangeViolationRows: sourceRangeViolations.length,
     unrecognizedTimeCycles: [...unrecognizedCycles]
   }
 }
@@ -523,15 +1027,36 @@ export function applyTimeCycleMapping(result, mapping = {}) {
   const mappedRows = []
   const validRows = []
   const failedRows = []
+  const sourceRangeViolations = []
 
   for (const row of rows) {
     const next = { rowIndex: row.rowIndex }
     for (const field of Object.keys(FIELD_RULES)) {
       next[field] = row[field]
     }
+    // 保留解析期的来源信息（不属于入库字段）
+    if (row.sourceTimeCycle) next.sourceTimeCycle = row.sourceTimeCycle
+    if (row.sourceTimeCycleRaw) next.sourceTimeCycleRaw = row.sourceTimeCycleRaw
 
-    // 应用映射：命中原始值则替换为识别结果（null/空 表示跳过该值）
-    if (
+    // 发布日期优先：有有效发布日期时，识别面板的结果不得覆盖标准周归属
+    const canonicalCycle = next.publish_date ? publishDateToWeekCode(next.publish_date) : null
+    let sourceRangeError = null
+    if (canonicalCycle) {
+      next.time_cycle = canonicalCycle
+      const sourceCheck = checkSourceTimeCycleRange(next)
+      if (sourceCheck) {
+        sourceRangeError = sourceCheck.reason
+        sourceRangeViolations.push({
+          rowIndex: next.rowIndex,
+          publishDate: next.publish_date,
+          sourceTimeCycle: next.sourceTimeCycleRaw || next.sourceTimeCycle,
+          timeCycle: canonicalCycle,
+          timeCycleLabel: weekCodeToLabel(canonicalCycle),
+          range: sourceCheck.range
+        })
+      }
+    } else if (
+      // 无发布日期：应用识别结果（命中原始值则替换；null/空 表示跳过该值）
       typeof next.time_cycle === 'string' &&
       Object.prototype.hasOwnProperty.call(mapping, next.time_cycle)
     ) {
@@ -548,6 +1073,7 @@ export function applyTimeCycleMapping(result, mapping = {}) {
     // 跨字段校验：累计播放量不得小于 7日播放量（V2 规则）
     const playRangeError = findPlayRangeError(next)
     if (playRangeError) cellErrors.push(playRangeError)
+    if (sourceRangeError) cellErrors.push({ field: 'time_cycle', reason: sourceRangeError })
 
     if (cellErrors.length) {
       failedRows.push({
@@ -567,6 +1093,8 @@ export function applyTimeCycleMapping(result, mapping = {}) {
     failedRows,
     previewRows: mappedRows.slice(0, 5),
     allRows: mappedRows,
+    sourceRangeViolations,
+    sourceRangeViolationRows: sourceRangeViolations.length,
     unrecognizedTimeCycles: []
   }
 }

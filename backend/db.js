@@ -3,7 +3,10 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const dbPath = path.join(__dirname, 'workbench.db')
+// 默认使用 backend/workbench.db；允许通过环境变量指向其它数据库文件（仅用于测试隔离）
+const dbPath = process.env.WORKBENCH_DB_PATH
+  ? path.resolve(process.env.WORKBENCH_DB_PATH)
+  : path.join(__dirname, 'workbench.db')
 
 // 首次运行自动创建数据库文件与数据表
 const db = new Database(dbPath)

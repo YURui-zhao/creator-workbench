@@ -11,6 +11,7 @@ import {
   List,
   Modal,
   Row,
+  Select,
   Space,
   Spin,
   Statistic,
@@ -25,13 +26,18 @@ import {
 import { InboxOutlined } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
 import { batchCreateRecords, fetchAllRecords, getCycles } from '../api/records'
-import { normalizeTimeCyclesAI, validateRecordsAI } from '../api/ai'
+import { normalizeTimeCyclesAI, suggestFieldMappingsAI, validateRecordsAI } from '../api/ai'
 import { getAiConfig } from '../utils/aiConfig.js'
 import { getErrorMessage } from '../utils/request.js'
 import {
   applyTimeCycleMapping,
+  buildHeaderMappingReview,
   FIELD_LABELS,
+  IGNORE_FIELD,
+  isMappingReviewComplete,
+  MAPPING_FIELD_OPTIONS,
   dedupeImportRows,
+  detectMappingConflicts,
   exportFailedRowsToExcel,
   parseRecordsExcel,
   sanitizeCorrectedFields,
@@ -112,10 +118,27 @@ function renderCell(field) {
 function renderTimeCycle(value, record) {
   const error = record.cellErrors?.find((item) => item.field === 'time_cycle')
   const display = weekCodeToLabel(value)
-  if (!error) return display
+  if (error) {
+    return (
+      <Tooltip title={error.reason}>
+        <span style={{ color: '#ff4d4f', cursor: 'help' }}>{display}</span>
+      </Tooltip>
+    )
+  }
+  // 源业务周期只作来源信息展示（它与 canonical 自然周不同属于正常情况，不做警告）
+  const sourceText = record.sourceTimeCycleRaw || ''
+  if (!sourceText) return display
   return (
-    <Tooltip title={error.reason}>
-      <span style={{ color: '#ff4d4f', cursor: 'help' }}>{display}</span>
+    <Tooltip title={`源业务周期：${sourceText}（最终按发布日期归属）`}>
+      <span style={{ cursor: 'help' }}>
+        {display}
+        <Tag
+          color="default"
+          style={{ marginLeft: 4, fontSize: 11, lineHeight: '16px', padding: '0 4px' }}
+        >
+          源
+        </Tag>
+      </span>
     </Tooltip>
   )
 }
@@ -172,6 +195,11 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   const [customRules, setCustomRules] = useState('')
   // 时间周期智能识别（本地规则无法识别时的 AI 兜底）
   const [cycleReview, setCycleReview] = useState(null)
+  // 字段映射确认（Batch 6A：存在未识别表头时必须先确认，不允许静默丢弃）
+  const [mappingReview, setMappingReview] = useState(null)
+  // 最近一次上传的文件与周期选项：用户确认字段映射后需要重新解析同一份文件
+  const sourceFileRef = useRef(null)
+  const sourceCyclesRef = useRef([])
   // 时间周期 AI 识别备注（按 Excel 行号索引）：AI 输出 / AI 识别失败原因，用于界面展示与失败明细导出
   const [cycleNotes, setCycleNotes] = useState({})
   // 去重阶段剔除的行（行号 + 原因）：应用时间周期映射后需要继续保持排除
@@ -223,12 +251,14 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     () => ({
       成功: importRows.length,
       失败: failedRows.length,
-      跳过: (preview?.blankRows || 0) + skippedRowIndexes.length,
+      // 跳过 = 空白行 + 重复表头行 + 时间周期面板中手动跳过的行
+      跳过: (preview?.blankRows || 0) + (preview?.repeatedHeaderRows || 0) + skippedRowIndexes.length,
       重复: duplicateRows.length
     }),
     [importRows.length, failedRows.length, preview, skippedRowIndexes.length, duplicateRows.length]
   )
   const blankRowIndexes = preview?.blankRowIndexes || []
+  const headerRowIndexes = preview?.headerRowIndexes || []
 
   // AI 校验错误行（未修正）：不拦截警告，仅错误行跳过入库
   const aiErrorRowIndexes = useMemo(
@@ -261,7 +291,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   }
 
   // 忙碌状态：解析/AI校验/导入中禁止关闭，避免异步回调写入已重置的状态
-  const busy = parsing || importing || aiLoading
+  const busy = parsing || importing || aiLoading || Boolean(mappingReview?.loading)
 
   // 重置并回到上传步骤
   const resetUpload = () => {
@@ -272,12 +302,15 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     setAiFormatError(false)
     setImportError('')
     setCycleReview(null)
+    setMappingReview(null)
     setCycleNotes({})
     setImportRows([])
     setFixedIndexes(new Set())
     setDuplicateRows([])
     setSkippedRowIndexes([])
     excludedRowsRef.current = []
+    sourceFileRef.current = null
+    sourceCyclesRef.current = []
     setParsing(false)
     setImporting(false)
   }
@@ -561,19 +594,89 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     await continueAfterCycleReview(preview)
   }
 
-  // ---------- 上传 -> 解析 -> 本地校验/去重 -> AI 校验 ----------
-  const handleFile = async (file) => {
+  // ---------- 字段映射确认（Batch 6A）----------
+  // 映射面板初始数据由 excel.js 的纯函数构造：
+  // 未识别表头一律默认「未选择」，系统 / AI 的建议只是建议，必须用户主动确认
+  const buildMappingReview = (result) => buildHeaderMappingReview(result)
+
+  // 对「仍无法确定」的未识别字段调用 AI 建议（AI = 增强建议，不是导入前置依赖）
+  const requestFieldMappingSuggestions = async (review) => {
+    const config = getAiConfig()
+    if (!config?.apiKey) {
+      return { ...review, loading: false, notice: '未配置 AI 密钥，请手动确认下列字段映射后继续' }
+    }
+    try {
+      const columns = review.items.map((item) => ({ header: item.header, samples: item.samples }))
+      const res = await suggestFieldMappingsAI(columns)
+      const map = new Map((res.data?.suggestions || []).map((item) => [item.source_header, item]))
+      return {
+        ...review,
+        loading: false,
+        error: '',
+        items: review.items.map((item) => {
+          // 本地已有建议时不覆盖；AI 只补充「本地完全没识别」的字段
+          if (item.suggestion) return item
+          const hit = map.get(item.header)
+          const field = String(hit?.suggested_field || '').trim()
+          if (!field || field === 'UNKNOWN') return item
+          return {
+            ...item,
+            // 仅作为「建议映射」展示，绝不自动填入用户的最终选择
+            aiSuggestion: field,
+            confidence: hit?.confidence || 'low',
+            reason: hit?.reason || 'AI 建议',
+            source: 'ai'
+          }
+        })
+      }
+    } catch (err) {
+      // AI 失败不影响导入：退回手动映射
+      return {
+        ...review,
+        loading: false,
+        error: getErrorMessage(err),
+        notice: 'AI 字段识别失败，请手动确认字段映射'
+      }
+    }
+  }
+
+  const updateMappingItem = (index, patch) => {
+    setMappingReview((prev) =>
+      prev
+        ? { ...prev, items: prev.items.map((item, i) => (i === index ? { ...item, ...patch } : item)) }
+        : prev
+    )
+  }
+
+  // 目标字段冲突（同一目标字段有多个来源列）：本轮不做字段合并，必须由用户消除冲突
+  const mappingConflicts = useMemo(
+    () => detectMappingConflicts(mappingReview?.items || []),
+    [mappingReview]
+  )
+  // 只要还有未识别字段没有明确选择（映射字段 或 忽略此列），就不允许继续
+  const mappingIncomplete = !isMappingReviewComplete(mappingReview?.items || [])
+
+  // 用户确认映射后：用同一份文件按确认的映射重新解析，再走原导入流程
+  const applyHeaderMapping = async () => {
+    if (!mappingReview || mappingConflicts.length || mappingIncomplete) return
+    const overrides = {}
+    for (const item of mappingReview.items) overrides[item.header] = item.target || IGNORE_FIELD
+    setMappingReview(null)
     setParsing(true)
     try {
-      // 获取周期选项：导入时「08/13-08/19」自动识别为对应 weekCode
-      let cycles = []
-      try {
-        const cyclesRes = await getCycles()
-        cycles = cyclesRes.data
-      } catch {
-        // 周期选项获取失败不影响解析，走兜底换算
-      }
-      const result = await parseRecordsExcel(file, cycles)
+      const result = await parseRecordsExcel(sourceFileRef.current, sourceCyclesRef.current, {
+        overrides
+      })
+      await runImportPipeline(result)
+    } catch (err) {
+      message.error(`文件解析失败：${err.message}`)
+    } finally {
+      setParsing(false)
+    }
+  }
+
+  // ---------- 解析后的通用流程：本地校验/去重 -> 时间周期识别 -> AI 校验 ----------
+  const runImportPipeline = async (result) => {
       // 自动判定无效数据：与库中已有记录重复、文件内重复的行剔除
       excludedRowsRef.current = []
       setDuplicateRows([])
@@ -639,6 +742,40 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
         setStep(1)
         await runAiValidation(result.validRows)
       }
+      return false
+  }
+
+  // ---------- 上传 -> 解析 -> 字段映射确认 -> 本地校验/去重 -> AI 校验 ----------
+  const handleFile = async (file) => {
+    setParsing(true)
+    try {
+      // 获取周期选项：导入时「08/13-08/19」自动识别为对应 weekCode
+      let cycles = []
+      try {
+        const cyclesRes = await getCycles()
+        cycles = cyclesRes.data
+      } catch {
+        // 周期选项获取失败不影响解析，走兜底换算
+      }
+      // 记录本次上传的文件与周期选项：用户确认字段映射后需要用同一份文件重新解析
+      sourceFileRef.current = file
+      sourceCyclesRef.current = cycles
+      const result = await parseRecordsExcel(file, cycles)
+
+      // 存在未识别表头：先进入字段映射确认，绝不静默丢弃（Batch 6A P0 修复）
+      const review = buildMappingReview(result)
+      if (review) {
+        setPreview(result)
+        setMappingReview(review)
+        setStep(1)
+        if (getAiConfig()?.apiKey) {
+          setMappingReview({ ...review, loading: true })
+          setMappingReview(await requestFieldMappingSuggestions(review))
+        }
+        return false
+      }
+
+      await runImportPipeline(result)
     } catch (err) {
       message.error(`文件解析失败：${err.message}`)
     } finally {
@@ -668,6 +805,11 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
 
   // ---------- 确认导入（导入修正后的数据） ----------
   const handleConfirm = async () => {
+    // 安全兜底：存在未确认的字段映射时，绝不允许正式导入（避免「假成功」）
+    if (mappingReview) {
+      message.warning('请先完成字段映射确认后再导入')
+      return
+    }
     // 仅导入「本地校验通过 - AI校验错误」的记录（警告不拦截）
     if (!importableRows.length) return
     setImporting(true)
@@ -895,6 +1037,24 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     if (!preview) {
       return <Button onClick={closeModal}>关闭</Button>
     }
+    // 字段映射确认：未确认完成前不允许进入导入（避免未识别列静默丢失后仍提示成功）
+    if (mappingReview) {
+      return (
+        <Space>
+          <Button onClick={closeModal} disabled={parsing}>
+            取消
+          </Button>
+          <Button
+            type="primary"
+            onClick={applyHeaderMapping}
+            loading={parsing}
+            disabled={mappingReview.loading || mappingIncomplete || mappingConflicts.length > 0}
+          >
+            确认字段映射并继续
+          </Button>
+        </Space>
+      )
+    }
     if (step === 1 && aiLoading) {
       return <Button disabled>取消</Button>
     }
@@ -1004,6 +1164,112 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
               }
             ]}
           />
+        </Space>
+      )}
+
+      {/* 步骤1.5：字段映射确认（Batch 6A：存在未识别表头时必须先确认，不允许静默丢弃） */}
+      {mappingReview && (
+        <Space direction="vertical" size="middle" style={{ display: 'flex' }}>
+          <Alert
+            type="warning"
+            showIcon
+            message={`发现 ${mappingReview.items.length} 个未识别字段，请确认后再导入`}
+            description="下列源字段未匹配到系统已知列名，请为每一列选择对应字段，或明确选择「忽略此列」。全部确认前无法进入导入。"
+          />
+          {mappingIncomplete && (
+            <Alert
+              type="info"
+              showIcon
+              message="请为所有未识别字段选择映射关系，或明确选择「忽略此列」。"
+            />
+          )}
+          {mappingReview.loading && (
+            <Typography.Text type="secondary">正在请求 AI 识别字段含义…</Typography.Text>
+          )}
+          {mappingReview.error && <Alert type="error" showIcon message={mappingReview.error} />}
+          {mappingReview.notice && <Alert type="info" showIcon message={mappingReview.notice} />}
+          <Table
+            size="small"
+            rowKey="header"
+            pagination={false}
+            dataSource={mappingReview.items}
+            scroll={{ y: 240 }}
+            columns={[
+              {
+                title: '源字段',
+                dataIndex: 'header',
+                width: 200,
+                render: (value, record) => (
+                  <Space direction="vertical" size={0} style={{ display: 'flex' }}>
+                    <Typography.Text strong>{value}</Typography.Text>
+                    {record.samples.length > 0 && (
+                      <Typography.Text
+                        type="secondary"
+                        style={{ fontSize: 12 }}
+                        ellipsis={{ tooltip: record.samples.join(' / ') }}
+                      >
+                        样例：{record.samples.slice(0, 3).join(' / ')}
+                      </Typography.Text>
+                    )}
+                  </Space>
+                )
+              },
+              {
+                title: '建议映射',
+                dataIndex: 'suggestion',
+                width: 150,
+                render: (_value, record) => {
+                  const field = record.suggestion || record.aiSuggestion || ''
+                  if (!field) return <Typography.Text type="secondary">未识别</Typography.Text>
+                  const option = MAPPING_FIELD_OPTIONS.find((item) => item.value === field)
+                  return (
+                    <Tag color={record.source === 'ai' ? 'blue' : 'green'}>
+                      {option ? option.label : field}
+                      {record.source === 'ai' ? '（AI）' : ''}
+                    </Tag>
+                  )
+                }
+              },
+              {
+                title: '状态',
+                dataIndex: 'status',
+                width: 100,
+                render: (_value, record) =>
+                  record.target ? (
+                    <Tag color="orange">待确认</Tag>
+                  ) : (
+                    <Tag color="error">未选择</Tag>
+                  )
+              },
+              {
+                title: '你的选择',
+                dataIndex: 'target',
+                render: (value, _record, index) => (
+                  <Select
+                    value={value || undefined}
+                    placeholder="请选择"
+                    style={{ width: 170 }}
+                    status={value ? undefined : 'error'}
+                    options={MAPPING_FIELD_OPTIONS}
+                    onChange={(next) => updateMappingItem(index, { target: next })}
+                  />
+                )
+              }
+            ]}
+          />
+          {mappingConflicts.length > 0 && (
+            <Alert
+              type="error"
+              showIcon
+              message="已有字段映射冲突，请确认"
+              description={mappingConflicts.map((item) => (
+                <div key={item.field}>
+                  「{FIELD_LABELS[item.field] || item.field}」被多个源字段同时映射：
+                  {item.headers.join('、')}（同一目标字段只能有一个来源列）
+                </div>
+              ))}
+            />
+          )}
         </Space>
       )}
 
@@ -1126,12 +1392,24 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
             description={
               <>
                 匹配字段：
-                {preview.mappedFields.length ? preview.mappedFields.join('、') : '无'}
+                {preview.mappedFields.length
+                  ? preview.mappedFields.map((field) => FIELD_LABELS[field] || field).join('、')
+                  : '无'}
                 {preview.missingFields.length > 0 && (
                   <div style={{ color: '#d46b08' }}>
-                缺失必填列（对应行将被判定失败）：{preview.missingFields.join('、')}
-                 </div>
-               )}
+                    缺失必填列（对应行将被判定失败）：
+                    {preview.missingFields.map((field) => FIELD_LABELS[field] || field).join('、')}
+                  </div>
+                )}
+                {(preview.ignoredHeaders?.length > 0 ||
+                  preview.systemIgnoredHeaders?.length > 0) && (
+                  <div style={{ color: '#8c8c8c' }}>
+                    已忽略列（不参与导入）：
+                    {[...(preview.ignoredHeaders || []), ...(preview.systemIgnoredHeaders || [])].join(
+                      '、'
+                    )}
+                  </div>
+                )}
               </>
             }
           />
@@ -1194,6 +1472,25 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
             />
           )}
 
+          {/* 发布日期不在 Excel 原业务周期内：数据质量异常，这些行已判失败（不会导入） */}
+          {preview.sourceRangeViolationRows > 0 && (
+            <Alert
+              type="error"
+              showIcon
+              message={`${preview.sourceRangeViolationRows} 条记录的发布日期不在源时间周期内，已判为失败（不会导入）`}
+              description={
+                <div style={{ maxHeight: 140, overflow: 'auto' }}>
+                  {preview.sourceRangeViolations.map((item) => (
+                    <div key={item.rowIndex}>
+                      第 {item.rowIndex} 行：发布日期 {item.publishDate} 不在源时间周期{' '}
+                      {item.sourceTimeCycle} 内，请检查原始数据。
+                    </div>
+                  ))}
+                </div>
+              }
+            />
+          )}
+
           {/* 本地失败明细：本地校验不通过的行，可一键下载明细 */}
           {failedRows.length > 0 && (
             <Alert
@@ -1241,13 +1538,18 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
               type="info"
               showIcon
               message={`跳过 ${importStats.跳过} 条（空白行 ${preview.blankRows || 0} 条${
+                headerRowIndexes.length ? `，重复表头行 ${headerRowIndexes.length} 条` : ''
+              }${
                 skippedRowIndexes.length ? `，手动跳过 ${skippedRowIndexes.length} 条` : ''
               }）`}
               description={
-                skippedRowIndexes.length || blankRowIndexes.length ? (
+                skippedRowIndexes.length || blankRowIndexes.length || headerRowIndexes.length ? (
                   <div style={{ maxHeight: 100, overflow: 'auto' }}>
                     {blankRowIndexes.length > 0 && (
                       <div>空白行：第 {blankRowIndexes.join('、')} 行</div>
+                    )}
+                    {headerRowIndexes.length > 0 && (
+                      <div>重复表头行：第 {headerRowIndexes.join('、')} 行</div>
                     )}
                     {skippedRowIndexes.length > 0 && (
                       <div>手动跳过：第 {skippedRowIndexes.join('、')} 行</div>

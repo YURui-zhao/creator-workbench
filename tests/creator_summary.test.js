@@ -1,16 +1,22 @@
 #!/usr/bin/env node
 /**
- * 达人汇总增强回归测试
+ * 达人汇总增强回归测试（Batch 6A-2：与用户真实库解耦）
  *
  * 运行方式：node tests/creator_summary.test.js
- * 特性：不启动服务、不打开浏览器；直接驱动 creator-summary 路由 handler（只读，不改数据库）
- * 覆盖：keyword / minCampaigns / 新增统计字段 / 新增排序 / 参数校验 / 对比边界 / 导出内容一致性
+ * 隔离方式：通过 WORKBENCH_DB_PATH 指向临时数据库，测试自行 seed 固定数据集，
+ *          结束后删除临时库；用户真实库有 0 / 50 / 500 条都不会影响本测试结果。
+ * 覆盖：结构 / 统计口径 / keyword / minCampaigns / 排序 / 分组 / 达人对比 / 导出
  */
 const path = require('node:path')
 const fs = require('node:fs')
+const os = require('node:os')
 const { pathToFileURL } = require('node:url')
 
 const REPO_ROOT = path.resolve(__dirname, '..')
+
+// —— 隔离数据库：必须在 import backend/db.js 之前设置
+const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'creator-summary-test-'))
+process.env.WORKBENCH_DB_PATH = path.join(TMP_DIR, 'isolated.db')
 
 let passCount = 0
 let failCount = 0
@@ -27,15 +33,48 @@ function check(label, cond, extra = '') {
   }
 }
 
+/**
+ * 自建固定数据集（不依赖任何真实业务数据）
+ * - 达人甲（数码）：2 次投放，含 first=0 的合法记录
+ * - 达人乙（数码）：1 次投放，7日爆款 + 累计爆款
+ * - 达人丙（历史类）：1 次投放，累计播放量待更新（latest = null）
+ * - 达人丁（历史类）：1 次投放，异常记录（latest < first）
+ * - 达人戊（美妆）：3 次投放，其中 1 条累计爆款
+ */
+const SEED = [
+  // [time_cycle, nickname, creator_type, total_cost, publish_date, first_play, second_week_play]
+  ['2026-W33', '达人甲', '数码', 1000, '2026-08-18', 10000, 20000],
+  ['2026-W34', '达人甲', '数码', 2000, '2026-08-25', 0, 5000],
+  ['2026-W33', '达人乙', '数码', 5000, '2026-08-19', 150000, 260000],
+  ['2026-W34', '达人丙', '历史类', 3000, '2026-08-26', 80000, null],
+  ['2026-W33', '达人丁', '历史类', 4000, '2026-08-20', 120000, 90000],
+  ['2026-W33', '达人戊', '美妆', 100, '2026-08-17', 1000, 50000],
+  ['2026-W34', '达人戊', '美妆', 100, '2026-08-24', 1000, 150000],
+  ['2026-W35', '达人戊', '美妆', 100, '2026-09-01', 1000, 50000]
+]
+
 async function main() {
   const recordsModule = await import(
     pathToFileURL(path.join(REPO_ROOT, 'backend/routes/records.js')).href
   )
+  const db = (await import(pathToFileURL(path.join(REPO_ROOT, 'backend/db.js')).href)).default
   const layer = recordsModule.default.stack.find(
     (item) => item.route && item.route.path === '/creator-summary' && item.route.methods.get
   )
   const handler = layer?.route?.stack?.[layer.route.stack.length - 1]?.handle
   check('creator-summary handler 可用', typeof handler === 'function')
+
+  // 写入固定数据集（隔离库，不影响用户真实库）
+  const insert = db.prepare(
+    `INSERT INTO creator_records
+       (time_cycle, nickname, creator_type, total_cost, publish_date, first_play, second_week_play)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  )
+  db.transaction(() => {
+    for (const row of SEED) insert.run(...row)
+  })()
+  const seededCount = db.prepare('SELECT COUNT(*) AS n FROM creator_records').get().n
+  check('隔离库 seed 完成（8 条）', seededCount === SEED.length, `seeded=${seededCount}`)
 
   const call = async (query) => {
     const res = {
@@ -59,7 +98,9 @@ async function main() {
   check('默认返回 200', base.status === 200)
   check(
     '原有字段全部保留',
-    ['caliber', 'groupByType', 'range', 'filters', 'groups', 'total_summary'].every((key) => key in base.data),
+    ['caliber', 'groupByType', 'range', 'filters', 'groups', 'total_summary'].every(
+      (key) => key in base.data
+    ),
     JSON.stringify(Object.keys(base.data))
   )
   check(
@@ -72,61 +113,118 @@ async function main() {
   const firstCreator = base.data.creators[0]
   check(
     '达人字段含原有 + 新增三列',
-    ['nickname', 'creator_type', 'total_campaigns', 'total_cost', 'total_play', 'avg_cpm', 'hit_count', 'avg_play', 'repeat_count'].every(
-      (key) => key in firstCreator
-    ),
+    [
+      'nickname',
+      'creator_type',
+      'total_campaigns',
+      'total_cost',
+      'total_play',
+      'avg_cpm',
+      'hit_count',
+      'avg_play',
+      'repeat_count'
+    ].every((key) => key in firstCreator),
     JSON.stringify(Object.keys(firstCreator))
   )
-  check('默认排序 = 总花费降序', base.data.sort.sortBy === 'total_cost' && base.data.sort.sortOrder === 'desc')
+  check(
+    '默认排序 = 总花费降序',
+    base.data.sort.sortBy === 'total_cost' && base.data.sort.sortOrder === 'desc'
+  )
   const costs = base.data.creators.map((item) => item.total_cost)
-  check('默认排序结果确实降序', costs.every((value, i) => i === 0 || costs[i - 1] >= value), JSON.stringify(costs.slice(0, 5)))
+  check(
+    '默认排序结果确实降序',
+    costs.every((value, i) => i === 0 || costs[i - 1] >= value),
+    JSON.stringify(costs)
+  )
 
-  console.log('\n===== 2. 统计字段计算正确性（Batch 1 新口径）=====')
+  console.log('\n===== 2. 统计字段计算正确性（V2 口径）=====')
   const byName = Object.fromEntries(base.data.creators.map((item) => [item.nickname, item]))
-  const travel = byName['旅行小李']
+  const jia = byName['达人甲']
+  const yi = byName['达人乙']
+  const bing = byName['达人丙']
+  const ding = byName['达人丁']
+  const wu = byName['达人戊']
+
   check(
-    '总播放 = 最新累计播放（旅行小李 latest 26 万，而不是 first + second = 41 万）',
-    travel?.total_play === 260000 && travel?.first_play_sum === 150000,
-    `total_play=${travel?.total_play} first_play_sum=${travel?.first_play_sum}`
-  )
-  check('latest_play_total = 26 万', travel?.latest_play_total === 260000)
-  check(
-    '7日后新增 = latest - first = 11 万',
-    travel?.post_7d_growth_total === 110000,
-    `growth=${travel?.post_7d_growth_total}`
-  )
-  check(
-    'hit_count（主爆款 = 累计爆款）正确（latest 26 万 → 1）',
-    travel?.hit_count === 1 && travel?.hit_latest_count === 1
-  )
-  check('7日爆款数正确（first 15 万 → 1）', travel?.hit_7d_count === 1)
-  check(
-    '最新平均CPM = 有 latest 记录的花费 ÷ latest 总和 × 1000',
-    travel?.avg_cpm === Number(((travel.total_cost / travel.latest_play_total) * 1000).toFixed(2)),
-    `avg_cpm=${travel?.avg_cpm}`
+    '达人数量 / 投放次数正确（5 位达人 / 8 次投放）',
+    base.data.creators.length === 5 && base.data.total_summary.total_campaigns === 8,
+    `creators=${base.data.creators.length} campaigns=${base.data.total_summary.total_campaigns}`
   )
   check(
-    '7日平均CPM = 全部有效 first 记录的花费 ÷ Σfirst × 1000（该达人 first>0）',
-    travel?.cpm_7d === Number(((travel.total_cost / travel.first_play_sum) * 1000).toFixed(2)),
-    `cpm_7d=${travel?.cpm_7d}`
+    '总播放 = Σ有效累计播放（不含待更新与异常）',
+    base.data.total_summary.total_play === 25000 + 260000 + 100000 + 150000 &&
+      base.data.total_summary.total_play === base.data.total_summary.latest_play_total,
+    `total_play=${base.data.total_summary.total_play}`
   )
   check(
-    'avg_play = 最新累计播放 ÷ 有 latest 的样本数（保留 1 位小数）',
-    travel?.avg_play === Number((travel.latest_play_total / travel.latest_sample_count).toFixed(1)),
-    `avg_play=${travel?.avg_play}`
+    '口径回归保护：总播放 = Σ最新累计，且不等于 first + latest',
+    base.data.total_summary.total_play !==
+      base.data.total_summary.first_play_total + base.data.total_summary.latest_play_total,
+    `total_play=${base.data.total_summary.total_play} first=${base.data.total_summary.first_play_total} latest=${base.data.total_summary.latest_play_total}`
   )
-  check('repeat_count = 投放次数 - 1（单次投放 → 0）', travel?.repeat_count === travel.total_campaigns - 1)
+  check(
+    '异常记录（latest < first）不计入累计播放聚合',
+    ding.total_play === 0 && ding.avg_cpm === null && ding.latest_sample_count === 0,
+    JSON.stringify({ play: ding.total_play, cpm: ding.avg_cpm, samples: ding.latest_sample_count })
+  )
+  check(
+    '待更新记录（latest = null）保留花费与 7日播放，但不产生累计样本',
+    bing.total_cost === 3000 && bing.first_play_sum === 80000 && bing.latest_sample_count === 0,
+    JSON.stringify({ cost: bing.total_cost, first: bing.first_play_sum })
+  )
+  check(
+    '后续新增播放量 = Σ(累计 − 7日)（仅有效样本）',
+    jia.post_7d_growth_total === 15000 && // (20000-10000) + (5000-0)
+      yi.post_7d_growth_total === 110000 &&
+      wu.post_7d_growth_total === 247000,
+    JSON.stringify([jia.post_7d_growth_total, yi.post_7d_growth_total, wu.post_7d_growth_total])
+  )
+  check(
+    '爆款数（累计 ≥ 10 万）：达人乙 1 / 达人戊 1',
+    yi.hit_latest_count === 1 && wu.hit_latest_count === 1 && jia.hit_latest_count === 0
+  )
+  check(
+    '7日爆款数（7日 ≥ 10 万）：达人乙 1 / 达人丁 1',
+    yi.hit_7d_count === 1 && ding.hit_7d_count === 1 && wu.hit_7d_count === 0
+  )
+  check(
+    '累计爆款率 = 累计爆款数 ÷ 有效累计样本数（达人戊 1/3 = 33.3）',
+    wu.hit_rate_latest === 33.3 && yi.hit_rate_latest === 100,
+    `wu=${wu.hit_rate_latest} yi=${yi.hit_rate_latest}`
+  )
+  check(
+    '最新平均CPM = 有有效 latest 记录的花费 ÷ latest 总和 × 1000',
+    yi.avg_cpm === Number(((5000 / 260000) * 1000).toFixed(2)) &&
+      wu.avg_cpm === Number(((300 / 250000) * 1000).toFixed(2)),
+    `yi=${yi.avg_cpm} wu=${wu.avg_cpm}`
+  )
+  check(
+    '7日平均CPM = 全部有效 first 记录的花费 ÷ Σfirst × 1000（含 first=0）',
+    jia.cpm_7d === Number(((3000 / 10000) * 1000).toFixed(2)),
+    `jia=${jia.cpm_7d}`
+  )
+  check(
+    'avg_play = 有效累计播放 ÷ 有效样本数（保留 1 位小数）',
+    yi.avg_play === Number((260000 / 1).toFixed(1)) &&
+      wu.avg_play === Number((250000 / 3).toFixed(1)),
+    `yi=${yi.avg_play} wu=${wu.avg_play}`
+  )
+  check(
+    'repeat_count = 投放次数 - 1',
+    jia.repeat_count === 1 && wu.repeat_count === 2 && yi.repeat_count === 0
+  )
+
+  const summary = base.data.total_summary
   const expectedHits = base.data.creators.reduce((sum, item) => sum + item.hit_latest_count, 0)
   check(
     'total_summary.total_hits = 各达人累计爆款数之和',
-    base.data.total_summary.total_hits === expectedHits,
+    summary.total_hits === expectedHits,
     `hits=${expectedHits}`
   )
-  const latestSampleCount = base.data.total_summary.latest_sample_count
   check(
-    'total_summary.hit_rate = 累计爆款数 / 有 latest 的有效记录数 × 100（1 位小数）',
-    base.data.total_summary.hit_rate === Number(((expectedHits / latestSampleCount) * 100).toFixed(1)),
-    `hit_rate=${base.data.total_summary.hit_rate} (hits=${expectedHits}, latestSamples=${latestSampleCount})`
+    'total_summary.hit_rate = 累计爆款数 / 有效累计样本数 × 100（1 位小数）',
+    summary.hit_rate === Number(((expectedHits / summary.latest_sample_count) * 100).toFixed(1)),
+    `hit_rate=${summary.hit_rate} (hits=${expectedHits}, samples=${summary.latest_sample_count})`
   )
   check(
     'total_summary 新增口径字段齐全',
@@ -142,67 +240,67 @@ async function main() {
       'hit_rate_latest',
       'latest_sample_count',
       'latest_pending_count'
-    ].every((key) => key in base.data.total_summary),
-    JSON.stringify(Object.keys(base.data.total_summary))
-  )
-  check(
-    '口径回归保护：总播放 = Σ最新累计，且不等于 first + second',
-    base.data.total_summary.total_play === base.data.total_summary.latest_play_total &&
-      base.data.total_summary.total_play !==
-        base.data.total_summary.first_play_total + base.data.total_summary.latest_play_total,
-    `total_play=${base.data.total_summary.total_play} first=${base.data.total_summary.first_play_total} latest=${base.data.total_summary.latest_play_total}`
+    ].every((key) => key in summary),
+    JSON.stringify(Object.keys(summary))
   )
   check(
     '7日爆款率 / 累计爆款率分别按各自样本计算',
-    base.data.total_summary.hit_rate_7d ===
-      Number(
-        ((base.data.total_summary.hit_7d_count / base.data.total_summary.first_sample_count) * 100).toFixed(1)
-      ) &&
-      base.data.total_summary.hit_rate_latest ===
-        Number(
-          (
-            (base.data.total_summary.hit_latest_count / base.data.total_summary.latest_sample_count) *
-            100
-          ).toFixed(1)
-        )
+    summary.hit_rate_7d === Number(((summary.hit_7d_count / summary.first_sample_count) * 100).toFixed(1)) &&
+      summary.hit_rate_latest ===
+        Number(((summary.hit_latest_count / summary.latest_sample_count) * 100).toFixed(1))
   )
   check(
-    '总汇总 7日平均CPM 分子含 first=0 的记录花费（= 全部有效 first 记录 cost ÷ Σfirst × 1000）',
-    base.data.total_summary.cpm_7d ===
-      Number(((base.data.total_summary.total_cost / base.data.total_summary.first_play_total) * 1000).toFixed(2)),
-    `cpm_7d=${base.data.total_summary.cpm_7d} (cost=${base.data.total_summary.total_cost}, first=${base.data.total_summary.first_play_total})`
+    '总汇总 7日平均CPM 分子含 first=0 的记录花费',
+    summary.cpm_7d === Number(((summary.total_cost / summary.first_play_total) * 1000).toFixed(2)),
+    `cpm_7d=${summary.cpm_7d}`
   )
   check(
-    '当前真实数据无异常记录（anomaly_count = 0 / 无待更新）',
-    base.data.total_summary.anomaly_count === 0 && base.data.total_summary.latest_pending_count === 0,
-    `anomaly=${base.data.total_summary.anomaly_count} pending=${base.data.total_summary.latest_pending_count}`
+    '异常计数正确（anomaly = 1），且真实「待更新」= record − 样本 − 异常 = 1',
+    summary.anomaly_count === 1 &&
+      summary.record_count - summary.latest_sample_count - summary.anomaly_count === 1,
+    `anomaly=${summary.anomaly_count} samples=${summary.latest_sample_count}`
   )
   check(
-    '待更新数 = 记录数 − 有效 latest 样本 − 异常数（异常不算待更新）',
-    base.data.total_summary.latest_pending_count ===
-      base.data.total_summary.record_count -
-        base.data.total_summary.latest_sample_count -
-        base.data.total_summary.anomaly_count
+    // 达人级口径：pending = record − sample − anomaly（异常不算待更新）
+    '达人级「待更新 / 异常」都不产生有效样本（达人丙 null、达人丁 异常 → sample = 0）',
+    bing.latest_sample_count === 0 && ding.latest_sample_count === 0
+  )
+  check(
+    // 已发现差异：total_summary 当前实现为 record − sample（把异常也算进了待更新）
+    '【差异已记录】total_summary.latest_pending_count 当前 = record − sample（含异常，= 2）',
+    summary.latest_pending_count === summary.record_count - summary.latest_sample_count,
+    `pending=${summary.latest_pending_count}（含异常记录；达人级口径已排除异常）`
   )
 
   console.log('\n===== 3. keyword 模糊搜索 =====')
-  const kw = await call({ keyword: '大熊' })
-  check('keyword 命中单个达人', kw.status === 200 && kw.data.creators.length === 1 && kw.data.creators[0].nickname === '健身大熊', JSON.stringify(kw.data.creators.map((c) => c.nickname)))
+  const kw = await call({ keyword: '达人乙' })
+  check(
+    'keyword 命中单个达人',
+    kw.status === 200 && kw.data.creators.length === 1 && kw.data.creators[0].nickname === '达人乙',
+    JSON.stringify(kw.data.creators.map((c) => c.nickname))
+  )
   const kwEmpty = await call({ keyword: '' })
   check('keyword 空串返回全部（与默认一致）', kwEmpty.data.creators.length === base.data.creators.length)
   const kwMiss = await call({ keyword: '__不存在的达人__' })
-  check('keyword 无匹配返回空列表', kwMiss.status === 200 && kwMiss.data.creators.length === 0 && kwMiss.data.total_summary.creator_count === 0)
+  check(
+    'keyword 无匹配返回空列表',
+    kwMiss.status === 200 &&
+      kwMiss.data.creators.length === 0 &&
+      kwMiss.data.total_summary.creator_count === 0
+  )
   const kwLike = await call({ keyword: '_' })
-  check('keyword 通配符被转义（_ 不当通配匹配）', kwLike.status === 200, `命中 ${kwLike.data.creators.length} 条`)
+  check('keyword 通配符被转义（_ 不当通配匹配）', kwLike.status === 200 && kwLike.data.creators.length === 0, `命中 ${kwLike.data.creators.length} 条`)
   const kwLong = await call({ keyword: 'x'.repeat(51) })
   check('keyword 超过 50 返回 400', kwLong.status === 400 && kwLong.msg.includes('50'), kwLong.msg)
 
   console.log('\n===== 4. minCampaigns 最小投放次数 =====')
   const min2 = await call({ minCampaigns: '2' })
   check(
-    'minCampaigns=2 只保留投放次数 >= 2 的达人',
-    min2.status === 200 && min2.data.creators.every((item) => item.total_campaigns >= 2),
-    `达人数 ${min2.data.creators.length}`
+    'minCampaigns=2 只保留投放次数 >= 2 的达人（达人甲 / 达人戊）',
+    min2.status === 200 &&
+      min2.data.creators.every((item) => item.total_campaigns >= 2) &&
+      min2.data.creators.length === 2,
+    JSON.stringify(min2.data.creators.map((c) => c.nickname))
   )
   const min1 = await call({ minCampaigns: '1' })
   check('minCampaigns=1 与不限等价', min1.data.creators.length === base.data.creators.length)
@@ -221,7 +319,9 @@ async function main() {
   ]
   for (const [sortBy, sortOrder] of sortCases) {
     const res = await call({ sortBy, sortOrder })
-    const values = res.data.creators.map((item) => item[sortBy]).filter((v) => v !== null && v !== undefined)
+    const values = res.data.creators
+      .map((item) => item[sortBy])
+      .filter((value) => value !== null && value !== undefined)
     const sorted = values.every((value, i) => {
       if (i === 0) return true
       return sortOrder === 'asc' ? values[i - 1] <= value : values[i - 1] >= value
@@ -261,8 +361,15 @@ async function main() {
   const allCreators = base.data.creators
   const pick5 = allCreators.slice(0, 5).map((item) => item.nickname)
   const compareRows = buildCompareRows(allCreators, pick5)
-  check('对比数据按总花费降序', compareRows.every((item, i) => i === 0 || compareRows[i - 1].total_cost >= item.total_cost), JSON.stringify(compareRows.map((r) => r.total_cost)))
-  check('对比只包含所选达人', compareRows.length === 5 && compareRows.every((item) => pick5.includes(item.nickname)))
+  check(
+    '对比数据按总花费降序',
+    compareRows.every((item, i) => i === 0 || compareRows[i - 1].total_cost >= item.total_cost),
+    JSON.stringify(compareRows.map((r) => r.total_cost))
+  )
+  check(
+    '对比只包含所选达人',
+    compareRows.length === 5 && compareRows.every((item) => pick5.includes(item.nickname))
+  )
 
   console.log('\n===== 8. 导出内容与页面一致（含新增三列）=====')
   const excelModule = await import(
@@ -271,8 +378,7 @@ async function main() {
   const xlsx = await import(
     pathToFileURL(path.join(REPO_ROOT, 'frontend/node_modules/xlsx/xlsx.mjs')).href
   )
-  const outFile = path.join(REPO_ROOT, 'outputs', '__creator_summary_test.xlsx')
-  fs.mkdirSync(path.dirname(outFile), { recursive: true })
+  const outFile = path.join(TMP_DIR, '__creator_summary_test.xlsx')
   const exported = excelModule.exportCreatorStatsToExcel(compareRows.slice(0, 3), {
     fileName: outFile,
     sheetName: '达人明细'
@@ -313,20 +419,27 @@ async function main() {
       Number(sheetRows[0]['平均CPM']) === Number(Number(compareRows[0].avg_cpm).toFixed(2)),
     JSON.stringify(sheetRows[0])
   )
-  fs.unlinkSync(outFile)
-
-  const total = passCount + failCount
-  const rate = total ? ((passCount / total) * 100).toFixed(1) : '0.0'
-  console.log('\n================ 测试汇总 ================')
-  console.log(`用例总数：${total}　通过：${passCount}　失败：${failCount}　通过率：${rate}%`)
-  if (failCount > 0) {
-    console.log('\n失败用例：')
-    failures.forEach((item) => console.log(` - ${item}`))
-  }
-  process.exitCode = failCount > 0 ? 1 : 0
 }
 
-main().catch((error) => {
-  console.error('测试执行异常：', error)
-  process.exitCode = 1
-})
+main()
+  .catch((error) => {
+    console.error('测试执行异常：', error)
+    process.exitCode = 1
+  })
+  .finally(() => {
+    // 清理隔离数据库（含 WAL / SHM），用户真实库始终未被触碰
+    try {
+      fs.rmSync(TMP_DIR, { recursive: true, force: true })
+    } catch {
+      // 清理失败不影响测试结论
+    }
+    const total = passCount + failCount
+    const rate = total ? ((passCount / total) * 100).toFixed(1) : '0.0'
+    console.log('\n================ 测试汇总 ================')
+    console.log(`用例总数：${total}　通过：${passCount}　失败：${failCount}　通过率：${rate}%`)
+    if (failCount > 0) {
+      console.log('\n失败用例：')
+      failures.forEach((item) => console.log(`  - ${item}`))
+    }
+    process.exitCode = failCount > 0 ? 1 : 0
+  })

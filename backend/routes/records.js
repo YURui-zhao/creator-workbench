@@ -1,9 +1,11 @@
 import { Router } from 'express'
 import db from '../db.js'
 import {
+  dateToWeekCode,
   getCycleInfo,
   getNextWeek,
   getPrevWeek,
+  getWeekDateRange,
   normalizeWeekCode,
   parseTimeCycleToWeekCode
 } from '../utils/dateCycle.js'
@@ -101,6 +103,31 @@ function checkPlayRange(row = {}) {
   const latest = toOptionalPlayNumber(row.second_week_play)
   if (first === null || latest === null) return null
   return latest < first ? PLAY_RANGE_ERROR : null
+}
+
+// 时间周期口径（V2）：time_cycle = 发布日期所属的标准自然周（周一 ~ 周日）
+const CYCLE_DATE_ERROR = '时间周期与发布日期所属周不一致，请按发布日期修正时间周期'
+
+/**
+ * 时间周期 与 发布日期 的确定性一致性校验：
+ * 两者都有有效值时，发布日期必须落在 time_cycle 对应的周一~周日区间内。
+ * - 任一为空 → 不校验（发布日期为空时周期允许人工指定）
+ * - time_cycle 不是合法周码（无法解析区间）→ 不在此处判错，交由既有格式校验
+ * @returns {string|null} 错误文案或 null
+ */
+function checkPublishCycleConsistency(row = {}) {
+  const publishDate = typeof row.publish_date === 'string' ? row.publish_date.trim() : ''
+  const timeCycle = typeof row.time_cycle === 'string' ? row.time_cycle.trim() : ''
+  if (!publishDate || !timeCycle) return null
+  const normalizedCycle = normalizeWeekCode(timeCycle)
+  // 与前端 publishDateToWeekCode 同源：由发布日期推导 canonical 自然周（周一 ~ 周日）
+  const expectedCycle = dateToWeekCode(publishDate)
+  if (!normalizedCycle || !expectedCycle) return null
+  if (normalizedCycle === expectedCycle) return null
+  const range = getWeekDateRange(expectedCycle)
+  const label = range ? `${range.startDate} ~ ${range.endDate}` : expectedCycle
+  // 提示里给出「正确的那一周」，不是用户传入的那一周，避免误导
+  return `${CYCLE_DATE_ERROR}（发布日期 ${publishDate} 属于 ${expectedCycle}，即 ${label}）`
 }
 
 // ---------- 参数校验 ----------
@@ -1763,6 +1790,11 @@ router.post('/batch', (req, res) => {
     if (playError) {
       return fail(res, 400, `第 ${i + 1} 条数据校验失败：${playError}`)
     }
+    // 时间周期必须与发布日期所属标准周一致（防止绕过前端写入错配周期）
+    const cycleError = checkPublishCycleConsistency(clean)
+    if (cycleError) {
+      return fail(res, 400, `第 ${i + 1} 条数据校验失败：${cycleError}`)
+    }
     rows.push(toRow(clean))
   }
 
@@ -1883,8 +1915,25 @@ router.post('/batch-update', (req, res) => {
   let success = 0
   // 字段名来自白名单，值走占位符参数化查询
   const update = db.prepare(`UPDATE creator_records SET ${field} = ? WHERE id = ?`)
+  // time_cycle 批量修改需要逐条读取「最终状态」：与 POST / PUT / batch 使用同一套发布日期归属规则
+  const selectCycleState = db.prepare(
+    'SELECT publish_date, time_cycle FROM creator_records WHERE id = ?'
+  )
   const runAll = db.transaction((idList) => {
     for (const id of idList) {
+      if (field === 'time_cycle') {
+        const current = selectCycleState.get(id)
+        if (!current) {
+          errors.push({ id, reason: '记录不存在或已被删除' })
+          continue
+        }
+        const cycleError = checkPublishCycleConsistency({ ...current, time_cycle: nextValue })
+        if (cycleError) {
+          // 单条拒绝，不写入错误周期；不影响其它合法记录
+          errors.push({ id, reason: cycleError })
+          continue
+        }
+      }
       const info = update.run(nextValue, id)
       if (info.changes > 0) success += 1
       else errors.push({ id, reason: '记录不存在或已被删除' })
@@ -1948,6 +1997,11 @@ router.post('/', (req, res) => {
   if (playError) {
     return fail(res, 400, playError)
   }
+  // 时间周期必须与发布日期所属标准周一致（后端独立校验）
+  const cycleError = checkPublishCycleConsistency(clean)
+  if (cycleError) {
+    return fail(res, 400, cycleError)
+  }
 
   const row = toRow(clean)
   const info = db.prepare(INSERT_SQL).run(...COLUMNS.map((col) => row[col]))
@@ -1996,6 +2050,11 @@ router.put('/:id', (req, res) => {
   const playError = checkPlayRange(finalRecord)
   if (playError) {
     return fail(res, 400, playError)
+  }
+  // 时间周期 与 发布日期 的一致性同样基于「更新后的最终状态」校验
+  const cycleError = checkPublishCycleConsistency(finalRecord)
+  if (cycleError) {
+    return fail(res, 400, cycleError)
   }
 
   const keys = Object.keys(clean)

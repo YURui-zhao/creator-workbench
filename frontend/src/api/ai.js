@@ -47,3 +47,17 @@ export function normalizeTimeCyclesAI(values) {
     { timeout: 60000, headers: buildAiHeaders() }
   )
 }
+
+/**
+ * 未识别表头的字段映射建议（AI 增强，非导入前置依赖）
+ * 入参：columns = [{ header, samples }]（最多 30 列，后端只发送表头与前几个样例值）
+ * 返回：{ code, data: { suggestions: [{ source_header, suggested_field, confidence, reason }] }, msg }
+ * 说明：suggested_field 一定落在后端白名单内；结果仅供用户在导入弹窗确认，不直接决定入库字段。
+ */
+export function suggestFieldMappingsAI(columns) {
+  return request.post(
+    '/ai/suggest-field-mappings',
+    { columns },
+    { timeout: 60000, headers: buildAiHeaders() }
+  )
+}

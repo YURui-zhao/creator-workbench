@@ -334,6 +334,118 @@ function normalizeIssueList(list) {
 /**
  * 智能校验：按启用规则构建提示词并调用 DeepSeek（可注入 callFn 便于测试）
  */
+
+// ---------- 字段映射建议（Batch 6A）----------
+// AI 只允许在这些目标字段中选择，不得自创数据库字段
+export const MAPPING_TARGET_FIELDS = [
+  'time_cycle',
+  'nickname',
+  'creator_type',
+  'homepage',
+  'content_link',
+  'video_link',
+  'total_cost',
+  'publish_date',
+  'first_play',
+  'second_week_play',
+  'IGNORE',
+  'UNKNOWN'
+]
+
+/**
+ * 构建「字段映射建议」提示词：只发送表头名与前几个非空样例值，不发送整表数据
+ * @param {Array<{ header: string, samples?: string[] }>} columns
+ */
+export function buildFieldMappingPrompt(columns = []) {
+  const list = Array.isArray(columns) ? columns : []
+  const rendered = list
+    .map((item, index) => {
+      const samples = (Array.isArray(item?.samples) ? item.samples : [])
+        .map((value) => String(value ?? '').trim())
+        .filter(Boolean)
+        .slice(0, 5)
+      return `${index + 1}. 原始表头「${String(item?.header ?? '').trim()}」${
+        samples.length ? `；样例值：${samples.join(' / ')}` : '；样例值：（该列无非空数据）'
+      }`
+    })
+    .join('\n')
+
+  return `
+你是一名数据导入字段映射助手。用户会给出若干「Excel 原始表头 + 该列前几个非空样例值」，
+请判断每个原始表头最可能对应系统中的哪个字段。
+
+只允许从以下目标字段中选择，不得自创字段名：
+- time_cycle：时间周期，如 2026-W33 或 08/13-08/19
+- nickname：达人昵称
+- creator_type：达人类型（博主类型）
+- homepage：达人主页链接
+- content_link：植入内容链接
+- video_link：视频发布链接
+- total_cost：总花费（元）
+- publish_date：发布日期，YYYY-MM-DD
+- first_play：7日播放量（内容发布约 7 天时记录的累计播放量）
+- second_week_play：累计播放量（最近一次更新时的累计播放量）
+- IGNORE：与上述字段无关、系统不导入的列（如报价、CPM、备注等）
+- UNKNOWN：确实无法判断
+
+重要语义（不得混淆）：
+- first_play 是「7日播放量」，不是「首周新增播放量」
+- second_week_play 只是历史字段名，含义是「累计播放量」，不是「第二周新增播放量」
+- 「播放量（新）」这类写法应理解为累计播放量，「播放量（首发）」「播放量（7日）」应理解为 7日播放量
+
+待识别字段：
+${rendered}
+
+只输出一个严格 JSON 对象，不要输出任何多余文字、解释或 Markdown 代码块。输出格式：
+{"mappings":[{"source_header":"播放量（首发）","suggested_field":"first_play","confidence":"high","reason":"简要中文理由"}]}
+- source_header 必须与输入原始表头完全一致
+- suggested_field 必须取自上面的白名单（大写 IGNORE / UNKNOWN 照写）
+- confidence 只能是 high / medium / low
+- 每条输入表头都必须出现在 mappings 中，不得遗漏、不得新增
+`
+}
+
+/**
+ * 归一化 AI 返回的字段映射建议：目标字段必须落在白名单内，否则视为 UNKNOWN
+ * @param {any} parsed AI 返回内容解析结果
+ * @param {Array<{ header: string }>} columns 本次提交的列（保证输出结构稳定）
+ */
+export function normalizeFieldSuggestions(parsed, columns = []) {
+  const list = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray(parsed?.mappings)
+      ? parsed.mappings
+      : Array.isArray(parsed?.suggestions)
+        ? parsed.suggestions
+        : []
+  const byHeader = new Map()
+  for (const item of list) {
+    if (!item || typeof item !== 'object') continue
+    const header = String(item.source_header ?? item.header ?? item.column ?? '').trim()
+    if (!header) continue
+    const rawField = String(item.suggested_field ?? item.field ?? item.mapping ?? '').trim()
+    const confidenceText = String(item.confidence ?? '').trim().toLowerCase()
+    byHeader.set(header, {
+      source_header: header,
+      suggested_field: MAPPING_TARGET_FIELDS.includes(rawField) ? rawField : 'UNKNOWN',
+      confidence: ['high', 'medium', 'low'].includes(confidenceText) ? confidenceText : 'low',
+      reason: String(item.reason ?? '').trim()
+    })
+  }
+  return (Array.isArray(columns) ? columns : []).map(
+    (column) =>
+      byHeader.get(column.header) || {
+        source_header: column.header,
+        suggested_field: 'UNKNOWN',
+        confidence: 'low',
+        reason: 'AI 未返回该字段的识别结果'
+      }
+  )
+}
+
+/**
+ * 智能校验：按启用规则构建提示词并调用 DeepSeek（可注入 callFn 便于测试）
+ */
 export async function validateRecords(records, callFn = callDeepSeek, rules = [], options = {}) {
   const content = await callFn(buildSystemPrompt(rules), JSON.stringify(records), options)
   return normalizeResult(parseAiResult(content))
@@ -437,6 +549,54 @@ router.post('/normalize-time-cycles', async (req, res) => {
     }
     console.error('[ai] 时间周期识别异常:', err)
     return fail(res, 500, 'AI 时间周期识别服务异常，请稍后重试')
+  }
+})
+
+/**
+ * POST /api/ai/suggest-field-mappings
+ * 入参：{ columns: [{ header: string, samples?: string[] }] }（最多 30 列，每列最多 5 个样例值）
+ * 出参：{ code, data: [{ source_header, suggested_field, confidence, reason }], msg }
+ * 说明：仅用于「未识别表头」的映射建议；AI 只能从白名单中选择字段，
+ *      且结果必须由用户在导入弹窗确认后才生效，不会直接决定入库字段。
+ * 不发送整表数据，不记录任何密钥信息。
+ */
+router.post('/suggest-field-mappings', async (req, res) => {
+  const body = req.body && !Array.isArray(req.body) ? req.body : {}
+  const rawColumns = Array.isArray(body.columns) ? body.columns : []
+  if (rawColumns.length === 0) {
+    return fail(res, 400, 'columns 必须是非空数组')
+  }
+  if (rawColumns.length > 30) {
+    return fail(res, 400, '单次最多支持 30 个未识别字段')
+  }
+
+  const columns = rawColumns
+    .map((item) => ({
+      header: String(item?.header ?? '').trim().slice(0, 100),
+      samples: (Array.isArray(item?.samples) ? item.samples : [])
+        .map((value) => String(value ?? '').trim().slice(0, 60))
+        .filter(Boolean)
+        .slice(0, 5)
+    }))
+    .filter((item) => item.header)
+  if (columns.length === 0) {
+    return fail(res, 400, 'columns 中的原始表头不能为空')
+  }
+
+  try {
+    // 服务商 / 密钥读取与智能校验一致：请求头优先，环境变量兜底（缺失时由 callDeepSeek 抛 400）
+    const content = await callDeepSeek(
+      buildFieldMappingPrompt(columns),
+      JSON.stringify(columns),
+      aiOptions(req)
+    )
+    ok(res, { suggestions: normalizeFieldSuggestions(parseAiResult(content), columns) })
+  } catch (err) {
+    if (err instanceof DeepSeekError || err.isDeepSeekError) {
+      return fail(res, err.status || 502, err.message)
+    }
+    console.error('[ai] 字段映射识别异常:', err)
+    return fail(res, 500, 'AI 字段识别服务异常，请稍后重试')
   }
 })
 

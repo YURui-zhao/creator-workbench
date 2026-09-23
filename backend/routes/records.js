@@ -18,7 +18,8 @@ const FIELDS = {
   homepage: { type: 'string', max: 500 },
   creator_type: { type: 'string', max: 50 },
   content_link: { type: 'string', max: 500 },
-  total_cost: { type: 'number', min: 0 },
+  // 总花费与 Excel 导入 / 前端表单保持一致：必填，但 0 是合法真实值
+  total_cost: { type: 'number', min: 0, required: true },
   publish_date: { type: 'date' },
   video_link: { type: 'string', max: 500 },
   first_play: { type: 'int', min: 0 },
@@ -59,6 +60,49 @@ function parseId(raw) {
   return Number.isSafeInteger(id) && id > 0 ? id : null
 }
 
+// ---------- 播放量字段（V2 业务口径）----------
+// first_play = 7日播放量；second_week_play = 累计播放量
+const PLAY_FIELD_LABELS = {
+  first_play: '7日播放量',
+  second_week_play: '累计播放量'
+}
+// 交叉校验统一文案（与前端表单 / Excel 导入保持一致）
+const PLAY_RANGE_ERROR = '累计播放量不能小于7日播放量，请检查数据是否录入正确'
+
+// 必填字段的用户可见中文名（仅用于「不能为空」提示，不参与数值校验文案）
+const REQUIRED_FIELD_LABELS = {
+  total_cost: '总花费'
+}
+
+/**
+ * 字段是否「明确提供」：
+ * - partial（PUT）：请求体里存在该 key 即视为提供（null / '' / 0 都是明确提供的值）
+ * - 非 partial（POST / batch）：undefined 视为未提供
+ * 使用 hasOwnProperty 而不是真假判断，避免把数字 0 当成「没传」
+ */
+function isFieldProvided(body, field, partial) {
+  if (partial) return Object.prototype.hasOwnProperty.call(body, field)
+  return body[field] !== undefined
+}
+
+// 明确清空：null / 空字符串（数字 0 属于真实值，不算清空）
+function isExplicitEmpty(value) {
+  if (value === null) return true
+  return typeof value === 'string' && value.trim() === ''
+}
+
+/**
+ * 播放量交叉校验（V2 规则）：两者都有值时，累计播放量不得小于 7日播放量
+ * 0 是有效观察值，缺失（null/空）不参与校验
+ * @returns {string|null} 错误文案或 null
+ */
+function checkPlayRange(row = {}) {
+  const first = toOptionalPlayNumber(row.first_play)
+  const latest = toOptionalPlayNumber(row.second_week_play)
+  if (first === null || latest === null) return null
+  return latest < first ? PLAY_RANGE_ERROR : null
+}
+
 // ---------- 参数校验 ----------
 function validate(data, { partial = false } = {}) {
   const errors = []
@@ -66,14 +110,21 @@ function validate(data, { partial = false } = {}) {
 
   for (const [field, spec] of Object.entries(FIELDS)) {
     const value = data[field]
-    const provided = value !== undefined && value !== null && value !== ''
+    const provided = isFieldProvided(data, field, partial)
+    const label = REQUIRED_FIELD_LABELS[field] || PLAY_FIELD_LABELS[field] || field
 
-    if (!provided) {
-      if (spec.required && !partial) {
-        errors.push(`${field} 不能为空`)
-      } else if (!partial && spec.type === 'string') {
-        clean[field] = ''
+    // 未提供 / 明确传空（null、空字符串）
+    if (!provided || isExplicitEmpty(value)) {
+      if (spec.required) {
+        // 必填字段：PUT 未提供 → 保持旧值；只要传了空值（或 POST 缺字段）→ 拒绝
+        // 有中文名的必填字段（总花费）与前端 Excel 导入保持同一文案「总花费不能为空」；
+        // 其余字段沿用既有「字段名 不能为空」形式，避免改变现有提示。
+        const emptyMsg = REQUIRED_FIELD_LABELS[field] ? `${label}不能为空` : `${label} 不能为空`
+        if (partial ? provided : true) errors.push(emptyMsg)
+        continue
       }
+      // 可空字段：POST 未提供或传空 → 写 NULL；PUT 明确传空 → 写 NULL（未提供则不动）
+      if (!partial || provided) clean[field] = null
       continue
     }
 
@@ -92,7 +143,9 @@ function validate(data, { partial = false } = {}) {
         num < spec.min
       ) {
         errors.push(
-          `${field} 必须为${spec.type === 'int' ? '整数' : '数字'}且不小于 ${spec.min}`
+          PLAY_FIELD_LABELS[field]
+            ? `${label}必须为非负整数`
+            : `${field} 必须为${spec.type === 'int' ? '整数' : '数字'}且不小于 ${spec.min}`
         )
         continue
       }
@@ -1705,6 +1758,11 @@ router.post('/batch', (req, res) => {
     if (errors.length) {
       return fail(res, 400, `第 ${i + 1} 条数据校验失败：${errors.join('；')}`)
     }
+    // 每行写库前执行同一套播放量交叉校验（客户端可能绕过 Excel 导入弹窗直接调用 API）
+    const playError = checkPlayRange(clean)
+    if (playError) {
+      return fail(res, 400, `第 ${i + 1} 条数据校验失败：${playError}`)
+    }
     rows.push(toRow(clean))
   }
 
@@ -1885,6 +1943,11 @@ router.post('/', (req, res) => {
   if (errors.length) {
     return fail(res, 400, errors.join('；'))
   }
+  // V2 播放量交叉校验（后端独立校验，不依赖前端表单）
+  const playError = checkPlayRange(clean)
+  if (playError) {
+    return fail(res, 400, playError)
+  }
 
   const row = toRow(clean)
   const info = db.prepare(INSERT_SQL).run(...COLUMNS.map((col) => row[col]))
@@ -1914,15 +1977,25 @@ router.put('/:id', (req, res) => {
     return fail(res, 400, '非法的记录 ID')
   }
 
-  const exists = db.prepare('SELECT id FROM creator_records WHERE id = ?').get(id)
+  // 读取完整原记录：PUT 需要基于「更新后的最终状态」做交叉校验
+  const exists = db.prepare(`${SELECT_SQL} WHERE id = ?`).get(id)
   if (!exists) {
     return fail(res, 404, '记录不存在')
   }
 
   const body = Array.isArray(req.body) ? {} : req.body || {}
+  // partial：只更新请求里明确提供的字段；null / 空字符串 = 明确清空（写 NULL）；0 = 真实值
   const { clean, errors } = validate(body, { partial: true })
   if (errors.length) {
     return fail(res, 400, errors.join('；'))
+  }
+
+  // 关键：合并请求值与旧值，对最终记录做播放量交叉校验
+  // （例如只传 first_play=30000 而库里 second_week_play=20000 → 最终不合法，必须拒绝）
+  const finalRecord = { ...exists, ...clean }
+  const playError = checkPlayRange(finalRecord)
+  if (playError) {
+    return fail(res, 400, playError)
   }
 
   const keys = Object.keys(clean)

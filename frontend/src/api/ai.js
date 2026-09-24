@@ -1,14 +1,13 @@
 import request from '../utils/request.js'
 import { getAiConfig } from '../utils/aiConfig.js'
 
-// 从本地配置读取 AI 请求头：页面配置的 Key/接口地址优先于后端环境变量
-function buildAiHeaders() {
+// 业务调用才携带当前页面 Key；状态查询只需要服务商和模型。
+function buildAiHeaders(includeKey = true) {
   const config = getAiConfig()
   const headers = {}
   if (config?.provider) headers['x-ai-provider'] = config.provider
   if (config?.model) headers['x-ai-model'] = config.model
-  if (config?.apiKey) headers['x-ai-api-key'] = config.apiKey
-  if (config?.baseUrl) headers['x-ai-base-url'] = config.baseUrl
+  if (includeKey && config?.apiKey) headers['x-ai-api-key'] = config.apiKey
   return headers
 }
 
@@ -28,11 +27,10 @@ export function validateRecordsAI(records, rules = []) {
 }
 
 /**
- * 查询 AI 服务状态（是否已配置 DeepSeek API Key）
- * 返回：{ code: 200, data: { available, model, msg }, msg }
+ * 查询后端环境变量配置状态；不发送浏览器当前页面的 Key。
  */
 export function getAiStatus() {
-  return request.get('/ai/status', { headers: buildAiHeaders() })
+  return request.get('/ai/status', { headers: buildAiHeaders(false) })
 }
 
 /**

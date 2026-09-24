@@ -1,8 +1,10 @@
 import { useEffect } from 'react'
-import { Form, Input, Modal, Select, Typography, message } from 'antd'
+import { Button, Form, Input, Modal, Select, Typography, message } from 'antd'
 import {
   AI_PROVIDERS,
   DEFAULT_PROVIDER,
+  clearAiConfig,
+  clearAiSessionKey,
   getAiConfig,
   getProviderPreset,
   saveAiConfig
@@ -15,12 +17,12 @@ const PROVIDER_OPTIONS = Object.values(AI_PROVIDERS).map((item) => ({
 
 /**
  * AI 接口配置弹窗
- * - AI 服务商：DeepSeek / 智谱 AI（切换时自动填充默认接口地址与模型）
+ * - AI 服务商：DeepSeek / 智谱 AI（切换时清空密钥并填充默认模型）
  * - API 密钥：密码样式，可切换显示明文
- * - 接口地址 / 模型：默认值可自定义修改
- * - 保存到 localStorage（key: ai_config），刷新不丢失
+ * - 模型可自定义；接口地址由后端按服务商固定
+ * - 密钥仅保存在当前浏览器会话，刷新后仍可使用
  */
-export default function AiConfigModal({ open, onCancel, onSaved }) {
+export default function AiConfigModal({ open, onCancel, onSaved, onDisconnected, onProviderChanged }) {
   const [form] = Form.useForm()
 
   // 打开时回显本地配置（含向下兼容：旧配置无 provider 视为 DeepSeek）
@@ -34,19 +36,20 @@ export default function AiConfigModal({ open, onCancel, onSaved }) {
       form.setFieldsValue({
         provider: DEFAULT_PROVIDER,
         model: preset.model,
-        baseUrl: preset.baseUrl,
         apiKey: ''
       })
     }
   }, [open, form])
 
-  // 切换服务商：自动填充该服务商的默认接口地址与模型（密钥保留，需与所选服务商匹配）
+  // 切换服务商后不沿用另一服务商的密钥。
   const handleProviderChange = (provider) => {
+    clearAiSessionKey()
+    onProviderChanged?.()
     const preset = getProviderPreset(provider)
     form.setFieldsValue({
       provider,
-      baseUrl: preset.baseUrl,
-      model: preset.model
+      model: preset.model,
+      apiKey: ''
     })
   }
 
@@ -56,15 +59,21 @@ export default function AiConfigModal({ open, onCancel, onSaved }) {
       const config = {
         provider: values.provider,
         model: String(values.model || '').trim(),
-        apiKey: String(values.apiKey || '').trim(),
-        baseUrl: String(values.baseUrl || '').trim()
+        apiKey: String(values.apiKey || '').trim()
       }
-      saveAiConfig(config)
+      const saved = saveAiConfig(config)
       message.success('AI 配置已保存')
-      onSaved?.(config.apiKey ? config : null)
+      onSaved?.(saved)
     } catch {
       // 表单校验失败由 antd 内联提示
     }
+  }
+
+  const handleDisconnect = () => {
+    clearAiConfig()
+    form.setFieldsValue({ apiKey: '' })
+    onDisconnected?.()
+    message.success('已清除当前会话的 AI Key；后端环境变量（如有）仍保留')
   }
 
   return (
@@ -93,13 +102,6 @@ export default function AiConfigModal({ open, onCancel, onSaved }) {
           <Input.Password placeholder="请输入 AI API Key" autoComplete="new-password" />
         </Form.Item>
         <Form.Item
-          name="baseUrl"
-          label="接口地址"
-          rules={[{ required: true, message: '请输入接口地址' }]}
-        >
-          <Input placeholder="https://api.deepseek.com/v1" />
-        </Form.Item>
-        <Form.Item
           name="model"
           label="模型"
           rules={[{ required: true, message: '请输入模型名称' }]}
@@ -107,8 +109,11 @@ export default function AiConfigModal({ open, onCancel, onSaved }) {
           <Input placeholder="deepseek-chat" />
         </Form.Item>
         <Typography.Text type="secondary">
-          提示：API 密钥需与所选服务商匹配；切换服务商会自动填充默认接口地址与模型。
+          密钥仅保留在当前浏览器会话，刷新后仍可使用。接口地址由服务商固定；断开不会删除后端环境变量。
         </Typography.Text>
+        <div style={{ marginTop: 16 }}>
+          <Button danger onClick={handleDisconnect}>断开 AI</Button>
+        </div>
       </Form>
     </Modal>
   )

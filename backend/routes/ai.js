@@ -2,9 +2,7 @@ import { Router } from 'express'
 import {
   callDeepSeek,
   DeepSeekError,
-  isDeepSeekConfigured,
   isProviderConfigured,
-  listProviders,
   resolveProvider
 } from '../services/deepseek.js'
 import {
@@ -28,8 +26,7 @@ function aiOptions(req) {
   return {
     provider: req.headers['x-ai-provider'],
     model: req.headers['x-ai-model'],
-    apiKey: req.headers['x-ai-api-key'],
-    baseUrl: req.headers['x-ai-base-url']
+    apiKey: req.headers['x-ai-api-key']
   }
 }
 
@@ -453,23 +450,20 @@ export async function validateRecords(records, callFn = callDeepSeek, rules = []
 
 /**
  * GET /api/ai/status
- * 返回 AI 服务是否可用（仅校验 Key 配置，不发起外部请求）
+ * 仅报告后端环境变量是否配置；无需接收或返回页面用户 Key。
  */
 router.get('/status', (req, res) => {
-  // 页面配置的服务商/Key/接口地址优先（请求头），否则回退环境变量
-  const options = aiOptions(req)
-  const providerInfo = resolveProvider(options.provider)
-  const available = isProviderConfigured(providerInfo.key, options.apiKey)
+  const providerInfo = resolveProvider(req.headers['x-ai-provider'])
+  const available = isProviderConfigured(providerInfo.key)
   ok(res, {
     available,
+    keySource: available ? 'environment' : 'none',
     provider: providerInfo.key,
     providerLabel: providerInfo.label,
-    model: available ? options.model || providerInfo.model : null,
-    baseUrl: options.baseUrl || providerInfo.baseUrl,
-    providers: listProviders(),
+    model: req.headers['x-ai-model'] || providerInfo.model,
     msg: available
-      ? 'AI服务已配置'
-      : `未配置 ${providerInfo.label} API Key，请先在页面右上角配置`
+      ? '本地环境已配置'
+      : `后端环境未配置 ${providerInfo.label} API Key`
   })
 })
 
@@ -547,7 +541,7 @@ router.post('/normalize-time-cycles', async (req, res) => {
     if (err instanceof DeepSeekError || err.isDeepSeekError) {
       return fail(res, err.status || 502, err.message)
     }
-    console.error('[ai] 时间周期识别异常:', err)
+    console.error('[ai] 时间周期识别异常')
     return fail(res, 500, 'AI 时间周期识别服务异常，请稍后重试')
   }
 })
@@ -595,7 +589,7 @@ router.post('/suggest-field-mappings', async (req, res) => {
     if (err instanceof DeepSeekError || err.isDeepSeekError) {
       return fail(res, err.status || 502, err.message)
     }
-    console.error('[ai] 字段映射识别异常:', err)
+    console.error('[ai] 字段映射识别异常')
     return fail(res, 500, 'AI 字段识别服务异常，请稍后重试')
   }
 })
@@ -619,14 +613,14 @@ router.post('/validate-records', async (req, res) => {
   }
 
   try {
-    // 页面配置的服务商/模型/Key/接口地址优先，其次环境变量兜底
+    // 页面配置的服务商/模型/Key 优先，其次环境变量兜底；接口地址固定。
     const result = await validateRecords(records, callDeepSeek, rules || [], aiOptions(req))
     ok(res, result)
   } catch (err) {
     if (err instanceof DeepSeekError || err.isDeepSeekError) {
       return fail(res, err.status || 502, err.message)
     }
-    console.error('[ai] 智能校验异常:', err)
+    console.error('[ai] 智能校验异常')
     return fail(res, 500, 'AI 校验服务异常，请稍后重试')
   }
 })

@@ -3,12 +3,12 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-// ---------- 服务商配置（默认值可被请求头/环境变量覆盖） ----------
+// ---------- 仅支持固定的官方服务商接口 ----------
 const PROVIDERS = {
   deepseek: {
     key: 'deepseek',
     label: 'DeepSeek',
-    baseUrl: process.env.DEEPSEEK_API_URL || 'https://api.deepseek.com/v1',
+    endpoint: 'https://api.deepseek.com/v1/chat/completions',
     model: 'deepseek-chat',
     apiKeyEnv: 'DEEPSEEK_API_KEY',
     supportsJsonMode: true // 支持 response_format: json_object
@@ -16,7 +16,7 @@ const PROVIDERS = {
   zhipu: {
     key: 'zhipu',
     label: '智谱 AI',
-    baseUrl: process.env.ZHIPU_API_URL || 'https://open.bigmodel.cn/api/paas/v4',
+    endpoint: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
     model: 'glm-4-flash',
     apiKeyEnv: 'ZHIPU_API_KEY',
     supportsJsonMode: false // 提示词已要求严格 JSON，避免部分模型不支持该参数
@@ -31,13 +31,12 @@ export function resolveProvider(provider) {
   return PROVIDERS[key] || PROVIDERS[DEFAULT_PROVIDER]
 }
 
-/** 服务商列表（供状态接口展示） */
+/** 服务商的非敏感元数据 */
 export function listProviders() {
   return Object.values(PROVIDERS).map((item) => ({
     key: item.key,
     label: item.label,
-    model: item.model,
-    baseUrl: item.baseUrl
+    model: item.model
   }))
 }
 
@@ -58,10 +57,15 @@ function normalizeUsage(usage) {
 }
 
 // 错误摘要（截断 + 脱敏：DeepSeek sk- 形态、智谱 id.secret 形态、上游掩码形态）
-function summarizeError(err, mapped) {
+function redactKey(value, key) {
+  const text = String(value)
+  return key ? text.split(String(key)).join('[REDACTED]') : text
+}
+
+function summarizeError(err, mapped, key) {
   const detail = err?.response?.data?.error?.message || err?.response?.data?.message
   const text = detail || mapped?.message || err?.message || '未知错误'
-  return String(text)
+  return redactKey(text, key)
     .replace(/sk-[A-Za-z0-9_-]+/gi, 'sk-***')
     .replace(/\b[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{8,}\b/g, '***.***')
     .replace(/\*{2,}[A-Za-z0-9_-]*/g, '****')
@@ -144,17 +148,8 @@ function getApiKey(providerKey, requestedKey) {
   return key
 }
 
-// 接口地址拼接：baseUrl + /chat/completions，兼容传入完整地址
-function buildEndpoint(baseUrl, defaultBaseUrl) {
-  const raw = (baseUrl && /^https?:\/\//i.test(baseUrl) ? baseUrl : defaultBaseUrl).replace(
-    /\/+$/,
-    ''
-  )
-  return /\/chat\/completions$/i.test(raw) ? raw : `${raw}/chat/completions`
-}
-
 /** 将 axios 错误转换为友好提示（按服务商标注） */
-function toDeepSeekError(err, providerLabel = PROVIDERS[DEFAULT_PROVIDER].label) {
+function toDeepSeekError(err, providerLabel = PROVIDERS[DEFAULT_PROVIDER].label, key) {
   if (err instanceof DeepSeekError) return err
   if (err.code === 'ECONNABORTED') {
     return new DeepSeekError(`${providerLabel} 请求超时，请稍后重试`)
@@ -173,7 +168,7 @@ function toDeepSeekError(err, providerLabel = PROVIDERS[DEFAULT_PROVIDER].label)
   if (status >= 500) {
     return new DeepSeekError(`${providerLabel} 服务异常（${status}），请稍后重试`)
   }
-  const detailText = detail ? `：${detail}` : ''
+  const detailText = detail ? `：${redactKey(detail, key)}` : ''
   return new DeepSeekError(`${providerLabel} 接口调用失败${detailText}`, 502)
 }
 
@@ -181,14 +176,14 @@ function toDeepSeekError(err, providerLabel = PROVIDERS[DEFAULT_PROVIDER].label)
  * 统一的多服务商 AI 调用函数（OpenAI 标准 chat/completions 协议）
  * @param {string} systemPrompt 系统提示词
  * @param {string} userContent 用户输入内容
- * @param {Object} [options] { temperature, maxTokens, apiKey, baseUrl, provider, model }
+ * @param {Object} [options] { temperature, maxTokens, apiKey, provider, model }
  * @returns {Promise<string>} 模型返回的文本内容
  */
 export async function callDeepSeek(systemPrompt, userContent, options = {}) {
   const startedAt = Date.now()
-  const { temperature = 0, maxTokens = 4096, apiKey, baseUrl, provider, model } = options
+  const { temperature = 0, maxTokens = 4096, apiKey, provider, model } = options
   const providerInfo = resolveProvider(provider)
-  const finalUrl = buildEndpoint(baseUrl, providerInfo.baseUrl)
+  const finalUrl = providerInfo.endpoint
   const finalModel = (model && String(model).trim()) || providerInfo.model
 
   let finalKey
@@ -248,7 +243,7 @@ export async function callDeepSeek(systemPrompt, userContent, options = {}) {
     })
     return String(content)
   } catch (err) {
-    const mapped = toDeepSeekError(err, providerInfo.label)
+    const mapped = toDeepSeekError(err, providerInfo.label, finalKey)
     // 只读日志：失败调用（状态码/耗时/错误摘要）
     writeAiLog({
       provider: providerInfo.key,
@@ -256,7 +251,7 @@ export async function callDeepSeek(systemPrompt, userContent, options = {}) {
       status: err.response?.status ?? null,
       durationMs: Date.now() - startedAt,
       usage: normalizeUsage(err.response?.data?.usage),
-      error: summarizeError(err, mapped),
+      error: summarizeError(err, mapped, finalKey),
       endpoint: finalUrl
     })
     throw mapped

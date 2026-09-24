@@ -1054,6 +1054,7 @@ export function applyTimeCycleMapping(result, mapping = {}) {
     if (row.sourceTimeCycleRaw) next.sourceTimeCycleRaw = row.sourceTimeCycleRaw
     if (row.manualCorrection) next.manualCorrection = true
     if (row.manualCorrectionFields) next.manualCorrectionFields = row.manualCorrectionFields
+    if (row.aiSuggestionAdopted) next.aiSuggestionAdopted = true
     if (row.sourceCycleConflictOrigin) next.sourceCycleConflictOrigin = true
     if (row.sourceCycleConfirmed) next.sourceCycleConfirmed = true
 
@@ -1141,12 +1142,13 @@ export function confirmSourceTimeCycleConflict(result, rowIndex) {
 }
 
 /**
- * 只修正本次导入会话中的单条失败或需确认行；复用时间周期映射后的整套本地重校验。
+ * 只修正本次导入会话中的单条记录；复用时间周期映射后的整套本地重校验。
  * rowIndex 与原 Excel 保持一致，time_cycle 不接受人工输入。
  */
-export function applyManualImportCorrection(result, rowIndex, changes = {}, cycles = []) {
+export function applyManualImportCorrection(result, rowIndex, changes = {}, cycles = [], options = {}) {
   const original = result?.allRows?.find((row) => row.rowIndex === rowIndex)
-  if (!original || (!original.cellErrors?.length && !result.confirmationRows?.some((row) => row.rowIndex === rowIndex))) return result
+  if (!original || (!options.allowValidRow && !original.cellErrors?.length &&
+      !result.confirmationRows?.some((row) => row.rowIndex === rowIndex))) return result
 
   const next = { ...original }
   const changedFields = new Set(original.manualCorrectionFields || [])
@@ -1161,16 +1163,20 @@ export function applyManualImportCorrection(result, rowIndex, changes = {}, cycl
 
   if (Object.prototype.hasOwnProperty.call(changes, 'sourceTimeCycleRaw')) {
     const source = String(changes.sourceTimeCycleRaw ?? '').trim()
-    if (String(original.sourceTimeCycleRaw ?? '') !== source) changedFields.add('sourceTimeCycleRaw')
+    const sourceChanged = String(original.sourceTimeCycleRaw ?? '') !== source
+    if (sourceChanged) changedFields.add('sourceTimeCycleRaw')
     next.sourceTimeCycleRaw = source || undefined
     next.sourceTimeCycle = source ? normalizeTimeCycleValue(source, cycles) : undefined
     // 无发布日期时仍按源周期兜底；有发布日期时由本地重校验重新计算自然周。
     next.time_cycle = next.sourceTimeCycle
+    // 原档期的人工确认不能沿用到修改后的另一档期。
+    if (sourceChanged) next.sourceCycleConfirmed = false
   }
 
   if (changedFields.size) {
     next.manualCorrection = true
     next.manualCorrectionFields = [...changedFields]
+    if (options.aiSuggestionAdopted) next.aiSuggestionAdopted = true
   }
 
   const revalidated = applyTimeCycleMapping(

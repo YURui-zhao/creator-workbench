@@ -164,18 +164,17 @@ const BASE_PROMPT = `
   · 播放量异常巨大 → 建议「核对数据来源，确认是否存在刷量或统计口径错误」
 - issues: 问题描述数组（中文，按字段说明；与 warnings/errors 的 reason 保持一致，可为空数组）
 - suggestions: 修正建议数组（中文，可操作；与 warnings/errors 的 suggestion 保持一致，可为空数组）
-- corrected: 仅在能明确修正时提供修正后的字段对象（如去除首尾空格、日期格式归一为 YYYY-MM-DD、链接补全 https://），无法确定时填 null，不得编造数值
+- corrected: 仅提供供用户核对的候选建议值（如去除首尾空格、链接补全 https://），不代表记录已被修改；无法确定时填 null，不得编造数值。发布日期、投放档期归属和系统自然周不得在 corrected 中改写，只能在 suggestions 提醒用户核对
 - issues、suggestions、warnings、errors 为空时输出空数组
 `
 
 // 智能补全能力（始终开启）
 const COMPLETION_PROMPT = `
-智能补全能力（仅在能明确判断时提供 corrected，无法确定时不得编造）：
+智能建议能力（corrected 只是供用户核对的候选值，不会自动写入；无法确定时不得编造）：
 - 根据达人昵称自动推测博主类型 creator_type（如昵称含「美妆/护肤」→美妆，含「美食/探店」→美食，含「穿搭/时尚」→穿搭，含「数码/测评」→数码，无法确定时不填）
 - 根据链接自动提取平台信息，写入 corrected.platform（平台名称，如 抖音/小红书/B站/快手/微博/视频号/其他）
-- 自动修正日期格式（归一化为 YYYY-MM-DD）、数字格式（去除货币符号/千分位，播放量支持 x.x万 写法）
-- 数值字段自动修正（total_cost、first_play、second_week_play 等）：遇到「/」「-」「--」「无」「空」「暂无」「N/A」等占位写法时按缺失处理——必填字段在 corrected 中给 0，非必填字段给 null；遇到「1.2万」「1万」「1,234」「￥1000」「1000元」等写法时在 corrected 中换算为标准数值（12000 / 10000 / 1234 / 1000 / 1000）；无法解析时非必填字段给 null 并在 suggestions 中提示
-- 时间周期自动修正：time_cycle 若为「第33周」「8.17-8.23」「8月17日」「2026年8月17日至8月23日」等写法，请识别为该周的标准周码 YYYY-Wxx（周一为每周第一天，区间必须是完整自然周）写入 corrected.time_cycle；无法唯一确定时置 null 并在 issues 中说明
+- 日期格式或投放档期有疑问时，在 suggestions 中提醒用户核对原始数据；不要给出 corrected.publish_date 或 corrected.time_cycle，标准自然周由本地程序根据真实发布日期计算
+- 数值格式建议（total_cost、first_play、second_week_play 等）：遇到「/」「-」「--」「无」「空」「暂无」「N/A」等占位写法时建议用户核对是否缺失；遇到「1.2万」「1万」「1,234」「￥1000」「1000元」等写法时可在 corrected 中给出候选标准数值（12000 / 10000 / 1234 / 1000 / 1000），但不得把推测值当作已确认事实；无法解析时在 suggestions 中提示
 `
 
 // 可选判定规则库（key 为前端勾选项）
@@ -189,7 +188,7 @@ const RULE_LIBRARY = {
   time_cycle_format: {
     label: '时间周期格式判定',
     prompt: `
-7. 时间周期格式判定：time_cycle 必须符合 YYYY-Wxx 格式（如 2024-W30），不合法时标记 error，并在 corrected.time_cycle 中给出规范值。
+7. 时间周期格式判定：time_cycle 必须符合 YYYY-Wxx 格式（如 2024-W30），不合法时标记 error，并在 suggestions 中提示用户核对；不得自行改写标准自然周。
 `
   },
   duplicate_check: {
@@ -441,10 +440,22 @@ export function normalizeFieldSuggestions(parsed, columns = []) {
 }
 
 /**
- * 智能校验：按启用规则构建提示词并调用 DeepSeek（可注入 callFn 便于测试）
+ * 智能校验：只向 Provider 发送提示词实际使用的业务字段。
  */
+export const AI_VALIDATION_FIELDS = [
+  'rowIndex', 'time_cycle', 'nickname', 'creator_type', 'homepage', 'content_link',
+  'video_link', 'total_cost', 'publish_date', 'first_play', 'second_week_play', 'cpm_quote'
+]
+
+export function projectValidationRecords(records) {
+  return records.map((record) => Object.fromEntries(
+    AI_VALIDATION_FIELDS.filter((field) => record?.[field] !== undefined)
+      .map((field) => [field, record[field]])
+  ))
+}
+
 export async function validateRecords(records, callFn = callDeepSeek, rules = [], options = {}) {
-  const content = await callFn(buildSystemPrompt(rules), JSON.stringify(records), options)
+  const content = await callFn(buildSystemPrompt(rules), JSON.stringify(projectValidationRecords(records)), options)
   return normalizeResult(parseAiResult(content))
 }
 

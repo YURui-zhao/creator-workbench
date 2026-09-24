@@ -28,7 +28,7 @@ import { InboxOutlined } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
 import { batchCreateRecords, fetchAllRecords, getCycles } from '../api/records'
 import { normalizeTimeCyclesAI, suggestFieldMappingsAI, validateRecordsAI } from '../api/ai'
-import { getAiConfig } from '../utils/aiConfig.js'
+import { getAiConfig, getProviderPreset } from '../utils/aiConfig.js'
 import { getErrorMessage } from '../utils/request.js'
 import {
   applyManualImportCorrection,
@@ -43,7 +43,6 @@ import {
   detectMappingConflicts,
   exportFailedRowsToExcel,
   parseRecordsExcel,
-  sanitizeCorrectedFields,
   weekCodeToLabel,
   buildFailedRowsFileName
 } from '../utils/excel'
@@ -116,6 +115,16 @@ const MANUAL_EDIT_FIELDS = [
   'first_play',
   'second_week_play'
 ]
+
+// 与后端白名单一致；解析/校验元数据不随智能校验请求发送。
+const AI_VALIDATION_FIELDS = [
+  'rowIndex', 'time_cycle', 'nickname', 'creator_type', 'homepage', 'content_link',
+  'video_link', 'total_cost', 'publish_date', 'first_play', 'second_week_play', 'cpm_quote'
+]
+const pickAiValidationFields = (row) => Object.fromEntries(
+  AI_VALIDATION_FIELDS.filter((field) => row[field] !== undefined)
+    .map((field) => [field, row[field]])
+)
 
 // 单元格渲染：无效单元格标红并悬浮显示原因
 function renderCell(field) {
@@ -195,13 +204,12 @@ const PREVIEW_COLUMNS = [
 ]
 
 /**
- * Excel 批量导入弹窗（DeepSeek 智能判定版）
- * 流程：上传文件 → AI校验 → 确认导入
+ * Excel 批量导入弹窗：上传并本地校验后，可主动请求 AI 建议，再确认导入。
  */
 export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   const navigate = useNavigate()
   const [manualForm] = Form.useForm()
-  // 步骤：0 上传文件 / 1 AI校验 / 2 确认导入
+  // 步骤：0 上传文件 / 1 字段或周期确认 / 2 预览与导入
   const [step, setStep] = useState(0)
   const [parsing, setParsing] = useState(false)
   const [importing, setImporting] = useState(false)
@@ -217,8 +225,11 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   const [aiFormatError, setAiFormatError] = useState(false)
   // 原始数据与修正后数据：importRows 始终为「当前待导入数据」
   const [importRows, setImportRows] = useState([])
-  const [fixedIndexes, setFixedIndexes] = useState(() => new Set())
+  const aiRequestInFlightRef = useRef(false)
+  const mappingRequestInFlightRef = useRef(false)
+  const cycleRequestInFlightRef = useRef(false)
   const [manualEditRowIndex, setManualEditRowIndex] = useState(null)
+  const [manualEditFromAi, setManualEditFromAi] = useState(false)
   const [manualEditError, setManualEditError] = useState('')
   const [manualSaving, setManualSaving] = useState(false)
   // 高级规则配置
@@ -242,6 +253,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
 
   // AI 结果按 Excel 行号索引（与本地校验行号口径一致）
   const aiMap = useMemo(() => new Map(aiResults.map((r) => [r.rowIndex, r])), [aiResults])
+  const aiProviderLabel = getProviderPreset(getAiConfig()?.provider).label
 
   // 统计：共 / 通过 / 警告 / 错误
   const stats = useMemo(() => {
@@ -254,15 +266,8 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     return s
   }, [aiResults])
 
-  // 尚未修正的错误行（存在错误时禁止直接导入）
-  const unfixedErrors = useMemo(
-    () => aiResults.filter((r) => r.level === 'error' && !fixedIndexes.has(r.rowIndex)),
-    [aiResults, fixedIndexes]
-  )
-
-  const hasCorrections = aiResults.some(
-    (r) => r.corrected && typeof r.corrected === 'object' && Object.keys(r.corrected).length > 0
-  )
+  // AI 错误仅作为风险提示，不能自行改变本地校验决定的可导入范围。
+  const aiErrors = useMemo(() => aiResults.filter((r) => r.level === 'error'), [aiResults])
 
   // ---------- 导入结果统计（成功 / 失败 / 跳过 / 重复，基于解析结果计算） ----------
   const duplicateIndexes = useMemo(
@@ -301,19 +306,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     (row) => row.rowIndex === manualEditRowIndex
   )?.sourceCycleConflictOrigin)
 
-  // AI 校验错误行（未修正）：不拦截警告，仅错误行跳过入库
-  const aiErrorRowIndexes = useMemo(
-    () => new Set(unfixedErrors.map((item) => item.rowIndex)),
-    [unfixedErrors]
-  )
-  const importableRows = useMemo(
-    () => importRows.filter((row) => !aiErrorRowIndexes.has(row.rowIndex)),
-    [importRows, aiErrorRowIndexes]
-  )
-  const skippedByAiIndexes = useMemo(
-    () => importRows.filter((row) => aiErrorRowIndexes.has(row.rowIndex)).map((row) => row.rowIndex),
-    [importRows, aiErrorRowIndexes]
-  )
+  const importableRows = importRows
 
   // 下载失败明细（行号 / 错误字段 / 原始值 / 错误原因），无失败数据时给出提示
   const handleDownloadFailedRows = () => {
@@ -332,7 +325,8 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   }
 
   // 忙碌状态：解析/AI校验/导入中禁止关闭，避免异步回调写入已重置的状态
-  const busy = parsing || importing || aiLoading || manualSaving || Boolean(mappingReview?.loading)
+  const busy = parsing || importing || aiLoading || manualSaving ||
+    Boolean(mappingReview?.loading) || Boolean(cycleReview?.loading)
 
   // 重置并回到上传步骤
   const resetUpload = () => {
@@ -346,8 +340,8 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     setMappingReview(null)
     setCycleNotes({})
     setImportRows([])
-    setFixedIndexes(new Set())
     setManualEditRowIndex(null)
+    setManualEditFromAi(false)
     setManualEditError('')
     manualForm.resetFields()
     setDuplicateRows([])
@@ -426,6 +420,8 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   }
 
   const runAiValidation = async (rows) => {
+    if (aiRequestInFlightRef.current || !rows.length) return
+    aiRequestInFlightRef.current = true
     setAiLoading(true)
     setAiError('')
     setAiFormatError(false)
@@ -448,7 +444,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
           .map((text) => text.trim())
           .filter(Boolean)
       ]
-      const res = await validateRecordsAI(rows, rules)
+      const res = await validateRecordsAI(rows.map(pickAiValidationFields), rules)
       const items = normalizeAiResults(res.data, rows)
       if (!items.length) {
         // 结构异常（不是数组 / 空数组）：不展示空列表，给出明确重试提示
@@ -466,6 +462,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
       setStep(2)
     } finally {
       setAiLoading(false)
+      aiRequestInFlightRef.current = false
     }
   }
 
@@ -476,8 +473,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     results: values.map((value) => ({ value, weekCode: '', skipped: false })),
     loading: false,
     error: '',
-    notice: '',
-    autoRunning: false
+    notice: ''
   })
 
   // 识别结果 -> 原始值映射（跳过 / 识别失败均映射为 null，对应行按原规则判失败）
@@ -580,23 +576,23 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   }
 
   const handleCycleAiRecognize = async () => {
-    if (!cycleReview) return
+    if (!cycleReview || cycleRequestInFlightRef.current) return
+    cycleRequestInFlightRef.current = true
     setCycleReview((prev) =>
       prev ? { ...prev, loading: true, error: '', notice: '' } : prev
     )
-    const recognized = await requestCycleRecognition(cycleReview)
-    setCycleReview(recognized)
+    try {
+      const recognized = await requestCycleRecognition(cycleReview)
+      setCycleReview(recognized)
+    } finally {
+      cycleRequestInFlightRef.current = false
+    }
   }
 
   // 继续原有校验流程（应用映射后 / 跳过识别时）
-  const continueAfterCycleReview = async (updatedResult) => {
+  const continueAfterCycleReview = async () => {
     setCycleReview(null)
-    setStep(1)
-    if (updatedResult.validRows.length) {
-      await runAiValidation(updatedResult.validRows)
-    } else {
-      setStep(2)
-    }
+    setStep(2)
   }
 
   /**
@@ -628,7 +624,9 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     } catch {
       // 与首次解析一致：拉取已有记录失败时仍执行文件内去重。
     }
-    const { duplicateRows: matches } = dedupeImportRows([candidate], [...existing, ...importRows])
+    const { duplicateRows: matches } = dedupeImportRows(
+      [candidate], [...existing, ...importRows.filter((row) => row.rowIndex !== rowIndex)]
+    )
     if (matches.length) {
       const duplicate = matches[0]
       excludedRowsRef.current = [...excludedRowsRef.current, duplicate]
@@ -638,10 +636,12 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
         validRows: checked.validRows.filter((row) => row.rowIndex !== rowIndex),
         failedRows: [...checked.failedRows, duplicate]
       })
+      setImportRows((current) => current.filter((row) => row.rowIndex !== rowIndex))
       return false
     }
     setPreview(checked)
-    setImportRows((current) => [...current, candidate].sort((a, b) => a.rowIndex - b.rowIndex))
+    setImportRows((current) => [...current.filter((row) => row.rowIndex !== rowIndex), candidate]
+      .sort((a, b) => a.rowIndex - b.rowIndex))
     return true
   }
 
@@ -663,9 +663,10 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     }
   }
 
-  const openManualCorrection = (rowIndex) => {
+  const openManualCorrection = (rowIndex, fromAi = false) => {
     if (!failedRows.some((item) => item.rowIndex === rowIndex) &&
-        !confirmationRows.some((item) => item.rowIndex === rowIndex)) return
+        !confirmationRows.some((item) => item.rowIndex === rowIndex) &&
+        !(fromAi && aiMap.has(rowIndex) && importRows.some((row) => row.rowIndex === rowIndex))) return
     const row = preview?.allRows?.find((item) => item.rowIndex === rowIndex)
     if (!row) return
     manualForm.resetFields()
@@ -673,24 +674,35 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
       Object.fromEntries(MANUAL_EDIT_FIELDS.map((field) => [field, String(row[field] ?? '')]))
     )
     setManualEditError('')
+    setManualEditFromAi(fromAi)
     setManualEditRowIndex(rowIndex)
   }
 
   const saveManualCorrection = async () => {
     if (!preview || manualEditRowIndex === null) return
+    const original = preview.allRows.find((row) => row.rowIndex === manualEditRowIndex)
+    const changes = manualForm.getFieldsValue()
+    if (manualEditFromAi && !MANUAL_EDIT_FIELDS.some((field) =>
+      String(original?.[field] ?? '') !== String(changes[field] ?? '')
+    )) {
+      setManualEditError('请先核对原始数据并调整字段；AI 建议不会自动写入。')
+      return
+    }
     setManualSaving(true)
     try {
       const rechecked = reapplyDedupeExclusion(
         applyManualImportCorrection(
           preview,
           manualEditRowIndex,
-          manualForm.getFieldsValue(),
-          sourceCyclesRef.current
+          changes,
+          sourceCyclesRef.current,
+          { allowValidRow: manualEditFromAi, aiSuggestionAdopted: manualEditFromAi }
         )
       )
       const repaired = rechecked.validRows.find((row) => row.rowIndex === manualEditRowIndex)
       if (!repaired) {
-        setPreview(rechecked)
+        // AI 建议行校验失败时保留原行；建议值不得进入待导入列表。
+        if (!manualEditFromAi) setPreview(rechecked)
         setManualEditError(
           rechecked.confirmationRows?.find((item) => item.rowIndex === manualEditRowIndex)?.reason ||
           rechecked.failedRows.find((item) => item.rowIndex === manualEditRowIndex)?.reason ||
@@ -706,7 +718,9 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
         return
       }
 
+      if (manualEditFromAi) setAiResults((current) => current.filter((item) => item.rowIndex !== manualEditRowIndex))
       setManualEditRowIndex(null)
+      setManualEditFromAi(false)
       setManualEditError('')
       message.success(`Excel 第${manualEditRowIndex}行已通过本地校验，可导入`)
     } catch (error) {
@@ -782,6 +796,17 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     }
   }
 
+  const handleMappingAiSuggestions = async () => {
+    if (!mappingReview || mappingRequestInFlightRef.current) return
+    mappingRequestInFlightRef.current = true
+    setMappingReview((current) => current ? { ...current, loading: true } : current)
+    try {
+      setMappingReview(await requestFieldMappingSuggestions(mappingReview))
+    } finally {
+      mappingRequestInFlightRef.current = false
+    }
+  }
+
   const updateMappingItem = (index, patch) => {
     setMappingReview((prev) =>
       prev
@@ -817,7 +842,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     }
   }
 
-  // ---------- 解析后的通用流程：本地校验/去重 -> 时间周期识别 -> AI 校验 ----------
+  // ---------- 解析后的通用流程：本地校验/去重 -> 必要时确认周期 -> 预览 ----------
   const runImportPipeline = async (result) => {
       // 自动判定无效数据：与库中已有记录重复、文件内重复的行剔除
       excludedRowsRef.current = []
@@ -839,7 +864,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
       }
 
       setPreview(result)
-      // 本地维护原始数据与修正后数据（importRows 可被一键修正更新）
+      // 本地校验通过的记录先进入可导入列表，AI 校验由用户另行主动触发。
       setImportRows(result.validRows.map((row) => ({ ...row })))
 
       // 本地规则无法识别的时间周期：先进入智能识别面板（不直接放行/丢弃）
@@ -848,46 +873,13 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
         const review = buildCycleReview(unknownCycles)
         setCycleReview(review)
         setStep(1)
-        // 已配置密钥：自动触发 AI 识别，识别成功后直接进入 AI 校验（无需手动点按钮）
-        if (getAiConfig()?.apiKey) {
-          setCycleReview({ ...review, loading: true, autoRunning: true })
-          const recognized = await requestCycleRecognition(review)
-          // AI 识别结果已过本地二次校验：全部识别成功才自动继续，否则交由用户手动确认
-          const allResolved = recognized.results.every(
-            (item) => item.skipped || Boolean(parseTimeCycleToWeekCode(item.weekCode))
-          )
-          if (!recognized.error && allResolved) {
-            setCycleNotes(buildCycleNotes(result.allRows, recognized))
-            const updated = reapplyDedupeExclusion(
-              applyTimeCycleMapping(result, buildCycleMapping(recognized))
-            )
-            setPreview(updated)
-            setImportRows(updated.validRows.map((row) => ({ ...row })))
-            await continueAfterCycleReview(updated)
-          } else {
-            setCycleReview({
-              ...recognized,
-              autoRunning: false,
-              notice: recognized.error
-                ? ''
-                : '部分时间周期未能自动识别，请手动填写后点击「确认应用」'
-            })
-          }
-        }
         return false
       }
-
-      if (!result.validRows.length) {
-        // 没有可导入数据时跳过 AI，直接进入结果页
-        setStep(2)
-      } else {
-        setStep(1)
-        await runAiValidation(result.validRows)
-      }
+      setStep(2)
       return false
   }
 
-  // ---------- 上传 -> 解析 -> 字段映射确认 -> 本地校验/去重 -> AI 校验 ----------
+  // ---------- 上传 -> 解析 -> 字段映射确认 -> 本地校验/去重 -> 预览 ----------
   const handleFile = async (file) => {
     setParsing(true)
     try {
@@ -910,10 +902,6 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
         setPreview(result)
         setMappingReview(review)
         setStep(1)
-        if (getAiConfig()?.apiKey) {
-          setMappingReview({ ...review, loading: true })
-          setMappingReview(await requestFieldMappingSuggestions(review))
-        }
         return false
       }
 
@@ -926,25 +914,6 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     return false // 阻止 antd Upload 自动上传
   }
 
-  // ---------- 一键修正：应用 AI 给出的修正值 ----------
-  const applyCorrections = () => {
-    const next = importRows.map((row) => {
-      const ai = aiMap.get(row.rowIndex)
-      if (ai?.corrected && typeof ai.corrected === 'object') {
-        // 修正值统一清洗：数值转标准数字、时间周期转标准周码，无法解析的字段丢弃
-        return { ...row, ...sanitizeCorrectedFields(ai.corrected) }
-      }
-      return row
-    })
-    setImportRows(next)
-    const fixed = new Set(fixedIndexes)
-    for (const r of aiResults) {
-      if (r.corrected && typeof r.corrected === 'object') fixed.add(r.rowIndex)
-    }
-    setFixedIndexes(fixed)
-    message.success('已应用 AI 修正建议，可继续导入')
-  }
-
   // ---------- 确认导入（导入修正后的数据） ----------
   const handleConfirm = async () => {
     // 安全兜底：存在未确认的字段映射时，绝不允许正式导入（避免「假成功」）
@@ -952,13 +921,20 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
       message.warning('请先完成字段映射确认后再导入')
       return
     }
-    // 仅导入「本地校验通过 - AI校验错误」的记录（警告不拦截）
+    // AI 结果只提示风险；正式导入资格由确定性本地校验决定。
     if (!importableRows.length) return
+    const locallyChecked = reapplyDedupeExclusion(applyTimeCycleMapping(preview, {}))
+    const checkedByIndex = new Map(locallyChecked.validRows.map((row) => [row.rowIndex, row]))
+    if (importableRows.some((row) => !checkedByIndex.has(row.rowIndex))) {
+      message.error('导入前本地校验未通过，请重新检查记录')
+      return
+    }
     setImporting(true)
     setImportError('')
     try {
-      const payload = importableRows.map(
+      const payload = importableRows.map((row) => checkedByIndex.get(row.rowIndex)).map(
         ({ rowIndex, sourceTimeCycle, sourceTimeCycleRaw, manualCorrection, manualCorrectionFields,
+          aiSuggestionAdopted,
           sourceCycleConflictOrigin, sourceCycleConfirmed, ...record }) =>
           record
       )
@@ -971,7 +947,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
         duplicateCount: duplicateRows.length,
         items: [
           ...importableRows
-            .filter((row) => row.manualCorrection || row.sourceCycleConfirmed)
+            .filter((row) => row.manualCorrection || row.sourceCycleConfirmed || row.aiSuggestionAdopted)
             .map((row) => ({
               rowIndex: row.rowIndex,
               status: 'success',
@@ -979,6 +955,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
                 row.manualCorrection && `人工修正：${(row.manualCorrectionFields || [])
                   .map((field) => field === 'sourceTimeCycleRaw' ? '源时间周期' : FIELD_LABELS[field] || field)
                   .join('、')}`,
+                row.aiSuggestionAdopted && 'AI建议 / 用户采用（已通过本地校验）',
                 row.sourceCycleConfirmed && `人工确认当前投放档期：源周期 ${row.sourceTimeCycleRaw || ''}；发布日期 ${row.publish_date}`
               ].filter(Boolean).join('；')
             })),
@@ -1028,9 +1005,6 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
         })
       } else {
         message.success(`成功导入 ${res.data.count} 条记录`)
-      }
-      if (skippedByAiIndexes.length) {
-        message.warning(`${skippedByAiIndexes.length} 条 AI 校验错误记录已跳过`)
       }
       if (failedRows.length) {
         message.warning(`${failedRows.length} 条本地校验失败数据已跳过`)
@@ -1087,7 +1061,6 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
                       {rowNote}
                     </Typography.Text>
                   )}
-                  {fixedIndexes.has(item.rowIndex) && <Tag color="blue">已修正</Tag>}
                 </Space>
               ),
               children: (
@@ -1171,15 +1144,20 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
                   )}
                   {item.corrected && Object.keys(item.corrected).length > 0 && (
                     <div>
-                      <Typography.Text strong>AI修正值：</Typography.Text>
-                      <Space size={[4, 4]} wrap>
+                      <Typography.Text strong>AI 建议修改（不会自动写入）：</Typography.Text>
+                      <Space direction="vertical" size={4} style={{ display: 'flex' }}>
                         {Object.entries(item.corrected).map(([key, value]) => (
-                          <Tag key={key} color="blue">
-                            {key}: {String(value)}
-                          </Tag>
+                          <Typography.Text key={key}>
+                            {FIELD_LABELS[key] || key}：{String(row?.[key] ?? '（空）')} → {String(value ?? '（空）')}
+                          </Typography.Text>
                         ))}
                       </Space>
                     </div>
+                  )}
+                  {importRows.some((candidate) => candidate.rowIndex === item.rowIndex) && (
+                    <Button size="small" onClick={() => openManualCorrection(item.rowIndex, true)}>
+                      参考建议，逐条人工调整
+                    </Button>
                   )}
                 </Space>
               )
@@ -1191,10 +1169,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   }
 
   // ---------- 底部按钮 ----------
-  const importLabel =
-    stats.warning > 0 && unfixedErrors.length === 0
-      ? '忽略警告，直接导入'
-      : `确认导入（${importableRows.length} 条）`
+  const importLabel = `确认导入（${importableRows.length} 条）`
 
   const renderFooter = () => {
     if (!preview) {
@@ -1218,20 +1193,6 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
         </Space>
       )
     }
-    if (step === 1 && aiLoading) {
-      return <Button disabled>取消</Button>
-    }
-    if (step === 1 && aiError) {
-      return (
-        <Space>
-          <Button onClick={closeModal}>取消</Button>
-          <Button onClick={() => runAiValidation(importRows)}>重试</Button>
-          <Button type="primary" onClick={() => setStep(2)}>
-            跳过AI，直接导入
-          </Button>
-        </Space>
-      )
-    }
     if (step === 2) {
       return (
         <Space>
@@ -1241,11 +1202,6 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
           <Button onClick={resetUpload} disabled={importing}>
             重新上传
           </Button>
-          {hasCorrections && (
-            <Button onClick={applyCorrections} disabled={importing}>
-              一键修正
-            </Button>
-          )}
           <Button
             type="primary"
             onClick={handleConfirm}
@@ -1274,7 +1230,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
       <Steps
         current={step}
         size="small"
-        items={[{ title: '上传文件' }, { title: 'AI校验' }, { title: '确认导入' }]}
+        items={[{ title: '上传文件' }, { title: '字段/周期确认' }, { title: '预览与导入' }]}
         style={{ marginBottom: 16 }}
       />
 
@@ -1294,7 +1250,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
               </p>
               <p className="ant-upload-text">点击或拖拽文件到此处上传</p>
               <p className="ant-upload-hint">
-                仅支持 .xlsx / .xls，上传后自动解析并调用 AI 逐条校验
+                仅支持 .xlsx / .xls；上传后只进行本地解析与校验，AI 需另行主动点击
               </p>
             </Dragger>
           </Spin>
@@ -1341,6 +1297,14 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
             message={`发现 ${mappingReview.items.length} 个未识别字段，请确认后再导入`}
             description="下列源字段未匹配到系统已知列名，请为每一列选择对应字段，或明确选择「忽略此列」。全部确认前无法进入导入。"
           />
+          <Space wrap>
+            <Typography.Text type="secondary">
+              点击后仅向 {aiProviderLabel} 发送未知表头及每列最多 5 个短样例；不会发送整份 Excel。
+            </Typography.Text>
+            <Button onClick={handleMappingAiSuggestions} loading={mappingReview.loading}>
+              AI 字段映射建议
+            </Button>
+          </Space>
           {mappingIncomplete && (
             <Alert
               type="info"
@@ -1412,6 +1376,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
                 render: (value, _record, index) => (
                   <Select
                     value={value || undefined}
+                    disabled={mappingReview.loading}
                     placeholder="请选择"
                     style={{ width: 170 }}
                     status={value ? undefined : 'error'}
@@ -1444,11 +1409,8 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
           <Alert
             type="info"
             showIcon
-            message={
-              cycleReview.loading && cycleReview.autoRunning
-                ? `检测到 ${cycleReview.values.length} 种无法识别的时间周期，正在自动调用 AI 识别…`
-                : `检测到 ${cycleReview.values.length} 种无法识别的时间周期，可点击 AI 智能识别自动整理`
-            }
+            message={`检测到 ${cycleReview.values.length} 种无法识别的时间周期，可主动点击 AI 智能识别`}
+            description={`点击后仅向 ${aiProviderLabel} 发送这些原始周期文本，不发送 Excel 原文件。`}
           />
           <Space wrap>
             <Button
@@ -1504,7 +1466,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
                       <Input
                         value={value}
                         placeholder="如 2026-W33"
-                        disabled={record.skipped}
+                        disabled={record.skipped || cycleReview.loading}
                         status={invalid ? 'error' : undefined}
                         onChange={(e) => updateCycleResult(index, { weekCode: e.target.value })}
                       />
@@ -1520,6 +1482,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
                 render: (checked, _record, index) => (
                   <Checkbox
                     checked={checked}
+                    disabled={cycleReview.loading}
                     onChange={(e) => updateCycleResult(index, { skipped: e.target.checked })}
                   />
                 )
@@ -1532,19 +1495,6 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
             </Button>
           </Space>
         </Space>
-      )}
-
-      {/* 步骤2：AI 校验加载中 / 失败重试 */}
-      {step === 1 && !cycleReview && aiLoading && (
-        <div style={{ textAlign: 'center', padding: 48 }}>
-          <Spin size="large" />
-          <Typography.Title level={5} style={{ marginTop: 16 }}>
-            AI正在判定数据...
-          </Typography.Title>
-          <Typography.Text type="secondary">
-            正在调用 DeepSeek 逐条校验记录（必填/格式/数值/业务逻辑/数据质量），请稍候
-          </Typography.Text>
-        </div>
       )}
 
       {/* 步骤3：确认导入（AI 结果 + 修正 + 预览） */}
@@ -1758,9 +1708,27 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
           <Divider orientation="left" style={{ margin: '4px 0' }}>
             <Typography.Text strong>AI 校验结果</Typography.Text>
             <Typography.Text type="secondary" style={{ marginLeft: 8, fontWeight: 'normal' }}>
-              （业务风险判定：警告不拦截导入，错误将跳过该行）
+              （主动触发；结果仅供核对，不改变本地校验结果）
             </Typography.Text>
           </Divider>
+
+          <Alert
+            type="info"
+            showIcon
+            message={`AI 智能校验 · ${aiProviderLabel}`}
+            description={`点击后会将本次分析所需的达人信息、链接、花费、发布日期、时间周期和播放数据发送给 ${aiProviderLabel}。不会上传 Excel 原文件；AI 建议不会自动修改记录。`}
+            action={
+              <Button
+                type="primary"
+                size="small"
+                onClick={() => runAiValidation(importRows)}
+                loading={aiLoading}
+                disabled={importing || importRows.length === 0}
+              >
+                AI 智能校验
+              </Button>
+            }
+          />
 
           {/* 无密钥 / 调用失败：降级提示，不影响基础导入 */}
           {aiError ? (
@@ -1794,6 +1762,11 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
             />
           ) : (
             <>
+              {aiResults.length === 0 && (
+                <Typography.Text type="secondary">
+                  尚未运行 AI 智能校验；可直接按本地校验结果导入。
+                </Typography.Text>
+              )}
               {/* AI 校验统计：通过 / 警告 / 错误 */}
               <Space size="middle" wrap>
                 <Tag>共 {stats.total} 条</Tag>
@@ -1802,15 +1775,12 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
                 <Tag color="error">错误 {stats.error} 条</Tag>
               </Space>
 
-              {/* AI 错误行：将跳过入库（可用「一键修正」或手动修正后重新导入） */}
-              {unfixedErrors.length > 0 && (
+              {aiErrors.length > 0 && (
                 <Alert
-                  type="error"
+                  type="warning"
                   showIcon
-                  message={`${unfixedErrors.length} 条 AI 校验错误将跳过入库（警告不影响导入）`}
-                  description={`错误行：${unfixedErrors
-                    .map((r) => formatRowLabel(r.rowIndex))
-                    .join('、')}；如需保留请点「一键修正」应用 AI 修正值，或修正后重新导入`}
+                  message={`${aiErrors.length} 条 AI 风险提示，请核对原始数据`}
+                  description={`涉及：${aiErrors.map((r) => formatRowLabel(r.rowIndex)).join('、')}。AI 不会自动修改或跳过记录；人工调整后会重新执行本地校验。`}
                 />
               )}
 
@@ -1840,7 +1810,10 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
       open={manualEditRowIndex !== null}
       zIndex={2000}
       onCancel={() => {
-        if (!manualSaving) setManualEditRowIndex(null)
+        if (!manualSaving) {
+          setManualEditRowIndex(null)
+          setManualEditFromAi(false)
+        }
       }}
       onOk={saveManualCorrection}
       okText="保存并重新校验"

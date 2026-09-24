@@ -25,9 +25,11 @@ if (isDeepSeekConfigured()) {
 
 const app = express()
 const PORT = process.env.PORT || 3001
+const HOST = '127.0.0.1'
+const LOCAL_FRONTEND_ORIGINS = ['http://localhost:5173', 'http://127.0.0.1:5173']
 
-// 跨域：开发环境放开所有来源
-app.use(cors())
+// 仅允许固定本地前端跨域；无 Origin 的本地脚本请求仍可正常访问 API
+app.use(cors({ origin: LOCAL_FRONTEND_ORIGINS }))
 
 // 请求体大小限制：支持批量导入/批量 AI 校验数据
 app.use(express.json({ limit: '5mb' }))
@@ -68,8 +70,8 @@ app.use((err, req, res, next) => {
   res.status(500).json({ code: 500, data: null, msg: '服务器内部错误', message: '服务器内部错误' })
 })
 
-app.listen(PORT, () => {
-  console.log(`[backend] 服务已启动: http://localhost:${PORT}`)
+app.listen(PORT, HOST, () => {
+  console.log(`[backend] 服务已启动: http://${HOST}:${PORT}`)
 })
 
 // 优雅退出时关闭数据库

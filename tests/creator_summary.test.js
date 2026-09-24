@@ -266,10 +266,11 @@ async function main() {
     bing.latest_sample_count === 0 && ding.latest_sample_count === 0
   )
   check(
-    // 已发现差异：total_summary 当前实现为 record − sample（把异常也算进了待更新）
-    '【差异已记录】total_summary.latest_pending_count 当前 = record − sample（含异常，= 2）',
-    summary.latest_pending_count === summary.record_count - summary.latest_sample_count,
-    `pending=${summary.latest_pending_count}（含异常记录；达人级口径已排除异常）`
+    'total_summary.latest_pending_count = record − sample − anomaly（异常不算待更新，= 1）',
+    summary.latest_pending_count === 1 &&
+      summary.latest_pending_count === summary.record_count - summary.latest_sample_count - summary.anomaly_count &&
+      summary.latest_pending_count === base.data.creators.reduce((sum, item) => sum + item.latest_pending_count, 0),
+    `pending=${summary.latest_pending_count}`
   )
 
   console.log('\n===== 3. keyword 模糊搜索 =====')
@@ -419,6 +420,49 @@ async function main() {
       Number(sheetRows[0]['平均CPM']) === Number(Number(compareRows[0].avg_cpm).toFixed(2)),
     JSON.stringify(sheetRows[0])
   )
+
+  console.log('\n===== 9. G3：total_summary 最新累计待更新边界 =====')
+  const pendingFixtures = [
+    {
+      label: '有效 + 空值 + 异常',
+      keyword: 'G3-mixed',
+      rows: [[100, 200], [100, null], [200, 100]],
+      expected: { record_count: 3, latest_sample_count: 1, anomaly_count: 1, latest_pending_count: 1 }
+    },
+    {
+      label: '只有异常，没有待更新',
+      keyword: 'G3-anomaly',
+      rows: [[100, 200], [200, 100]],
+      expected: { record_count: 2, latest_sample_count: 1, anomaly_count: 1, latest_pending_count: 0 }
+    },
+    {
+      label: '全部 latest 为空',
+      keyword: 'G3-empty',
+      rows: [[100, null], [100, null], [100, null]],
+      expected: { record_count: 3, latest_sample_count: 0, anomaly_count: 0, latest_pending_count: 3 }
+    }
+  ]
+  for (const fixture of pendingFixtures) {
+    db.transaction(() => {
+      fixture.rows.forEach(([first, latest], index) => {
+        insert.run('2026-W34', `${fixture.keyword}-${index + 1}`, 'G3', 10, '2026-08-26', first, latest)
+      })
+    })()
+    const result = await call({ keyword: fixture.keyword })
+    const actual = result.data?.total_summary
+    check(
+      `total_summary：${fixture.label}`,
+      result.status === 200 &&
+        result.data.creators.length === fixture.rows.length &&
+        Object.entries(fixture.expected).every(([field, value]) => actual[field] === value),
+      JSON.stringify({
+        record_count: actual?.record_count,
+        latest_sample_count: actual?.latest_sample_count,
+        anomaly_count: actual?.anomaly_count,
+        latest_pending_count: actual?.latest_pending_count
+      })
+    )
+  }
 }
 
 main()

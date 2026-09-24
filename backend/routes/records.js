@@ -1185,7 +1185,7 @@ function buildCreatorSummaryLatest({
       : null
   totalSummary.hit_rate = totalSummary.hit_rate_latest
   totalSummary.latest_pending_count =
-    totalSummary.record_count - totalSummary.latest_sample_count
+    totalSummary.record_count - totalSummary.latest_sample_count - totalSummary.anomaly_count
 
   return {
     range: { startWeek: startWeek || null, endWeek: endWeek || null },

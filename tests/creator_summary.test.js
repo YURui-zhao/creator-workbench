@@ -62,7 +62,15 @@ async function main() {
     (item) => item.route && item.route.path === '/creator-summary' && item.route.methods.get
   )
   const handler = layer?.route?.stack?.[layer.route.stack.length - 1]?.handle
+  const routeHandler = (routePath) => recordsModule.default.stack.find(
+    (item) => item.route && item.route.path === routePath && item.route.methods.get
+  )?.route?.stack?.at(-1)?.handle
+  const weekStatsHandler = routeHandler('/week-stats')
+  const listHandler = routeHandler('/')
+  const exportHandler = routeHandler('/export')
   check('creator-summary handler 可用', typeof handler === 'function')
+  check('周汇总、记录列表、导出 handler 可用',
+    [weekStatsHandler, listHandler, exportHandler].every((item) => typeof item === 'function'))
 
   // 写入固定数据集（隔离库，不影响用户真实库）
   const insert = db.prepare(
@@ -76,10 +84,11 @@ async function main() {
   const seededCount = db.prepare('SELECT COUNT(*) AS n FROM creator_records').get().n
   check('隔离库 seed 完成（8 条）', seededCount === SEED.length, `seeded=${seededCount}`)
 
-  const call = async (query) => {
+  const callRoute = async (route, query) => {
     const res = {
       statusCode: 200,
       payload: null,
+      body: null,
       status(code) {
         this.statusCode = code
         return this
@@ -87,11 +96,19 @@ async function main() {
       json(body) {
         this.payload = body
         return this
+      },
+      setHeader() {
+        return this
+      },
+      send(body) {
+        this.body = body
+        return this
       }
     }
-    await handler({ query }, res)
-    return { status: res.statusCode, data: res.payload?.data, msg: res.payload?.msg }
+    await route({ query }, res)
+    return { status: res.statusCode, data: res.payload?.data, msg: res.payload?.msg, body: res.body }
   }
+  const call = (query) => callRoute(handler, query)
 
   console.log('===== 1. 默认行为（不传新参数，保持原有结构）=====')
   const base = await call({})
@@ -344,10 +361,39 @@ async function main() {
   const campaign = await call({ caliber: 'campaign' })
   const occurrence = await call({ caliber: 'occurrence' })
   check(
-    '口径切换仍返回新字段（花费一致、播放不同）',
-    campaign.data.total_summary.total_cost === occurrence.data.total_summary.total_cost &&
-      campaign.data.creators.every((item) => 'hit_count' in item && 'avg_play' in item),
-    `cost=${campaign.data.total_summary.total_cost}`
+    'creator-summary 默认与显式 campaign 返回一致',
+    campaign.status === 200 && JSON.stringify(campaign.data) === JSON.stringify(base.data)
+  )
+  check(
+    'creator-summary 显式 occurrence 返回 400',
+    occurrence.status === 400 && occurrence.msg.includes('按发生周暂未开放'),
+    occurrence.msg
+  )
+  const weekDefault = await callRoute(weekStatsHandler, { weekCode: '2026-W33' })
+  const weekCampaign = await callRoute(weekStatsHandler, { weekCode: '2026-W33', caliber: 'campaign' })
+  const weekOccurrence = await callRoute(weekStatsHandler, { weekCode: '2026-W33', caliber: 'occurrence' })
+  check(
+    'week-stats 默认与显式 campaign 返回一致',
+    weekDefault.status === 200 && weekCampaign.status === 200 &&
+      JSON.stringify(weekDefault.data) === JSON.stringify(weekCampaign.data)
+  )
+  check(
+    'week-stats 显式 occurrence 返回 400',
+    weekOccurrence.status === 400 && weekOccurrence.msg.includes('按发生周暂未开放'),
+    weekOccurrence.msg
+  )
+  const exportDefault = await callRoute(exportHandler, { type: 'creator-summary' })
+  const exportCampaign = await callRoute(exportHandler, { type: 'creator-summary', caliber: 'campaign' })
+  const exportOccurrence = await callRoute(exportHandler, { type: 'creator-summary', caliber: 'occurrence' })
+  check(
+    'creator-summary 导出默认与 campaign 仍返回 Excel',
+    exportDefault.status === 200 && exportCampaign.status === 200 &&
+      Buffer.isBuffer(exportDefault.body) && Buffer.isBuffer(exportCampaign.body)
+  )
+  check(
+    'creator-summary 导出显式 occurrence 返回 400',
+    exportOccurrence.status === 400 && exportOccurrence.msg.includes('按发生周暂未开放'),
+    exportOccurrence.msg
   )
 
   console.log('\n===== 7. 达人对比边界（2 / 5 / 1 / 6 位）=====')
@@ -463,6 +509,52 @@ async function main() {
       })
     )
   }
+
+  console.log('\n===== 10. G3：分类精确匹配与原始成本精度 =====')
+  insert.run('2026-W34', 'G3-type-exact', '数码', 10, '2026-08-26', 100, 200)
+  insert.run('2026-W34', 'G3-type-prefix', '数码测评', 10, '2026-08-26', 100, 200)
+  const exactType = await callRoute(listHandler, { creatorType: '数码', keyword: 'G3-type', page: 1, pageSize: 10 })
+  check(
+    'Records creator_type=数码 只返回精确分类',
+    exactType.status === 200 && exactType.data?.total === 1 &&
+      exactType.data.list[0]?.nickname === 'G3-type-exact',
+    JSON.stringify(exactType.data?.list?.map((item) => item.creator_type))
+  )
+
+  const precisionNames = ['G3-precision-1', 'G3-precision-2', 'G3-precision-3']
+  for (const name of precisionNames) {
+    insert.run('2026-W34', name, 'G3-precision', 1.234, '2026-08-26', 100, 200)
+  }
+  const preciseCreators = await call({ keyword: 'G3-precision' })
+  const preciseDashboard = await callRoute(weekStatsHandler, {
+    startWeek: '2026-W34', endWeek: '2026-W34', nicknames: precisionNames.join(',')
+  })
+  const expectedPrecision = { total_cost: 3.7, avg_cpm: 6.17, cpm_7d: 12.34 }
+  const matchesPrecision = (summary) => Object.entries(expectedPrecision).every(
+    ([key, value]) => summary?.[key] === value
+  )
+  check(
+    '三位达人原始成本汇总：3.70 / 6.17 / 12.34',
+    preciseCreators.status === 200 && preciseCreators.data.creators.length === 3 &&
+      matchesPrecision(preciseCreators.data.total_summary),
+    JSON.stringify(preciseCreators.data?.total_summary)
+  )
+  check(
+    'CreatorSummary 总汇总与 Dashboard 周汇总一致',
+    preciseDashboard.status === 200 && matchesPrecision(preciseDashboard.data?.total_summary) &&
+      Object.keys(expectedPrecision).every((key) =>
+        preciseCreators.data.total_summary[key] === preciseDashboard.data.total_summary[key]),
+    JSON.stringify(preciseDashboard.data?.total_summary)
+  )
+  check(
+    'CreatorSummary 分类组也只在汇总结果处舍入',
+    preciseCreators.data.groups.length === 1 && matchesPrecision(preciseCreators.data.groups[0]),
+    JSON.stringify(preciseCreators.data?.groups?.[0] && {
+      total_cost: preciseCreators.data.groups[0].total_cost,
+      avg_cpm: preciseCreators.data.groups[0].avg_cpm,
+      cpm_7d: preciseCreators.data.groups[0].cpm_7d
+    })
+  )
 }
 
 main()

@@ -304,10 +304,8 @@ router.get('/', (req, res) => {
     params.push(...overlappingCodes)
   }
   if (creatorType) {
-    // 前缀匹配：兼容选项粒度与库中实际值不一致（如「数码」匹配「数码测评」），
-    // 传入完整类型时等价于精确匹配
-    conditions.push("creator_type LIKE ? ESCAPE '\\'")
-    params.push(`${escapeLike(String(creatorType))}%`)
+    conditions.push('creator_type = ?')
+    params.push(String(creatorType))
   }
   // 按导入批次筛选：仅返回该批次导入的投放记录（关联表来自导入日志，未改 creator_records 表结构）
   const batchIdParam = rawBatchId !== undefined && rawBatchId !== '' ? rawBatchId : rawBatchIdCamel
@@ -794,14 +792,14 @@ function expandWeekRange(startWeek, endWeek) {
   return list
 }
 
-// ---------- 周度播放量聚合（caliber：campaign 投放周 / occurrence 发生周，默认 occurrence） ----------
+// ---------- 周度播放量聚合（V2 仅开放 campaign 投放周） ----------
 router.get('/week-stats', (req, res) => {
   const rawWeekCode = req.query.weekCode
-  // 默认主口径 = campaign（投放周）；occurrence 仍支持显式传入（TODO(occurrence)：待 snapshot Batch 重构）
   const caliber = String(req.query.caliber || 'campaign').trim().toLowerCase()
   if (!['campaign', 'occurrence'].includes(caliber)) {
     return fail(res, 400, 'caliber 必须为 campaign 或 occurrence')
   }
+  if (caliber === 'occurrence') return fail(res, 400, '按发生周暂未开放')
   let targetWeekCode = null
   if (rawWeekCode !== undefined && rawWeekCode !== '') {
     targetWeekCode = normalizeWeekCode(rawWeekCode)
@@ -1144,11 +1142,17 @@ function buildCreatorSummaryLatest({
       return sortDirection === 'asc' ? left - right : right - left
     })
 
+  const rawAccByNickname = new Map(creators.map((item) => [item.nickname, creatorMap.get(item.nickname).acc]))
+  const rawAccs = [...rawAccByNickname.values()]
+  const rawTotalCost = rawAccs.reduce((sum, acc) => sum + acc.total_cost, 0)
+  const rawLatestValidCost = rawAccs.reduce((sum, acc) => sum + acc.latest_valid_cost, 0)
+  const rawFirstValidCost = rawAccs.reduce((sum, acc) => sum + acc.first_valid_cost, 0)
+
   // 总汇总：与达人明细同一套口径（成本/次数按全部记录，播放/CPM/爆款按有效样本）
   const totalSummary = {
     creator_count: creators.length,
     record_count: creators.reduce((sum, item) => sum + item.total_campaigns, 0),
-    total_cost: round2(creators.reduce((sum, item) => sum + item.total_cost, 0)),
+    total_cost: round2(rawTotalCost),
     first_play_total: creators.reduce((sum, item) => sum + item.first_play_sum, 0),
     latest_play_total: creators.reduce((sum, item) => sum + item.latest_play_total, 0),
     post_7d_growth_total: creators.reduce((sum, item) => sum + item.post_7d_growth_total, 0),
@@ -1157,8 +1161,8 @@ function buildCreatorSummaryLatest({
     hit_7d_count: creators.reduce((sum, item) => sum + item.hit_7d_count, 0),
     hit_latest_count: creators.reduce((sum, item) => sum + item.hit_latest_count, 0),
     anomaly_count: creators.reduce((sum, item) => sum + item.anomaly_count, 0),
-    latest_valid_cost: round2(creators.reduce((sum, item) => sum + item.latest_valid_cost, 0)),
-    first_valid_cost: round2(creators.reduce((sum, item) => sum + item.first_valid_cost, 0))
+    latest_valid_cost: round2(rawLatestValidCost),
+    first_valid_cost: round2(rawFirstValidCost)
   }
   totalSummary.total_play = totalSummary.latest_play_total
   totalSummary.total_campaigns = totalSummary.record_count
@@ -1167,11 +1171,11 @@ function buildCreatorSummaryLatest({
   totalSummary.second_play_sum = totalSummary.latest_play_total
   totalSummary.avg_cpm =
     totalSummary.latest_play_total > 0
-      ? round2((totalSummary.latest_valid_cost / totalSummary.latest_play_total) * 1000)
+      ? round2((rawLatestValidCost / totalSummary.latest_play_total) * 1000)
       : null
   totalSummary.cpm_7d =
     totalSummary.first_play_total > 0
-      ? round2((totalSummary.first_valid_cost / totalSummary.first_play_total) * 1000)
+      ? round2((rawFirstValidCost / totalSummary.first_play_total) * 1000)
       : null
   totalSummary.hit_count = totalSummary.hit_latest_count
   totalSummary.total_hits = totalSummary.hit_latest_count
@@ -1194,7 +1198,8 @@ function buildCreatorSummaryLatest({
     minCampaigns: minCampaignsValue,
     sort: { sortBy: sortField, sortOrder: sortDirection },
     creators,
-    total_summary: totalSummary
+    total_summary: totalSummary,
+    rawAccByNickname
   }
 }
 
@@ -1366,8 +1371,9 @@ function buildCreatorSummaryLegacyOccurrence({
  * - campaign：总播放 = Σ有效最新累计播放；最新平均CPM 的分子只含同一样本记录的花费
  * - occurrence：保持旧实现（TODO(occurrence)：待 snapshot Batch 重构）
  */
-function buildGroupSummary(creatorType, list, caliber = 'campaign') {
-  const totalCost = round2(list.reduce((sum, item) => sum + item.total_cost, 0))
+function buildGroupSummary(creatorType, list, caliber = 'campaign', rawAccByNickname = null) {
+  const rawCost = (item, field) => rawAccByNickname?.get(item.nickname)?.[field] ?? item[field] ?? 0
+  const totalCost = round2(list.reduce((sum, item) => sum + rawCost(item, 'total_cost'), 0))
   const totalCampaigns = list.reduce((sum, item) => sum + item.total_campaigns, 0)
 
   if (caliber !== 'campaign') {
@@ -1388,8 +1394,8 @@ function buildGroupSummary(creatorType, list, caliber = 'campaign') {
 
   const latestPlayTotal = list.reduce((sum, item) => sum + item.latest_play_total, 0)
   const firstPlayTotal = list.reduce((sum, item) => sum + item.first_play_sum, 0)
-  const latestValidCost = list.reduce((sum, item) => sum + (item.latest_valid_cost || 0), 0)
-  const firstValidCost = list.reduce((sum, item) => sum + (item.first_valid_cost || 0), 0)
+  const latestValidCost = list.reduce((sum, item) => sum + rawCost(item, 'latest_valid_cost'), 0)
+  const firstValidCost = list.reduce((sum, item) => sum + rawCost(item, 'first_valid_cost'), 0)
   const latestSampleCount = list.reduce((sum, item) => sum + item.latest_sample_count, 0)
   const firstSampleCount = list.reduce((sum, item) => sum + item.first_sample_count, 0)
   const hitLatestCount = list.reduce((sum, item) => sum + item.hit_latest_count, 0)
@@ -1422,11 +1428,11 @@ function buildGroupSummary(creatorType, list, caliber = 'campaign') {
 
 // ---------- 达人维度汇总接口（按博主类型分组，支持周范围/类型筛选/口径） ----------
 router.get('/creator-summary', (req, res) => {
-  // 默认主口径 = campaign（投放周）；occurrence 仍支持显式传入（TODO(occurrence)：待 snapshot Batch 重构）
   const caliber = String(req.query.caliber || 'campaign').trim().toLowerCase()
   if (!['campaign', 'occurrence'].includes(caliber)) {
     return fail(res, 400, 'caliber 必须为 campaign 或 occurrence')
   }
+  if (caliber === 'occurrence') return fail(res, 400, '按发生周暂未开放')
   const rawStartWeek = req.query.startWeek
   const rawEndWeek = req.query.endWeek
   const startWeek = rawStartWeek ? normalizeWeekCode(rawStartWeek) : null
@@ -1489,10 +1495,10 @@ router.get('/creator-summary', (req, res) => {
       typeMap.get(type).push(creator)
     }
     groups = [...typeMap.entries()]
-      .map(([creatorType, list]) => buildGroupSummary(creatorType, list, caliber))
+      .map(([creatorType, list]) => buildGroupSummary(creatorType, list, caliber, summary.rawAccByNickname))
       .sort((a, b) => b.total_cost - a.total_cost || b.total_play - a.total_play)
   } else {
-    groups = [buildGroupSummary('全部达人', summary.creators, caliber)]
+    groups = [buildGroupSummary('全部达人', summary.creators, caliber, summary.rawAccByNickname)]
   }
 
   ok(res, {
@@ -1591,6 +1597,7 @@ router.get('/export', (req, res) => {
     if (!['campaign', 'occurrence'].includes(caliber)) {
       return fail(res, 400, 'caliber 必须为 campaign 或 occurrence')
     }
+    if (caliber === 'occurrence') return fail(res, 400, '按发生周暂未开放')
     // 兼容新增筛选参数（keyword / minCampaigns），并按页面当前排序导出
     const exportKeyword = String(req.query.keyword || '').trim().slice(0, 50)
     const exportMinCampaigns = Number(req.query.minCampaigns) > 0 ? Math.floor(Number(req.query.minCampaigns)) : 0

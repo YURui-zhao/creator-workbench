@@ -579,7 +579,10 @@ export default function CreatorSummary() {
     paddingTop: 8,
     width: '100%',
     display: 'grid',
-    columnGap: 8
+    columnGap: 8,
+    // 多列时按内容自适应：给「后续新增播放量」这类较长指标名留足宽度，
+    // 空间不足时再回落到省略号（minmax(0, auto) 允许收缩，不会溢出卡片）
+    justifyContent: 'center'
   }
   const metricSecondaryLabelStyle = {
     fontSize: 11,
@@ -808,11 +811,12 @@ export default function CreatorSummary() {
                     <div
                       style={{
                         ...metricSecondaryStyle,
-                        gridTemplateColumns: item.secondary.length > 1 ? '1fr 1fr' : '1fr'
+                        gridTemplateColumns:
+                          item.secondary.length > 1 ? 'minmax(0, auto) minmax(0, auto)' : '1fr'
                       }}
                     >
                       {item.secondary.map((sub) => (
-                        <Tooltip key={sub.label} title={sub.tooltip}>
+                        <Tooltip key={sub.label} title={`${sub.label}：${sub.tooltip}`}>
                           <div style={{ minWidth: 0, textAlign: 'center' }}>
                             <div style={metricSecondaryLabelStyle}>{sub.label}</div>
                             <div style={metricSecondaryValueStyle}>{sub.value}</div>

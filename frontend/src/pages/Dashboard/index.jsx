@@ -136,28 +136,17 @@ export default function Dashboard() {
     try {
       const rows = await fetchAllRecords()
       setRecords(rows)
-      // —— 关键调试日志：确认真实接口数据、字段名、周代码格式 ——
-      console.log('接口返回全部记录:', rows)
-      console.log('每条记录的time_cycle:', rows.map((r) => r.time_cycle))
       if (rows.length) {
         // 取所有记录中 time_cycle 最新的一周（YYYY-Wxx 字符串比较即时间序）
         const latestWeekCode = rows.reduce(
           (max, row) => (row.time_cycle > max ? row.time_cycle : max),
           ''
         )
-        console.log('计算出的最新周latestWeekCode:', latestWeekCode)
         const nextSelectedWeek = buildWeekInfoFromWeekCode(latestWeekCode) || currentWeek
         setSelectedWeek(nextSelectedWeek)
         // 周范围默认与选中周一致（单周模式，保持原有看板表现）
         setRangeStart(nextSelectedWeek.weekCode)
         setRangeEnd(nextSelectedWeek.weekCode)
-        console.log('当前选中周selectedWeekCode:', nextSelectedWeek.weekCode)
-        // 精确匹配筛选（字段名 time_cycle，格式 YYYY-Wxx 完全一致）
-        const filteredRecords = rows.filter(
-          (row) => row.time_cycle === nextSelectedWeek.weekCode
-        )
-        console.log('筛选后匹配的记录:', filteredRecords)
-        console.log('筛选后记录数:', filteredRecords.length)
       } else {
         // 无任何数据：兜底选中系统当前自然周，展示空状态
         setSelectedWeek(currentWeek)
@@ -263,7 +252,7 @@ export default function Dashboard() {
     }
   }, [selectedWeekCode, caliber, rangeStart, rangeEnd, filterTypes, filterNicknames])
 
-  // 周切换：更新选中周、打印切换日志（加载态由上面的请求 effect 驱动）
+  // 周切换：更新选中周（加载态由上面的请求 effect 驱动）
   const switchToWeek = (weekCode) => {
     const info = buildWeekInfoFromWeekCode(weekCode)
     if (!info) return
@@ -271,11 +260,6 @@ export default function Dashboard() {
     // 单周切换：范围同步为该周（避免范围模式残留）
     setRangeStart(weekCode)
     setRangeEnd(weekCode)
-    // —— 切换日志：验证周码与筛选命中 ——
-    console.log('切换到周：', weekCode)
-    const filteredRecords = records.filter((row) => row.time_cycle === weekCode)
-    console.log('匹配到的记录：', filteredRecords)
-    console.log('匹配条数：', filteredRecords.length)
   }
 
   // 日历选周：任意日期自动对齐到完整自然周
@@ -778,7 +762,14 @@ export default function Dashboard() {
     gridTemplateColumns: '1fr 1fr',
     columnGap: 12
   }
-  const playSplitLabelStyle = { fontSize: 12 }
+  // 卡内 secondary 指标名固定单行：空间不足时省略而不是拆字（完整含义由外层 Tooltip 说明）
+  const playSplitLabelStyle = {
+    fontSize: 12,
+    display: 'block',
+    whiteSpace: 'nowrap',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis'
+  }
   const playSplitValueStyle = { fontSize: 18, lineHeight: '24px', fontWeight: 500 }
   // 数据完整性提示（小号辅助文案）
   const metricFootnoteStyle = { fontSize: 12, lineHeight: '18px', color: 'rgba(0, 0, 0, 0.45)' }
@@ -1108,11 +1099,15 @@ export default function Dashboard() {
                           />
                         </Tooltip>
                         <Tooltip title="播放数据已更新 = 有有效累计播放数据的投放数；待更新 = 尚未填写；异常 = 累计播放量小于7日播放量">
-                          <div style={{ alignSelf: 'center' }}>
+                          {/* 数据完整性提示独占一整行：保证「已更新 X / Y」不因卡内两栏太窄而拆行 */}
+                          <div style={{ gridColumn: '1 / -1', alignSelf: 'center' }}>
                             <div>
-                              <Typography.Text style={metricFootnoteStyle}>
-                                播放数据已更新 {formatInteger(metrics.latestSampleCount)} /{' '}
-                                {formatInteger(metrics.recordCount)}
+                              <Typography.Text style={{ ...metricFootnoteStyle, whiteSpace: 'nowrap' }}>
+                                播放数据已更新{' '}
+                                <span style={{ whiteSpace: 'nowrap' }}>
+                                  {formatInteger(metrics.latestSampleCount)} /{' '}
+                                  {formatInteger(metrics.recordCount)}
+                                </span>
                               </Typography.Text>
                             </div>
                             {metrics.latestPendingCount > 0 && (

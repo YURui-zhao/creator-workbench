@@ -7,6 +7,7 @@ import {
   Col,
   Collapse,
   Divider,
+  Form,
   Input,
   List,
   Modal,
@@ -30,8 +31,10 @@ import { normalizeTimeCyclesAI, suggestFieldMappingsAI, validateRecordsAI } from
 import { getAiConfig } from '../utils/aiConfig.js'
 import { getErrorMessage } from '../utils/request.js'
 import {
+  applyManualImportCorrection,
   applyTimeCycleMapping,
   buildHeaderMappingReview,
+  confirmSourceTimeCycleConflict,
   FIELD_LABELS,
   IGNORE_FIELD,
   isMappingReviewComplete,
@@ -101,6 +104,19 @@ const RULE_OPTIONS = [
   { label: '链接平台与博主类型匹配（抖音/小红书/B站等）', value: 'platform_link_match' }
 ]
 
+const MANUAL_EDIT_FIELDS = [
+  'nickname',
+  'publish_date',
+  'sourceTimeCycleRaw',
+  'creator_type',
+  'homepage',
+  'content_link',
+  'video_link',
+  'total_cost',
+  'first_play',
+  'second_week_play'
+]
+
 // 单元格渲染：无效单元格标红并悬浮显示原因
 function renderCell(field) {
   return (value, record) => {
@@ -147,7 +163,18 @@ function renderTimeCycle(value, record) {
 const PREVIEW_COLUMNS = [
   { title: '行号', dataIndex: 'rowIndex', width: 70 },
   { title: '时间周期', dataIndex: 'time_cycle', width: 120, ellipsis: true, render: renderTimeCycle },
-  { title: '达人昵称', dataIndex: 'nickname', width: 130, ellipsis: true, render: renderCell('nickname') },
+  {
+    title: '达人昵称',
+    dataIndex: 'nickname',
+    width: 170,
+    render: (value, record) => (
+      <Space size={4}>
+        {renderCell('nickname')(value, record)}
+        {record.manualCorrection && <Tag color="blue">人工修正</Tag>}
+        {record.sourceCycleConfirmed && <Tag color="gold">人工确认</Tag>}
+      </Space>
+    )
+  },
   { title: '博主类型', dataIndex: 'creator_type', width: 110, ellipsis: true, render: renderCell('creator_type') },
   { title: '总花费(元)', dataIndex: 'total_cost', width: 100, align: 'right', render: renderCell('total_cost') },
   { title: '发布日期', dataIndex: 'publish_date', width: 110, render: renderCell('publish_date') },
@@ -173,6 +200,7 @@ const PREVIEW_COLUMNS = [
  */
 export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   const navigate = useNavigate()
+  const [manualForm] = Form.useForm()
   // 步骤：0 上传文件 / 1 AI校验 / 2 确认导入
   const [step, setStep] = useState(0)
   const [parsing, setParsing] = useState(false)
@@ -190,6 +218,9 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   // 原始数据与修正后数据：importRows 始终为「当前待导入数据」
   const [importRows, setImportRows] = useState([])
   const [fixedIndexes, setFixedIndexes] = useState(() => new Set())
+  const [manualEditRowIndex, setManualEditRowIndex] = useState(null)
+  const [manualEditError, setManualEditError] = useState('')
+  const [manualSaving, setManualSaving] = useState(false)
   // 高级规则配置
   const [selectedRules, setSelectedRules] = useState([])
   const [customRules, setCustomRules] = useState('')
@@ -247,18 +278,28 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
       ),
     [preview, duplicateIndexes, skippedIndexes]
   )
+  const confirmationRows = useMemo(
+    () => (preview?.confirmationRows || []).filter(
+      (item) => !duplicateIndexes.has(item.rowIndex) && !skippedIndexes.has(item.rowIndex)
+    ),
+    [preview, duplicateIndexes, skippedIndexes]
+  )
   const importStats = useMemo(
     () => ({
       成功: importRows.length,
+      需确认: confirmationRows.length,
       失败: failedRows.length,
       // 跳过 = 空白行 + 重复表头行 + 时间周期面板中手动跳过的行
       跳过: (preview?.blankRows || 0) + (preview?.repeatedHeaderRows || 0) + skippedRowIndexes.length,
       重复: duplicateRows.length
     }),
-    [importRows.length, failedRows.length, preview, skippedRowIndexes.length, duplicateRows.length]
+    [importRows.length, confirmationRows.length, failedRows.length, preview, skippedRowIndexes.length, duplicateRows.length]
   )
   const blankRowIndexes = preview?.blankRowIndexes || []
   const headerRowIndexes = preview?.headerRowIndexes || []
+  const manualEditIsSourceConflict = Boolean(preview?.allRows?.find(
+    (row) => row.rowIndex === manualEditRowIndex
+  )?.sourceCycleConflictOrigin)
 
   // AI 校验错误行（未修正）：不拦截警告，仅错误行跳过入库
   const aiErrorRowIndexes = useMemo(
@@ -291,7 +332,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   }
 
   // 忙碌状态：解析/AI校验/导入中禁止关闭，避免异步回调写入已重置的状态
-  const busy = parsing || importing || aiLoading || Boolean(mappingReview?.loading)
+  const busy = parsing || importing || aiLoading || manualSaving || Boolean(mappingReview?.loading)
 
   // 重置并回到上传步骤
   const resetUpload = () => {
@@ -306,6 +347,9 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     setCycleNotes({})
     setImportRows([])
     setFixedIndexes(new Set())
+    setManualEditRowIndex(null)
+    setManualEditError('')
+    manualForm.resetFields()
     setDuplicateRows([])
     setSkippedRowIndexes([])
     excludedRowsRef.current = []
@@ -574,6 +618,104 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     return { ...result, validRows, failedRows }
   }
 
+  const admitValidatedRow = async (checked, rowIndex) => {
+    const candidate = checked.validRows.find((row) => row.rowIndex === rowIndex)
+    if (!candidate) return false
+    // 新放行的行此前未参与去重，按现有规则与数据库和本次待导入行比较。
+    let existing = []
+    try {
+      existing = await fetchAllRecords()
+    } catch {
+      // 与首次解析一致：拉取已有记录失败时仍执行文件内去重。
+    }
+    const { duplicateRows: matches } = dedupeImportRows([candidate], [...existing, ...importRows])
+    if (matches.length) {
+      const duplicate = matches[0]
+      excludedRowsRef.current = [...excludedRowsRef.current, duplicate]
+      setDuplicateRows((current) => [...current, duplicate])
+      setPreview({
+        ...checked,
+        validRows: checked.validRows.filter((row) => row.rowIndex !== rowIndex),
+        failedRows: [...checked.failedRows, duplicate]
+      })
+      return false
+    }
+    setPreview(checked)
+    setImportRows((current) => [...current, candidate].sort((a, b) => a.rowIndex - b.rowIndex))
+    return true
+  }
+
+  const confirmCurrentSourceCycle = async (rowIndex) => {
+    if (!preview || !confirmationRows.some((item) => item.rowIndex === rowIndex) || manualSaving) return
+    setManualSaving(true)
+    try {
+      const confirmed = reapplyDedupeExclusion(confirmSourceTimeCycleConflict(preview, rowIndex))
+      const admitted = await admitValidatedRow(confirmed, rowIndex)
+      message[admitted ? 'success' : 'warning'](
+        admitted
+          ? `Excel 第${rowIndex}行已确认当前投放档期，可导入`
+          : `Excel 第${rowIndex}行与现有记录重复，仍不会导入`
+      )
+    } catch (error) {
+      message.error(getErrorMessage(error, '确认投放档期失败，请重试'))
+    } finally {
+      setManualSaving(false)
+    }
+  }
+
+  const openManualCorrection = (rowIndex) => {
+    if (!failedRows.some((item) => item.rowIndex === rowIndex) &&
+        !confirmationRows.some((item) => item.rowIndex === rowIndex)) return
+    const row = preview?.allRows?.find((item) => item.rowIndex === rowIndex)
+    if (!row) return
+    manualForm.resetFields()
+    manualForm.setFieldsValue(
+      Object.fromEntries(MANUAL_EDIT_FIELDS.map((field) => [field, String(row[field] ?? '')]))
+    )
+    setManualEditError('')
+    setManualEditRowIndex(rowIndex)
+  }
+
+  const saveManualCorrection = async () => {
+    if (!preview || manualEditRowIndex === null) return
+    setManualSaving(true)
+    try {
+      const rechecked = reapplyDedupeExclusion(
+        applyManualImportCorrection(
+          preview,
+          manualEditRowIndex,
+          manualForm.getFieldsValue(),
+          sourceCyclesRef.current
+        )
+      )
+      const repaired = rechecked.validRows.find((row) => row.rowIndex === manualEditRowIndex)
+      if (!repaired) {
+        setPreview(rechecked)
+        setManualEditError(
+          rechecked.confirmationRows?.find((item) => item.rowIndex === manualEditRowIndex)?.reason ||
+          rechecked.failedRows.find((item) => item.rowIndex === manualEditRowIndex)?.reason ||
+            '本地校验仍未通过，请检查填写内容。'
+        )
+        return
+      }
+
+      const admitted = await admitValidatedRow(rechecked, manualEditRowIndex)
+      if (!admitted) {
+        setManualEditRowIndex(null)
+        message.warning(`Excel 第${manualEditRowIndex}行修正后与现有记录重复，仍不会导入`)
+        return
+      }
+
+      setManualEditRowIndex(null)
+      setManualEditError('')
+      message.success(`Excel 第${manualEditRowIndex}行已通过本地校验，可导入`)
+    } catch (error) {
+      message.error(getErrorMessage(error, '人工修正失败，请重试'))
+    } finally {
+      setManualSaving(false)
+    }
+  }
+
   const applyCycleMapping = async () => {
     if (!cycleReview || !preview) return
     // 手动跳过的行单独统计（不重复计入「失败」）
@@ -691,7 +833,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
       } catch {
         // 拉取已有记录失败时跳过去重
       }
-      if (!result.validRows.length && !result.failedRows.length) {
+      if (!result.validRows.length && !result.failedRows.length && !result.confirmationRows?.length) {
         message.warning('文件中没有有效数据')
         return false
       }
@@ -815,15 +957,36 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     setImporting(true)
     setImportError('')
     try {
-      const payload = importableRows.map(({ rowIndex, ...rest }) => rest)
+      const payload = importableRows.map(
+        ({ rowIndex, sourceTimeCycle, sourceTimeCycleRaw, manualCorrection, manualCorrectionFields,
+          sourceCycleConflictOrigin, sourceCycleConfirmed, ...record }) =>
+          record
+      )
       // 导入批次元数据（写入导入历史）：文件名 + 本次成功/失败/跳过/重复统计 + 行级明细
       const batchMeta = {
         fileName: preview?.fileName || '',
-        totalCount: payload.length + failedRows.length + duplicateRows.length + importStats.跳过,
+        totalCount: payload.length + confirmationRows.length + failedRows.length + duplicateRows.length + importStats.跳过,
         failCount: failedRows.length,
-        skipCount: importStats.跳过,
+        skipCount: importStats.跳过 + confirmationRows.length,
         duplicateCount: duplicateRows.length,
         items: [
+          ...importableRows
+            .filter((row) => row.manualCorrection || row.sourceCycleConfirmed)
+            .map((row) => ({
+              rowIndex: row.rowIndex,
+              status: 'success',
+              reason: [
+                row.manualCorrection && `人工修正：${(row.manualCorrectionFields || [])
+                  .map((field) => field === 'sourceTimeCycleRaw' ? '源时间周期' : FIELD_LABELS[field] || field)
+                  .join('、')}`,
+                row.sourceCycleConfirmed && `人工确认当前投放档期：源周期 ${row.sourceTimeCycleRaw || ''}；发布日期 ${row.publish_date}`
+              ].filter(Boolean).join('；')
+            })),
+          ...confirmationRows.map((item) => ({
+            rowIndex: item.rowIndex,
+            status: 'skip',
+            reason: `需人工确认，未导入：${item.reason}`
+          })),
           ...failedRows.map((item) => ({
             rowIndex: item.rowIndex,
             status: 'fail',
@@ -1098,10 +1261,12 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   }
 
   return (
+    <>
     <Modal
       title="导入Excel"
       open={open}
       onCancel={closeModal}
+      zIndex={1000}
       width={820}
       footer={renderFooter()}
     >
@@ -1422,9 +1587,9 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
             </Typography.Text>
           </Divider>
 
-          {/* 本地统计：成功 / 失败 / 跳过 / 重复 */}
+          {/* 本地统计：正常行直接可入库；源档期冲突单列为需确认 */}
           <Row gutter={[12, 12]}>
-            <Col xs={12} md={6}>
+            <Col xs={12} md={8}>
               <Card size="small" styles={{ body: { padding: '12px 16px' } }}>
                 <Statistic
                   title="成功（可入库）"
@@ -1433,28 +1598,37 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
                 />
               </Card>
             </Col>
-            <Col xs={12} md={6}>
+            <Col xs={12} md={4}>
               <Card size="small" styles={{ body: { padding: '12px 16px' } }}>
                 <Statistic
-                  title="失败（将跳过）"
+                  title="需确认"
+                  value={importStats.需确认}
+                  valueStyle={{ color: importStats.需确认 ? '#faad14' : undefined, fontSize: 22 }}
+                />
+              </Card>
+            </Col>
+            <Col xs={12} md={4}>
+              <Card size="small" styles={{ body: { padding: '12px 16px' } }}>
+                <Statistic
+                  title="失败"
                   value={importStats.失败}
                   valueStyle={{ color: importStats.失败 ? '#ff4d4f' : undefined, fontSize: 22 }}
                 />
               </Card>
             </Col>
-            <Col xs={12} md={6}>
+            <Col xs={12} md={4}>
               <Card size="small" styles={{ body: { padding: '12px 16px' } }}>
                 <Statistic
-                  title="跳过（空白/手动）"
+                  title="跳过"
                   value={importStats.跳过}
                   valueStyle={{ fontSize: 22 }}
                 />
               </Card>
             </Col>
-            <Col xs={12} md={6}>
+            <Col xs={12} md={4}>
               <Card size="small" styles={{ body: { padding: '12px 16px' } }}>
                 <Statistic
-                  title="重复（将跳过）"
+                  title="重复"
                   value={importStats.重复}
                   valueStyle={{ color: importStats.重复 ? '#faad14' : undefined, fontSize: 22 }}
                 />
@@ -1472,20 +1646,35 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
             />
           )}
 
-          {/* 发布日期不在 Excel 原业务周期内：数据质量异常，这些行已判失败（不会导入） */}
-          {preview.sourceRangeViolationRows > 0 && (
+          {/* 来源档期与发布日期冲突：需业务确认，确认前不进入可导入列表 */}
+          {confirmationRows.length > 0 && (
             <Alert
-              type="error"
+              type="warning"
               showIcon
-              message={`${preview.sourceRangeViolationRows} 条记录的发布日期不在源时间周期内，已判为失败（不会导入）`}
+              message={`需确认 ${confirmationRows.length} 条（确认前不会导入）`}
               description={
-                <div style={{ maxHeight: 140, overflow: 'auto' }}>
-                  {preview.sourceRangeViolations.map((item) => (
-                    <div key={item.rowIndex}>
-                      Excel 第{item.rowIndex}行：{item.nickname} 发布日期 {item.publishDate} 不在源时间周期{' '}
-                      {item.sourceTimeCycle} 内，请检查原始数据。
-                    </div>
-                  ))}
+                <div style={{ maxHeight: 180, overflow: 'auto' }}>
+                  {confirmationRows.map((item) => {
+                    const row = preview.allRows.find((candidate) => candidate.rowIndex === item.rowIndex)
+                    return (
+                      <div key={item.rowIndex} style={{ marginBottom: 8 }}>
+                        <div>
+                          Excel 第{item.rowIndex}行：{row?.nickname}；发布日期 {row?.publish_date}；源时间周期{' '}
+                          {row?.sourceTimeCycleRaw}。{item.reason}
+                        </div>
+                        <Space size="small" style={{ marginTop: 4 }}>
+                          <Button size="small" type="primary" disabled={manualSaving}
+                            onClick={() => confirmCurrentSourceCycle(item.rowIndex)}>
+                            确认当前投放档期
+                          </Button>
+                          <Button size="small" disabled={manualSaving}
+                            onClick={() => openManualCorrection(item.rowIndex)}>
+                            人工调整
+                          </Button>
+                        </Space>
+                      </div>
+                    )
+                  })}
                 </div>
               }
             />
@@ -1505,8 +1694,13 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
               description={
                 <div style={{ maxHeight: 140, overflow: 'auto' }}>
                   {failedRows.map((item) => (
-                    <div key={item.rowIndex}>
-                      第 {item.rowIndex} 行：{item.reason}
+                    <div key={item.rowIndex} style={{ marginBottom: 6 }}>
+                      <Space align="start">
+                        <span>Excel 第{item.rowIndex}行：{item.reason}</span>
+                        <Button size="small" onClick={() => openManualCorrection(item.rowIndex)}>
+                          人工修正
+                        </Button>
+                      </Space>
                     </div>
                   ))}
                 </div>
@@ -1641,5 +1835,48 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
         </Space>
       )}
     </Modal>
+    <Modal
+      title={`人工修正 · Excel 第${manualEditRowIndex ?? ''}行`}
+      open={manualEditRowIndex !== null}
+      zIndex={2000}
+      onCancel={() => {
+        if (!manualSaving) setManualEditRowIndex(null)
+      }}
+      onOk={saveManualCorrection}
+      okText="保存并重新校验"
+      confirmLoading={manualSaving}
+      forceRender
+      width={600}
+    >
+      <Typography.Paragraph type="secondary">
+        {manualEditIsSourceConflict
+          ? '发布日期保留原值；可调整源时间周期。最终自然周仍由发布日期自动计算。'
+          : '仅修改本次导入会话；最终时间周期由发布日期自动计算，源时间周期只用于核对 Excel 原分组。'}
+      </Typography.Paragraph>
+      <Form form={manualForm} layout="vertical">
+        {MANUAL_EDIT_FIELDS.map((field) => (
+          <Form.Item
+            key={field}
+            name={field}
+            label={field === 'sourceTimeCycleRaw' ? '源时间周期' : FIELD_LABELS[field] || field}
+          >
+            <Input
+              placeholder={field === 'publish_date' ? 'YYYY-MM-DD' : undefined}
+              disabled={field === 'publish_date' && manualEditIsSourceConflict}
+            />
+          </Form.Item>
+        ))}
+      </Form>
+      {manualEditError && (
+        <Alert
+          type={preview?.confirmationRows?.some((row) => row.rowIndex === manualEditRowIndex) ? 'warning' : 'error'}
+          showIcon
+          message={preview?.confirmationRows?.some((row) => row.rowIndex === manualEditRowIndex)
+            ? '仍需确认当前投放档期' : '本地校验仍未通过'}
+          description={manualEditError}
+        />
+      )}
+    </Modal>
+    </>
   )
 }

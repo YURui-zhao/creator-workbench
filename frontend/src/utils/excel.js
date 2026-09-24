@@ -448,6 +448,7 @@ function normalizeDate(value) {
 // 因此它天然可能不等于 canonical 自然周 —— 这本身不是问题，不得报警。
 // 只有「发布日期实际落在源区间之外」才是数据质量问题。
 export const SOURCE_RANGE_ERROR = '不在源时间周期'
+export const SOURCE_CONFLICT_MESSAGE = '发布时间不在当前投放档期内，请确认业务归属。'
 
 // 源业务区间文本：M/D、M.D、M月D日 等写法，分隔符支持 - ~ ～ 至 到
 const BUSINESS_RANGE_RE =
@@ -838,13 +839,14 @@ export async function parseRecordsExcel(file, cycles = [], options = {}) {
   const mappedRows = []
   const validRows = []
   const failedRows = []
+  const confirmationRows = []
   // 自动跳过的空白行（整行无有效值，不进入校验与报错列表）
   const blankRowIndexes = []
   // 重复表头行（整行与表头同名）：跳过，不继承时间周期、不作为业务数据
   const headerRowIndexes = []
   // 本地规则无法识别的时间周期原始值（去重，供 AI 兜底识别）
   const unrecognizedCycles = new Set()
-  // 发布日期不在 Excel 原业务周期内的行（数据质量异常 → 该行判失败，不参与导入）
+  // 发布日期不在 Excel 原业务周期内的行：单列为需确认，不自动入库。
   const sourceRangeViolations = []
   // 非合并空周期的兜底继承，仅在同一段连续业务行内生效。
   let carriedCycle = ''
@@ -901,7 +903,7 @@ export async function parseRecordsExcel(file, cycles = [], options = {}) {
     // 记录来源信息（仅解析过程使用，不写数据库）
     mapped.sourceTimeCycle = sourceWeekCode || undefined
     mapped.sourceTimeCycleRaw = sourceCycleRaw || undefined
-    // 源业务周期一致性检查的结果（作为该行的数据质量错误）
+    // 源业务周期一致性检查的结果（业务归属待确认，不修改发布日期）
     let sourceRangeError = null
 
     if (canonicalCycle) {
@@ -911,6 +913,7 @@ export async function parseRecordsExcel(file, cycles = [], options = {}) {
       const sourceCheck = checkSourceTimeCycleRange(mapped)
       if (sourceCheck) {
         sourceRangeError = sourceCheck.reason
+        mapped.sourceCycleConflictOrigin = true
         sourceRangeViolations.push({
           rowIndex,
           nickname: mapped.nickname,
@@ -941,15 +944,14 @@ export async function parseRecordsExcel(file, cycles = [], options = {}) {
     // 跨字段校验：累计播放量不得小于 7日播放量（V2 规则）
     const playRangeError = findPlayRangeError(mapped)
     if (playRangeError) cellErrors.push(playRangeError)
-    // 源业务周期一致性：发布日期不在源周期内 → 该行判失败（要求修正 / 确认后再导入）
-    if (sourceRangeError) cellErrors.push({ field: 'time_cycle', reason: sourceRangeError })
-
     if (cellErrors.length) {
       failedRows.push({
         rowIndex,
         cellErrors,
         reason: cellErrors.map((e) => e.reason).join('；')
       })
+    } else if (sourceRangeError) {
+      confirmationRows.push({ rowIndex, reason: SOURCE_CONFLICT_MESSAGE })
     } else {
       validRows.push(mapped)
     }
@@ -973,6 +975,7 @@ export async function parseRecordsExcel(file, cycles = [], options = {}) {
     allRows: mappedRows,
     validRows,
     failedRows,
+    confirmationRows,
     blankRows: blankRowIndexes.length,
     blankRowIndexes,
     repeatedHeaderRows: headerRowIndexes.length,
@@ -1038,6 +1041,7 @@ export function applyTimeCycleMapping(result, mapping = {}) {
   const mappedRows = []
   const validRows = []
   const failedRows = []
+  const confirmationRows = []
   const sourceRangeViolations = []
 
   for (const row of rows) {
@@ -1048,6 +1052,10 @@ export function applyTimeCycleMapping(result, mapping = {}) {
     // 保留解析期的来源信息（不属于入库字段）
     if (row.sourceTimeCycle) next.sourceTimeCycle = row.sourceTimeCycle
     if (row.sourceTimeCycleRaw) next.sourceTimeCycleRaw = row.sourceTimeCycleRaw
+    if (row.manualCorrection) next.manualCorrection = true
+    if (row.manualCorrectionFields) next.manualCorrectionFields = row.manualCorrectionFields
+    if (row.sourceCycleConflictOrigin) next.sourceCycleConflictOrigin = true
+    if (row.sourceCycleConfirmed) next.sourceCycleConfirmed = true
 
     // 发布日期优先：有有效发布日期时，识别面板的结果不得覆盖标准周归属
     const canonicalCycle = next.publish_date ? publishDateToWeekCode(next.publish_date) : null
@@ -1057,6 +1065,7 @@ export function applyTimeCycleMapping(result, mapping = {}) {
       const sourceCheck = checkSourceTimeCycleRange(next)
       if (sourceCheck) {
         sourceRangeError = sourceCheck.reason
+        next.sourceCycleConflictOrigin = true
         sourceRangeViolations.push({
           rowIndex: next.rowIndex,
           nickname: next.nickname,
@@ -1085,14 +1094,14 @@ export function applyTimeCycleMapping(result, mapping = {}) {
     // 跨字段校验：累计播放量不得小于 7日播放量（V2 规则）
     const playRangeError = findPlayRangeError(next)
     if (playRangeError) cellErrors.push(playRangeError)
-    if (sourceRangeError) cellErrors.push({ field: 'time_cycle', reason: sourceRangeError })
-
     if (cellErrors.length) {
       failedRows.push({
         rowIndex: next.rowIndex,
         cellErrors,
         reason: cellErrors.map((e) => e.reason).join('；')
       })
+    } else if (sourceRangeError && !next.sourceCycleConfirmed) {
+      confirmationRows.push({ rowIndex: next.rowIndex, reason: SOURCE_CONFLICT_MESSAGE })
     } else {
       validRows.push(next)
     }
@@ -1103,11 +1112,97 @@ export function applyTimeCycleMapping(result, mapping = {}) {
     ...result,
     validRows,
     failedRows,
+    confirmationRows,
     previewRows: mappedRows.slice(0, 5),
     allRows: mappedRows,
     sourceRangeViolations,
     sourceRangeViolationRows: sourceRangeViolations.length,
     unrecognizedTimeCycles: []
+  }
+}
+
+/** 确认源档期归属；只改变本次会话的状态，保持发布日期和 canonical 周不变。 */
+export function confirmSourceTimeCycleConflict(result, rowIndex) {
+  if (!result?.confirmationRows?.some((item) => item.rowIndex === rowIndex)) return result
+  const original = result.allRows?.find((row) => row.rowIndex === rowIndex)
+  if (!original || original.cellErrors?.length || !checkSourceTimeCycleRange(original)) return result
+  const { cellErrors, ...confirmed } = original
+  confirmed.sourceCycleConfirmed = true
+  const allRows = result.allRows.map((row) =>
+    row.rowIndex === rowIndex ? { ...row, sourceCycleConfirmed: true } : row
+  )
+  return {
+    ...result,
+    allRows,
+    previewRows: allRows.slice(0, 5),
+    validRows: [...result.validRows, confirmed].sort((a, b) => a.rowIndex - b.rowIndex),
+    confirmationRows: result.confirmationRows.filter((item) => item.rowIndex !== rowIndex)
+  }
+}
+
+/**
+ * 只修正本次导入会话中的单条失败或需确认行；复用时间周期映射后的整套本地重校验。
+ * rowIndex 与原 Excel 保持一致，time_cycle 不接受人工输入。
+ */
+export function applyManualImportCorrection(result, rowIndex, changes = {}, cycles = []) {
+  const original = result?.allRows?.find((row) => row.rowIndex === rowIndex)
+  if (!original || (!original.cellErrors?.length && !result.confirmationRows?.some((row) => row.rowIndex === rowIndex))) return result
+
+  const next = { ...original }
+  const changedFields = new Set(original.manualCorrectionFields || [])
+  for (const field of Object.keys(FIELD_RULES)) {
+    if (field === 'time_cycle' ||
+        (field === 'publish_date' && original.sourceCycleConflictOrigin) ||
+        !Object.prototype.hasOwnProperty.call(changes, field)) continue
+    const value = changes[field] ?? ''
+    if (String(original[field] ?? '') !== String(value)) changedFields.add(field)
+    next[field] = field === 'publish_date' ? normalizeDate(value) : value
+  }
+
+  if (Object.prototype.hasOwnProperty.call(changes, 'sourceTimeCycleRaw')) {
+    const source = String(changes.sourceTimeCycleRaw ?? '').trim()
+    if (String(original.sourceTimeCycleRaw ?? '') !== source) changedFields.add('sourceTimeCycleRaw')
+    next.sourceTimeCycleRaw = source || undefined
+    next.sourceTimeCycle = source ? normalizeTimeCycleValue(source, cycles) : undefined
+    // 无发布日期时仍按源周期兜底；有发布日期时由本地重校验重新计算自然周。
+    next.time_cycle = next.sourceTimeCycle
+  }
+
+  if (changedFields.size) {
+    next.manualCorrection = true
+    next.manualCorrectionFields = [...changedFields]
+  }
+
+  const revalidated = applyTimeCycleMapping(
+    { ...result, allRows: result.allRows.map((row) => (row.rowIndex === rowIndex ? next : row)) },
+    {}
+  )
+  // 对源周期错误做人工修正时，不能清空或填入不可解析文本来绕过原区间校验。
+  const hadSourceRangeError = original.sourceCycleConflictOrigin || original.cellErrors?.some((error) =>
+    String(error.reason).includes(SOURCE_RANGE_ERROR)
+  )
+  if (!hadSourceRangeError && !changedFields.has('sourceTimeCycleRaw')) return revalidated
+  const sourceText = String(next.sourceTimeCycleRaw || '').trim()
+  if (sourceText && parseBusinessDateRange(sourceText, next.publish_date)) return revalidated
+
+  const reason = sourceText
+    ? '源时间周期无法识别，请填写有效的日期区间或标准周码。'
+    : '源时间周期不能为空，不能清空后跳过源数据校验。'
+  const currentFailure = revalidated.failedRows.find((item) => item.rowIndex === rowIndex)
+  const cellErrors = [...(currentFailure?.cellErrors || []), { field: 'time_cycle', reason }]
+  const failedRow = { rowIndex, cellErrors, reason: cellErrors.map((item) => item.reason).join('；') }
+  const allRows = revalidated.allRows.map((row) =>
+    row.rowIndex === rowIndex ? { ...row, cellErrors } : row
+  )
+  return {
+    ...revalidated,
+    allRows,
+    previewRows: allRows.slice(0, 5),
+    validRows: revalidated.validRows.filter((row) => row.rowIndex !== rowIndex),
+    failedRows: [
+      ...revalidated.failedRows.filter((item) => item.rowIndex !== rowIndex),
+      failedRow
+    ].sort((a, b) => a.rowIndex - b.rowIndex)
   }
 }
 

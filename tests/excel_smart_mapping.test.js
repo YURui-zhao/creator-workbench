@@ -452,7 +452,7 @@ async function main() {
     makeFile(['时间周期', '达人昵称', '总花费', '发布日期'], realRows)
   )
   const realByName = new Map(realResult.validRows.map((row) => [row.nickname, row]))
-  // 探花Gary 的发布日期（08/26）不在其源业务周期（08/27-09/02）内 → 数据质量异常，该行判失败
+  // 探花Gary 的发布日期（08/26）不在源档期内 → 单列需确认，其余正常行无需操作。
   const wrongCycles = REAL_CASES.filter(([nickname, , expected]) => {
     if (nickname === '探花Gary') return false
     const row = realByName.get(nickname)
@@ -467,13 +467,12 @@ async function main() {
     wrongCycles.length ? JSON.stringify(wrongCycles) : `valid=${realResult.validRows.length}`
   )
   check(
-    '探花Gary（源 08/27-09/02 / 发布日期 08/26）→ 判为失败行，提示「不在源时间周期内」',
-    realResult.failedRows.length === 1 &&
-      realResult.failedRows[0].rowIndex === 2 &&
-      String(realResult.failedRows[0].reason).includes(
-        '发布日期 2026-08-26 不在源时间周期 08/27-09/02 内，请检查原始数据。'
-      ),
-    JSON.stringify(realResult.failedRows)
+    '探花Gary（源 08/27-09/02 / 发布日期 08/26）→ 需确认，不计入失败',
+    realResult.confirmationRows.length === 1 &&
+      realResult.confirmationRows[0].rowIndex === 2 &&
+      realResult.confirmationRows[0].reason === excel.SOURCE_CONFLICT_MESSAGE &&
+      realResult.failedRows.length === 0,
+    JSON.stringify(realResult.confirmationRows)
   )
   check(
     '该行仍按发布日期给出 canonical 周期（08/24-08/30），可追溯，不静默改写源周期',
@@ -508,9 +507,9 @@ async function main() {
     const passed =
       res.validRows.length === 1 && res.failedRows.length === 0 && res.sourceRangeViolationRows === 0
     const rejected =
-      res.failedRows.length === 1 &&
+      res.failedRows.length === 0 && res.confirmationRows.length === 1 &&
       res.sourceRangeViolationRows === 1 &&
-      String(res.failedRows[0].reason).includes(`不在源时间周期 ${source} 内`)
+      res.confirmationRows[0].reason === excel.SOURCE_CONFLICT_MESSAGE
     check(label, shouldPass ? passed : rejected, JSON.stringify({
       valid: res.validRows.length,
       failed: res.failedRows.map((r) => r.reason),
@@ -529,11 +528,12 @@ async function main() {
     )
   )
   check(
-    '来源写成标准周码（2026-W35）时同样按区间检查：09/08 不在该周 → 报错',
-    weekSourceResult.failedRows.length === 1 &&
+    '来源写成标准周码（2026-W35）时同样按区间检查：09/08 不在该周 → 需确认',
+    weekSourceResult.failedRows.length === 0 &&
+      weekSourceResult.confirmationRows.length === 1 &&
       weekSourceResult.sourceRangeViolationRows === 1 &&
-      String(weekSourceResult.failedRows[0].reason).includes('不在源时间周期 2026-W35 内'),
-    JSON.stringify(weekSourceResult.failedRows.map((r) => r.reason))
+      weekSourceResult.confirmationRows[0].reason === excel.SOURCE_CONFLICT_MESSAGE,
+    JSON.stringify(weekSourceResult.confirmationRows.map((r) => r.reason))
   )
 
   console.log('\n===== 前端 / 后端 Monday-Sunday 周定义一致性 =====')
@@ -682,16 +682,25 @@ async function main() {
     JSON.stringify(fixtureResult.blankRowIndexes)
   )
   check(
-    '真实结构 fixture：42 条中仅 Excel 第27行 探花Gary 违反源周期',
+    '真实结构 fixture：成功 41 / 需确认 1 / 失败 0 / 跳过 5，唯一冲突为第27行 Gary',
     fixtureResult.validRows.length === 41 &&
-      fixtureResult.failedRows.length === 1 &&
-      fixtureResult.failedRows[0].rowIndex === 27 &&
+      fixtureResult.confirmationRows.length === 1 &&
+      fixtureResult.confirmationRows[0].rowIndex === 27 &&
+      fixtureResult.confirmationRows[0].reason === excel.SOURCE_CONFLICT_MESSAGE &&
+      fixtureResult.failedRows.length === 0 &&
+      fixtureResult.blankRows === 5 &&
       fixtureResult.sourceRangeViolationRows === 1 &&
       fixtureResult.sourceRangeViolations[0].rowIndex === 27 &&
       fixtureResult.sourceRangeViolations[0].nickname === '探花Gary' &&
       fixtureResult.sourceRangeViolations[0].sourceTimeCycle === '08/27-09/02' &&
-      fixtureResult.failedRows[0].reason.includes('发布日期 2026-08-26 不在源时间周期 08/27-09/02 内'),
+      fixtureByRow.get(27)?.publish_date === '2026-08-26' &&
+      fixtureByRow.get(27)?.time_cycle === excel.publishDateToWeekCode('2026-08-26'),
     JSON.stringify(fixtureResult.sourceRangeViolations)
+  )
+  check(
+    '其余 41 条正常记录自动可入库，无需人工确认',
+    fixtureResult.validRows.length === 41 &&
+      fixtureResult.validRows.every((row) => !row.sourceCycleConfirmed && row.rowIndex !== 27)
   )
   check(
     'Excel 第40–48行九位达人均合法且来源严格为 09/03-09/09',
@@ -701,14 +710,112 @@ async function main() {
     }),
     JSON.stringify(fixtureResult.validRows.filter((row) => row.rowIndex >= 40).map((row) => [row.rowIndex, row.nickname, row.sourceTimeCycleRaw]))
   )
+  const confirmedResult = excel.confirmSourceTimeCycleConflict(fixtureResult, 27)
+  const confirmedGary = confirmedResult.validRows.find((row) => row.rowIndex === 27)
+  check(
+    '确认当前投放档期后：42 可入库 / 0 需确认，发布日期和 canonical 周保持原值',
+    confirmedResult.validRows.length === 42 &&
+      confirmedResult.confirmationRows.length === 0 &&
+      confirmedResult.failedRows.length === 0 &&
+      confirmedResult.blankRows === 5 &&
+      confirmedResult.sourceRangeViolationRows === 1 &&
+      confirmedGary?.publish_date === '2026-08-26' &&
+      confirmedGary?.time_cycle === excel.publishDateToWeekCode('2026-08-26') &&
+      confirmedGary?.sourceTimeCycleRaw === '08/27-09/02' &&
+      confirmedGary?.sourceCycleConfirmed === true,
+    JSON.stringify(confirmedGary)
+  )
+  check(
+    '确认只作用于导入会话，原解析结果仍为 41 成功 / 1 需确认',
+    fixtureResult.validRows.length === 41 &&
+      fixtureResult.confirmationRows[0].rowIndex === 27 &&
+      fixtureResult.allRows.find((row) => row.rowIndex === 27)?.publish_date === '2026-08-26'
+  )
+  const repairedSource = excel.applyManualImportCorrection(fixtureResult, 27, {
+    publish_date: '2026-08-27',
+    sourceTimeCycleRaw: '08/26-09/02'
+  })
+  check(
+    '人工调整源周期可通过校验，但不能借机改写客观发布日期与自然周',
+    repairedSource.validRows.length === 42 &&
+      repairedSource.confirmationRows.length === 0 &&
+      repairedSource.validRows.find((row) => row.rowIndex === 27)?.publish_date === '2026-08-26' &&
+      repairedSource.validRows.find((row) => row.rowIndex === 27)?.sourceTimeCycleRaw === '08/26-09/02' &&
+      repairedSource.validRows.find((row) => row.rowIndex === 27)?.time_cycle === excel.publishDateToWeekCode('2026-08-26') &&
+      repairedSource.validRows.find((row) => row.rowIndex === 27)?.manualCorrectionFields.join(',') === 'sourceTimeCycleRaw'
+  )
+  const stillInvalid = excel.applyManualImportCorrection(fixtureResult, 27, {
+    publish_date: '2026-08-25',
+    sourceTimeCycleRaw: '08/28-09/03'
+  })
+  check(
+    '人工调整后仍有档期冲突时留在需确认列表，不变为失败或成功',
+    stillInvalid.validRows.length === 41 &&
+      stillInvalid.confirmationRows[0]?.rowIndex === 27 &&
+      stillInvalid.confirmationRows[0]?.reason === excel.SOURCE_CONFLICT_MESSAGE &&
+      stillInvalid.failedRows.length === 0 &&
+      stillInvalid.allRows.find((row) => row.rowIndex === 27)?.publish_date === '2026-08-26'
+  )
+  const clearedSource = excel.applyManualImportCorrection(fixtureResult, 27, {
+    sourceTimeCycleRaw: ''
+  })
+  const badSource = excel.applyManualImportCorrection(fixtureResult, 27, {
+    sourceTimeCycleRaw: '无法识别的周期'
+  })
+  check(
+    '清空或填入无效源周期不能绕过原有档期冲突',
+    clearedSource.validRows.length === 41 &&
+      clearedSource.confirmationRows.length === 0 &&
+      clearedSource.failedRows[0]?.reason.includes('源时间周期不能为空') &&
+      badSource.validRows.length === 41 &&
+      badSource.failedRows[0]?.reason.includes('源时间周期无法识别')
+  )
+  const mixedError = await parseRecordsExcel(
+    makeFile(['时间周期', '达人昵称', '总花费', '发布日期'], [
+      ['08/27-09/02', '双重问题', '错误金额', '2026-08-26']
+    ])
+  )
+  const mixedRepaired = excel.applyManualImportCorrection(mixedError, 2, { total_cost: '1000' })
+  check(
+    '确定性格式错误仍先判失败，修好后才转为需确认；不能直接确认放行',
+    mixedError.failedRows.length === 1 &&
+      mixedError.confirmationRows.length === 0 &&
+      excel.confirmSourceTimeCycleConflict(mixedError, 2) === mixedError &&
+      mixedRepaired.failedRows.length === 0 &&
+      mixedRepaired.confirmationRows.length === 1 &&
+      mixedRepaired.validRows.length === 0 &&
+      mixedRepaired.allRows[0].publish_date === '2026-08-26'
+  )
+  const badCost = await parseRecordsExcel(
+    makeFile(['时间周期', '达人昵称', '总花费', '发布日期'], [
+      ['08/27-09/02', '费用待修正', '错误金额', '2026-08-27']
+    ])
+  )
+  const repairedCost = excel.applyManualImportCorrection(badCost, 2, { total_cost: '1000' })
+  check(
+    '其他本地校验失败字段也复用同一校验规则进入有效列表',
+    badCost.failedRows.length === 1 &&
+      repairedCost.failedRows.length === 0 &&
+      repairedCost.validRows[0]?.total_cost === 1000
+  )
+  check(
+    '周期重校验保留人工修正与人工确认标记',
+    excel.applyTimeCycleMapping(repairedSource, {}).validRows.find((row) => row.rowIndex === 27)
+      ?.manualCorrection === true &&
+      excel.applyTimeCycleMapping(confirmedResult, {}).validRows.find((row) => row.rowIndex === 27)
+        ?.sourceCycleConfirmed === true
+  )
   const fixtureReparsed = await parseRecordsExcel(makeRealStructureFixture(), [], {
     overrides: { '时间周期': 'time_cycle' }
   })
   const fixtureRemapped = excel.applyTimeCycleMapping(fixtureResult, {})
   check(
-    '映射确认后二次解析与时间周期映射重校验均保持 42 条 / 1 条源周期异常及真实行号',
+    '映射确认后二次解析与时间周期映射重校验均保持 41 成功 / 1 需确认及真实行号',
     [fixtureReparsed, fixtureRemapped].every((result) =>
       result.allRows.length === 42 &&
+      result.validRows.length === 41 &&
+      result.confirmationRows.length === 1 &&
+      result.failedRows.length === 0 &&
       result.sourceRangeViolationRows === 1 &&
       result.sourceRangeViolations[0].rowIndex === 27 &&
       result.allRows.find((row) => row.rowIndex === 40)?.sourceTimeCycleRaw === '09/03-09/09'

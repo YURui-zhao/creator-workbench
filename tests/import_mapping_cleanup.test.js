@@ -10,7 +10,7 @@
  *
  * 覆盖：
  *   CASE 1  删除普通投放记录后，对应 import_batch_records 映射不残留（单条删除 + 批量删除）
- *   CASE 2  当前产品没有「删除导入历史 / 撤销导入」接口（导入历史是只读日志；删除记录不会删除批次日志）
+ *   CASE 2  批次级写接口只有「撤销导入 / 删除历史」两个（Batch 6C 新增），且删除记录不会删除批次日志
  *   CASE 3  全库不存在孤儿 mapping（record 已删 / batch 已删）
  */
 const path = require('node:path')
@@ -89,20 +89,25 @@ async function main() {
   check('批量删除 handler 可用（POST /records/batch-delete）', typeof batchDelete === 'function')
   check('批次详情 handler 可用（GET /import/batches/:id）', typeof getBatchDetail === 'function')
 
-  console.log('\n===== CASE 2：产品语义（是否存在「删除导入历史 / 撤销导入」接口）=====')
-  const importDeleteRoutes = importRouter.stack.filter(
-    (item) => item.route && (item.route.methods?.delete || item.route.methods?.patch)
-  )
+  console.log('\n===== CASE 2：批次级写接口清单（Batch 6C 新增两个动作）=====')
+  // Batch 6C 起：批次级写操作只有「撤销导入」（POST /batches/:id/rollback）
+  // 与「删除历史」（DELETE /batches/:id），且都必须保留 mapping 清理后的完整性
+  const batchWriteRoutes = importRouter.stack
+    .filter((item) => item.route && (item.route.methods?.delete || item.route.methods?.patch || item.route.methods?.post))
+    .map((item) => `${Object.keys(item.route.methods)[0].toUpperCase()} ${item.route.path}`)
+    .sort()
   check(
-    'importBatches 路由没有任何 delete/patch 接口 → 导入历史是只读日志，不存在「删除历史 / 撤销导入」',
-    importDeleteRoutes.length === 0,
-    `发现 ${importDeleteRoutes.length} 个写接口`
+    'importBatches 只有「撤销导入 / 删除历史」两个写接口（无其它未预期写接口）',
+    batchWriteRoutes.length === 2 &&
+      batchWriteRoutes.includes('POST /batches/:id/rollback') &&
+      batchWriteRoutes.includes('DELETE /batches/:id'),
+    JSON.stringify(batchWriteRoutes)
   )
   const recordsDeleteIds = recordsRouter.stack
     .filter((item) => item.route && item.route.methods?.delete)
     .map((item) => item.route.path)
   check(
-    '只有投放记录本身支持删除（DELETE /records/:id），没有批次级删除',
+    '投放记录侧仍然只有 DELETE /records/:id 一个删除接口',
     recordsDeleteIds.includes('/:id') && recordsDeleteIds.length === 1,
     JSON.stringify(recordsDeleteIds)
   )

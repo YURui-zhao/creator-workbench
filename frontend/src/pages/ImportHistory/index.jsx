@@ -6,17 +6,25 @@ import {
   DatePicker,
   Descriptions,
   Drawer,
+  Dropdown,
   Empty,
+  Modal,
   Skeleton,
   Space,
   Table,
   Tag,
   Tooltip,
-  Typography
+  Typography,
+  message
 } from 'antd'
-import { ReloadOutlined, UnorderedListOutlined } from '@ant-design/icons'
+import { DownOutlined, ReloadOutlined, UnorderedListOutlined } from '@ant-design/icons'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { getImportBatchDetail, getImportBatches } from '../../api/importBatches'
+import {
+  deleteImportBatchHistory,
+  getImportBatchDetail,
+  getImportBatches,
+  rollbackImportBatch
+} from '../../api/importBatches'
 import { getErrorMessage } from '../../utils/request'
 import { formatCpm, formatInteger, formatMoney, formatPlays } from '../../utils/format'
 import { calcCpm } from '../../utils/calc'
@@ -139,6 +147,96 @@ export default function ImportHistory() {
     navigate(`/records?batchId=${batchId}`)
   }
 
+  // ---------- 批次级操作：撤销导入 / 删除历史（两个完全不同的产品动作）----------
+  // 撤销导入：删除该批次「当前仍关联」的投放记录；导入历史与行级日志保留
+  const handleRollback = (batch) => {
+    const currentCount = Number(batch.record_count) || 0
+    if (currentCount === 0) {
+      message.info('该批次当前没有可撤销的投放记录。')
+      return
+    }
+    Modal.confirm({
+      title: '确认撤销导入？',
+      okText: '确认撤销',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      width: 520,
+      content: (
+        <Space direction="vertical" size={4} style={{ display: 'flex' }}>
+          <div>文件名：{batch.file_name || `批次 #${batch.id}`}</div>
+          <div>批次：# {batch.id}</div>
+          <div>当时成功导入：{formatInteger(batch.success_count)} 条</div>
+          <div>当前仍关联记录：{formatInteger(currentCount)} 条</div>
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginTop: 8 }}
+            message="撤销后将删除该批次当前仍关联的投放记录，包括之后编辑过的这些记录；导入历史将继续保留。"
+          />
+        </Space>
+      ),
+      onOk: async () => {
+        try {
+          const res = await rollbackImportBatch(batch.id)
+          const deleted = Number(res.data?.deletedCount) || 0
+          if (deleted > 0) {
+            message.success(`已撤销导入，删除 ${deleted} 条投放记录`)
+          } else {
+            message.info('该批次当前没有可撤销的投放记录。')
+          }
+          await loadData()
+          // 详情抽屉若正打开该批次：刷新为最新状态（对应记录应变为 0 条）
+          if (detailOpen && detail?.batch?.id === batch.id) {
+            await openDetail(batch.id)
+          }
+        } catch (err) {
+          message.error(getErrorMessage(err, '撤销导入失败，请稍后重试'))
+          throw err
+        }
+      }
+    })
+  }
+
+  // 删除历史：只删日志；仍有关联投放记录时不允许（后端同样返回 409 兜底）
+  const handleDeleteHistory = (batch) => {
+    const currentCount = Number(batch.record_count) || 0
+    if (currentCount > 0) {
+      message.warning('该批次仍有关联投放记录，请先撤销导入。')
+      return
+    }
+    Modal.confirm({
+      title: '确认删除导入历史？',
+      okText: '确认删除',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      width: 480,
+      content: (
+        <Space direction="vertical" size={4} style={{ display: 'flex' }}>
+          <div>文件名：{batch.file_name || `批次 #${batch.id}`}</div>
+          <div>批次：# {batch.id}</div>
+          <div>当前仍关联记录：0 条</div>
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginTop: 8 }}
+            message="仅删除本次导入历史与行级日志，不会删除任何投放记录。"
+          />
+        </Space>
+      ),
+      onOk: async () => {
+        try {
+          await deleteImportBatchHistory(batch.id)
+          message.success('已删除导入历史')
+          if (detailOpen && detail?.batch?.id === batch.id) closeDetail()
+          await loadData()
+        } catch (err) {
+          message.error(getErrorMessage(err, '删除导入历史失败，请稍后重试'))
+          throw err
+        }
+      }
+    })
+  }
+
   const columns = [
     { title: '批次', dataIndex: 'id', width: 80 },
     {
@@ -193,24 +291,52 @@ export default function ImportHistory() {
       render: (value) => <Tag color={value ? 'warning' : 'default'}>{formatInteger(value)}</Tag>
     },
     {
+      // 当前仍然关联的投放记录数（会随记录被删除而减少）——与「成功」（导入当时写入条数）不同
+      title: '当前关联',
+      dataIndex: 'record_count',
+      width: 100,
+      align: 'right',
+      render: (value) => (
+        <Tooltip title="当前仍存在于投放记录中的数量；与「成功」不同，手动删除记录后这里会减少">
+          <span style={{ cursor: 'help' }}>{formatInteger(value)}</span>
+        </Tooltip>
+      )
+    },
+    {
       title: '操作',
       key: 'action',
-      width: 200,
-      render: (_, record) => (
-        <Space size={8}>
-          <Button size="small" type="link" onClick={() => openDetail(record.id)}>
-            批次详情
-          </Button>
-          <Button
-            size="small"
-            type="link"
-            icon={<UnorderedListOutlined />}
-            onClick={() => goRecordsByBatch(record.id)}
-          >
-            查看对应记录
-          </Button>
-        </Space>
-      )
+      width: 260,
+      render: (_, record) => {
+        // 「更多」里只放两个破坏性动作，且语义明确区分；不在主区域并排两个红色按钮
+        const moreItems = [
+          { key: 'rollback', label: '撤销导入（删除该批次当前关联的投放记录）', danger: true },
+          { key: 'delete-history', label: '删除历史（仅删日志，不动投放记录）', danger: true }
+        ]
+        const onMoreClick = ({ key }) => {
+          if (key === 'rollback') handleRollback(record)
+          else if (key === 'delete-history') handleDeleteHistory(record)
+        }
+        return (
+          <Space size={4}>
+            <Button size="small" type="link" onClick={() => openDetail(record.id)}>
+              批次详情
+            </Button>
+            <Button
+              size="small"
+              type="link"
+              icon={<UnorderedListOutlined />}
+              onClick={() => goRecordsByBatch(record.id)}
+            >
+              查看对应记录
+            </Button>
+            <Dropdown menu={{ items: moreItems, onClick: onMoreClick }} trigger={['click']}>
+              <Button size="small" type="link">
+                更多 <DownOutlined />
+              </Button>
+            </Dropdown>
+          </Space>
+        )
+      }
     }
   ]
 
@@ -392,7 +518,7 @@ export default function ImportHistory() {
           columns={columns}
           dataSource={list}
           locale={{ emptyText: '暂无导入记录，可在投放管理页导入 Excel 后查看' }}
-          scroll={{ x: 1100 }}
+          scroll={{ x: 1200 }}
           pagination={{
             current: page,
             pageSize,
@@ -444,6 +570,13 @@ export default function ImportHistory() {
                     重复 {formatInteger(detail.batch.duplicate_count)}
                   </Tag>
                 </Space>
+              </Descriptions.Item>
+              <Descriptions.Item label="当前关联记录">
+                <Tooltip title="当前仍存在于投放记录中的数量；与「成功」不同，记录被删除后这里会减少。撤销导入只影响这里关联的记录">
+                  <span style={{ cursor: 'help' }}>
+                    {formatInteger(detail.record_count)} 条
+                  </span>
+                </Tooltip>
               </Descriptions.Item>
             </Descriptions>
 

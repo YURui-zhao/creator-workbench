@@ -10,6 +10,7 @@ import {
   parseTimeCycleToWeekCode
 } from '../utils/dateCycle.js'
 import { buildXlsx } from '../utils/xlsx.js'
+import { loadLatestSnapshotSummaries } from './recentSnapshots.js'
 
 const router = Router()
 
@@ -1790,7 +1791,22 @@ router.get('/repurchase-radar', (req, res) => {
     // 非测试模式：忽略该参数，生产始终以服务端本地当前日期为准
   }
   const rows = queryDetailRows()
-  return ok(res, buildRepurchaseRadar(rows, { referenceDate }))
+  const radar = buildRepurchaseRadar(rows, { referenceDate })
+
+  // P2B：合并每位达人的「最新近期表现快照」轻量 summary。
+  // 单条 SQL 批量查询（不做 N+1）；只增加展示字段，
+  // 不参与 historical_status / 分组 / median_cpm / 排序，P1 规则保持不变。
+  const snapshotMap = loadLatestSnapshotSummaries(
+    radar.groups.flatMap((group) => group.creators.map((creator) => creator.creator))
+  )
+  for (const group of radar.groups) {
+    group.creators = group.creators.map((creator) => ({
+      ...creator,
+      recent_snapshot: snapshotMap.get(creator.creator) || null
+    }))
+  }
+
+  return ok(res, radar)
 })
 
 // ---------- 筛选元数据（博主类型 / 达人昵称 / 数据周范围，供 BI 筛选面板初始化） ----------

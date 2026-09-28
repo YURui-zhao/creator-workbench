@@ -2,10 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert,
   Button,
+  Checkbox,
   Divider,
   Empty,
   Input,
   Modal,
+  Select,
   Space,
   Spin,
   Tag,
@@ -21,9 +23,18 @@ import {
   SendOutlined
 } from '@ant-design/icons'
 import { extractCreatorScreenshot, getAiStatus } from '../api/ai'
+import { saveRecentSnapshot } from '../api/recentSnapshots'
 import { getAiConfig } from '../utils/aiConfig.js'
 import { getErrorMessage } from '../utils/request'
-import { formatInteger } from '../utils/format'
+import { formatInteger, formatPlays } from '../utils/format'
+import {
+  buildSnapshotPayload,
+  canSaveSnapshot,
+  formatPlayRange,
+  formatTrendRatio,
+  needsIdentityConfirmation,
+  TREND_LABELS_FULL
+} from '../utils/recentPerformanceSave.js'
 import {
   IMAGE_ACCEPT_ATTR,
   MAX_IMAGE_BYTES,
@@ -48,6 +59,7 @@ const SEND_NOTICE =
   '将向当前配置的 AI 服务发送所选截图，用于识别：达人昵称、星图刊例价、作品播放量。原图不会作为业务记录长期保存。'
 const ORDER_NOTICE =
   '请确认作品顺序是否为从新到旧；如截图包含置顶或重复作品，可排除对应项。'
+const SAVE_NOTICE = '将保存结构化播放数据与统计结果，不保存原截图。'
 
 /**
  * 近期表现助手（V3-alpha P2A）
@@ -56,7 +68,14 @@ const ORDER_NOTICE =
  * - AI 只返回可见事实；数值由确定性解析器换算，用户可逐条修改 / 排除
  * - 确认识别结果只在生成前端草稿，P2A 不写数据库、不估值、不给复投建议
  */
-export default function RecentPerformanceAssistantModal({ open, onCancel, onConfirmed }) {
+export default function RecentPerformanceAssistantModal({
+  open,
+  onCancel,
+  onConfirmed,
+  onSaved,
+  creator = null,
+  creatorOptions = []
+}) {
   const [images, setImages] = useState([])
   const [preparing, setPreparing] = useState(false)
   const [prepareError, setPrepareError] = useState('')
@@ -64,11 +83,26 @@ export default function RecentPerformanceAssistantModal({ open, onCancel, onConf
   const [aiError, setAiError] = useState('')
   const [draft, setDraft] = useState(null)
   const [confirmed, setConfirmed] = useState(null)
+  // P2B：快照必须绑定到用户点击的雷达达人（header 入口需先选择达人）
+  const [boundCreator, setBoundCreator] = useState('')
+  const [identityConfirmed, setIdentityConfirmed] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState('')
+  const [savedSnapshot, setSavedSnapshot] = useState(null)
   const [aiStatus, setAiStatus] = useState({ checked: false, available: false, visionModel: null, visionAvailable: false, providerLabel: '' })
   const [dragging, setDragging] = useState(false)
   const inputRef = useRef(null)
   // 并发保护：识别进行中禁止重复点击（同一次请求不会被叠加）
   const aiInFlightRef = useRef(false)
+
+  // 打开时绑定达人：由行内入口传入；header 入口为空，需要用户显式选择
+  useEffect(() => {
+    if (!open) return
+    setBoundCreator(String(creator ?? '').trim())
+    setIdentityConfirmed(false)
+    setSaveError('')
+    setSavedSnapshot(null)
+  }, [open, creator])
 
   // 打开时读取 AI 状态（只查后端环境变量与固定 vision 模型，不发送 Key/图片）
   useEffect(() => {
@@ -106,6 +140,9 @@ export default function RecentPerformanceAssistantModal({ open, onCancel, onConf
     setAiLoading(false)
     setDraft(null)
     setConfirmed(null)
+    setIdentityConfirmed(false)
+    setSaveError('')
+    setSavedSnapshot(null)
     aiInFlightRef.current = false
   }, [])
 
@@ -173,6 +210,8 @@ export default function RecentPerformanceAssistantModal({ open, onCancel, onConf
       // 图片变化后，之前的识别结果不再对应当前截图
       setDraft(null)
       setConfirmed(null)
+      setIdentityConfirmed(false)
+      setSavedSnapshot(null)
       setAiError('')
     },
     []
@@ -205,6 +244,8 @@ export default function RecentPerformanceAssistantModal({ open, onCancel, onConf
     setImages((list) => list.filter((item) => item.id !== image.id))
     setDraft(null)
     setConfirmed(null)
+    setIdentityConfirmed(false)
+    setSavedSnapshot(null)
     setAiError('')
   }
 
@@ -234,6 +275,9 @@ export default function RecentPerformanceAssistantModal({ open, onCancel, onConf
     try {
       const res = await extractCreatorScreenshot(images.map((image) => ({ mime: image.mime, base64: image.base64 })))
       setDraft(buildDraftFromExtraction(res?.data || {}))
+      setConfirmed(null)
+      setIdentityConfirmed(false)
+      setSavedSnapshot(null)
     } catch (error) {
       // 识别失败：保留已选截图与人工修改，只提示失败原因
       setAiError(getErrorMessage(error, 'AI 识别失败，请重试（截图与已修改内容均已保留）'))
@@ -251,7 +295,62 @@ export default function RecentPerformanceAssistantModal({ open, onCancel, onConf
     message.success('已确认识别结果（P2A 暂不写入数据库）')
   }
 
+  // P2B：显式保存（不静默写库）；失败保留 confirmed draft 与全部人工修改
+  const handleSave = async () => {
+    if (saving) return
+    if (!confirmed) {
+      message.warning('请先点击「确认识别结果」，再保存近期表现')
+      return
+    }
+    if (!boundCreator) {
+      message.warning('请先选择本次快照所属的达人')
+      return
+    }
+    if (identityNeedsConfirm && !identityConfirmed) {
+      message.warning('截图昵称与当前达人不一致，请勾选确认后再保存')
+      return
+    }
+    setSaving(true)
+    setSaveError('')
+    try {
+      const res = await saveRecentSnapshot(
+        buildSnapshotPayload(draft, { creator: boundCreator, identityConfirmed })
+      )
+      setSavedSnapshot(res?.data || null)
+      onSaved?.(res?.data || null)
+      message.success('近期表现已保存为快照')
+    } catch (error) {
+      // 后端统一返回中文 msg；网络层失败（超时 / 502 等）不回显 axios 原始英文错误
+      const backendMessage = error?.response?.data?.msg || error?.response?.data?.message
+      setSaveError(backendMessage || '保存失败，识别结果与人工修改均已保留，可重试')
+    } finally {
+      setSaving(false)
+    }
+  }
+
   const summary = draft ? summarizeDraft(draft) : null
+  const recognizedName = draft?.creator_name || ''
+  const identityNeedsConfirm = needsIdentityConfirmation(boundCreator, recognizedName)
+  const canSave = canSaveSnapshot({
+    confirmed: Boolean(confirmed),
+    creator: boundCreator,
+    identityNeedsConfirm,
+    identityConfirmed,
+    saving,
+    savedSnapshot
+  })
+
+  /**
+   * 草稿的任何人工修改都会让「确认识别结果」与「已保存」状态失效：
+   * 这样「确认识别结果 → 保存近期表现」始终对应同一份内容，
+   * 也避免同一份草稿被重复保存成多条快照。
+   */
+  const applyDraftChange = (nextDraft) => {
+    setDraft(nextDraft)
+    setConfirmed(null)
+    setSavedSnapshot(null)
+    setSaveError('')
+  }
 
   return (
     <Modal
@@ -266,7 +365,7 @@ export default function RecentPerformanceAssistantModal({ open, onCancel, onConf
       <Space direction="vertical" size="middle" style={{ display: 'flex' }}>
         <Typography.Text type="secondary">
           粘贴 / 上传达人主页或星图截图，AI 只负责识别截图上的可见信息（昵称、星图刊例价、作品播放量），
-          数值换算与判断由系统确定性地完成，识别结果必须经你确认。P2A 阶段暂不写入数据库。
+          数值换算与判断由系统确定性地完成，识别结果必须经你确认；在你点击「保存近期表现」之前不会写入数据库。
         </Typography.Text>
 
         <Alert type="info" showIcon message="发送范围" description={SEND_NOTICE} />
@@ -429,6 +528,47 @@ export default function RecentPerformanceAssistantModal({ open, onCancel, onConf
               无法确定性解析的条目请人工确认。{ORDER_NOTICE}
             </Typography.Text>
 
+            {/* P2B：快照归属由用户点击的雷达达人决定，AI 识别昵称只作为 evidence */}
+            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+              <div>
+                <Typography.Text type="secondary">本次快照所属达人（雷达达人）</Typography.Text>
+                <div>
+                  {creator ? (
+                    <Typography.Text strong>{creator}</Typography.Text>
+                  ) : (
+                    <Select
+                      value={boundCreator || undefined}
+                      placeholder="请选择本次快照所属达人"
+                      style={{ width: 220 }}
+                      showSearch
+                      optionFilterProp="label"
+                      onChange={(value) => {
+                        setBoundCreator(value)
+                        setIdentityConfirmed(false)
+                      }}
+                      options={creatorOptions.map((name) => ({ value: name, label: name }))}
+                    />
+                  )}
+                </div>
+              </div>
+              {identityNeedsConfirm && (
+                <Alert
+                  type="warning"
+                  showIcon
+                  style={{ flex: '1 1 320px' }}
+                  message={`截图昵称「${recognizedName}」与当前达人「${boundCreator || '未选择'}」不一致，请确认是否上传了正确截图。`}
+                  description={
+                    <Checkbox
+                      checked={identityConfirmed}
+                      onChange={(event) => setIdentityConfirmed(event.target.checked)}
+                    >
+                      {`我确认本次快照保存到「${boundCreator || '未选择'}」`}
+                    </Checkbox>
+                  }
+                />
+              )}
+            </div>
+
             {draft.warnings.length > 0 && (
               <Alert
                 type="warning"
@@ -447,7 +587,7 @@ export default function RecentPerformanceAssistantModal({ open, onCancel, onConf
                   value={draft.creator_name}
                   placeholder="请核对达人昵称"
                   style={{ width: 220 }}
-                  onChange={(event) => setDraft(updateCreatorName(draft, event.target.value))}
+                  onChange={(event) => applyDraftChange(updateCreatorName(draft, event.target.value))}
                 />
               </div>
               <div>
@@ -457,7 +597,7 @@ export default function RecentPerformanceAssistantModal({ open, onCancel, onConf
                     value={draft.xingtu_price_raw}
                     placeholder="例如 ¥3,000"
                     style={{ width: 180 }}
-                    onChange={(event) => setDraft(updatePriceRawText(draft, event.target.value))}
+                    onChange={(event) => applyDraftChange(updatePriceRawText(draft, event.target.value))}
                   />
                   <Typography.Text strong style={{ marginLeft: 8 }}>
                     {draft.xingtu_price === null ? '需人工确认' : `¥${formatInteger(draft.xingtu_price)}`}
@@ -505,7 +645,7 @@ export default function RecentPerformanceAssistantModal({ open, onCancel, onConf
                         value={play.raw_text ?? ''}
                         placeholder="截图原文"
                         style={{ width: 120 }}
-                        onChange={(event) => setDraft(updatePlayRawText(draft, play.id, event.target.value))}
+                        onChange={(event) => applyDraftChange(updatePlayRawText(draft, play.id, event.target.value))}
                       />
                       <Typography.Text type="secondary">→</Typography.Text>
                       <Typography.Text
@@ -524,7 +664,7 @@ export default function RecentPerformanceAssistantModal({ open, onCancel, onConf
                       <Button
                         size="small"
                         type="link"
-                        onClick={() => setDraft(togglePlayExcluded(draft, play.id))}
+                        onClick={() => applyDraftChange(togglePlayExcluded(draft, play.id))}
                       >
                         {play.excluded ? '恢复该条' : '排除该条'}
                       </Button>
@@ -539,6 +679,13 @@ export default function RecentPerformanceAssistantModal({ open, onCancel, onConf
                 <Typography.Text>识别作品：{summary.identified_count}</Typography.Text>
                 <Typography.Text>有效作品：{summary.valid_count}</Typography.Text>
                 <Typography.Text>排除：{summary.excluded_count}</Typography.Text>
+                {summary.unresolved_count > 0 && (
+                  <Tooltip title="未排除但无法确定性解析的条目，不计入有效样本（后端会存为 unresolved）">
+                    <Typography.Text type="warning">
+                      待人工确认：{summary.unresolved_count}
+                    </Typography.Text>
+                  </Tooltip>
+                )}
                 <Typography.Text>
                   星图价：{summary.xingtu_price === null ? '需人工确认' : `¥${formatInteger(summary.xingtu_price)}`}
                 </Typography.Text>
@@ -552,10 +699,72 @@ export default function RecentPerformanceAssistantModal({ open, onCancel, onConf
               <Alert
                 type="success"
                 showIcon
-                message="已生成确认草稿（P2A 到此结束）"
-                description="本次仅在前端形成确认结果，未写入数据库；不计算目标价、不做折扣与复投建议（进入 P2B/P3）。"
+                message="已生成确认草稿"
+                description="确认只是形成草稿，尚未写入数据库；点击下方「保存近期表现」才会写入快照。不计算目标价、不做折扣与复投建议。"
               />
             )}
+
+            {/* P2B：显式保存动作（与「确认识别结果」分开，不做静默写库） */}
+            <Divider style={{ margin: '4px 0' }} />
+            <Space direction="vertical" size={8} style={{ display: 'flex' }}>
+              <Typography.Text type="secondary">{SAVE_NOTICE}</Typography.Text>
+              <Space size={12} wrap>
+                <Tooltip title={confirmed ? '' : '请先点击上方「确认识别结果」'}>
+                  <Button type="primary" loading={saving} disabled={!canSave} onClick={handleSave}>
+                    保存近期表现
+                  </Button>
+                </Tooltip>
+                <Typography.Text type="secondary">
+                  保存后可在复投雷达对应达人处看到最新快照（append-only，不会覆盖历史快照）
+                </Typography.Text>
+              </Space>
+
+              {saveError && (
+                <Alert
+                  type="error"
+                  showIcon
+                  message={saveError}
+                  description="识别结果与人工修改均已保留，可直接重试。"
+                />
+              )}
+
+              {savedSnapshot && (
+                <Alert
+                  type="success"
+                  showIcon
+                  message={`已保存快照 #${savedSnapshot.id}（${savedSnapshot.created_at || ''}）`}
+                  description={
+                    <Space direction="vertical" size={2}>
+                      <Typography.Text>
+                        有效样本：{formatInteger(savedSnapshot.valid_count)}
+                        {savedSnapshot.excluded_count > 0 ? `，排除 ${formatInteger(savedSnapshot.excluded_count)}` : ''}
+                        {savedSnapshot.unresolved_count > 0 ? `，待人工确认 ${formatInteger(savedSnapshot.unresolved_count)}` : ''}
+                      </Typography.Text>
+                      {savedSnapshot.stats_status === 'ok' ? (
+                        <>
+                          <Typography.Text>
+                            中位播放：{formatPlays(savedSnapshot.median_play)}　典型区间（P25–P75）：
+                            {formatPlayRange(savedSnapshot.p25_play, savedSnapshot.p75_play)}
+                          </Typography.Text>
+                          <Typography.Text>
+                            趋势：{TREND_LABELS_FULL[savedSnapshot.trend_label] || '样本不足'}
+                            {formatTrendRatio(savedSnapshot.trend_ratio)
+                              ? `（${formatTrendRatio(savedSnapshot.trend_ratio)}）`
+                              : ''}
+                          </Typography.Text>
+                        </>
+                      ) : (
+                        <Typography.Text>样本不足：本次不展示中位播放与典型区间，建议补充更多近期作品截图。</Typography.Text>
+                      )}
+                      <Typography.Text>
+                        星图价：{savedSnapshot.xingtu_price === null || savedSnapshot.xingtu_price === undefined ? '待确认 / 未识别' : `¥${formatInteger(savedSnapshot.xingtu_price)}`}
+                      </Typography.Text>
+                      <Typography.Text type="secondary">统计口径：{savedSnapshot.stats_version}</Typography.Text>
+                    </Space>
+                  }
+                />
+              )}
+            </Space>
           </>
         )}
 

@@ -5,6 +5,7 @@ import {
   Card,
   Col,
   Empty,
+  Popover,
   Row,
   Skeleton,
   Space,
@@ -19,6 +20,12 @@ import { getRepurchaseRadar } from '../../api/records'
 import { getErrorMessage } from '../../utils/request'
 import { formatCpm, formatInteger } from '../../utils/format'
 import RecentPerformanceAssistantModal from '../../components/RecentPerformanceAssistantModal'
+import {
+  formatPlayRange,
+  formatSnapshotStatusText,
+  formatTrendRatio,
+  TREND_LABELS_FULL
+} from '../../utils/recentPerformanceSave.js'
 
 // 历史状态 -> 展示文案（文字为主，颜色仅辅助，不依赖颜色理解）
 const STATUS_META = {
@@ -34,18 +41,89 @@ const GROUP_HINTS = {
   low_priority: '有效合作样本 ≥ 2 且多数单次累计 CPM 未达标'
 }
 
-// 列宽合计刻意控制在 832px 内：1024 宽度下整张表无需横向滚动即可看全全部指标
-const RADAR_TABLE_WIDTH = 832
+// 列宽合计刻意控制在 1024 宽度下不产生页面级 / 表内横向滚动：
+// 「达人名称」列加宽以容纳第二行的近期表现状态，同时小幅收紧中位数与风险列
+const RADAR_TABLE_WIDTH = 836
 const SECONDARY_TEXT_STYLE = { fontSize: 12, color: 'rgba(0, 0, 0, 0.45)', lineHeight: '18px' }
 const PLACEHOLDER = <Typography.Text type="secondary">-</Typography.Text>
 
 /**
  * 列定义（目标 CPM 只用于提示文案，业务判定全部由后端给出）
  * @param {number} targetCpm 目标 CPM
+ * @param {(creator: string) => void} onOpenAssistant 打开某位达人的「近期表现助手」
  */
-function buildRadarColumns(targetCpm) {
+function buildRadarColumns(targetCpm, onOpenAssistant) {
   return [
-    { title: '达人名称', dataIndex: 'creator', width: 120, ellipsis: true },
+    {
+      title: '达人名称 / 近期表现',
+      dataIndex: 'creator',
+      width: 140,
+      render: (value, record) => {
+        const snapshot = record.recent_snapshot
+        return (
+          <div style={{ minWidth: 0 }}>
+            <div style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {value}
+            </div>
+            <Popover
+              trigger="click"
+              placement="right"
+              title={`${value} · 近期表现`}
+              content={
+                <div style={{ width: 260 }}>
+                  {snapshot ? (
+                    <Space direction="vertical" size={2} style={{ display: 'flex' }}>
+                      <Typography.Text type="secondary">
+                        更新于：{snapshot.created_at || '-'}
+                      </Typography.Text>
+                      <Typography.Text>有效样本：{formatInteger(snapshot.valid_count)}</Typography.Text>
+                      {snapshot.stats_status === 'ok' ? (
+                        <>
+                          <Typography.Text>中位播放：{formatSnapshotStatusText(snapshot).split(' · ')[0]}</Typography.Text>
+                          <Typography.Text>
+                            典型区间（P25–P75）：{formatPlayRange(snapshot.p25_play, snapshot.p75_play)}
+                          </Typography.Text>
+                          <Typography.Text>
+                            趋势：{TREND_LABELS_FULL[snapshot.trend_label] || '样本不足'}
+                            {formatTrendRatio(snapshot.trend_ratio)
+                              ? `（${formatTrendRatio(snapshot.trend_ratio)}）`
+                              : ''}
+                          </Typography.Text>
+                        </>
+                      ) : (
+                        <Typography.Text type="warning">
+                          样本不足：建议补充更多近期作品截图
+                        </Typography.Text>
+                      )}
+                      <Typography.Text>
+                        星图价：
+                        {snapshot.xingtu_price === null || snapshot.xingtu_price === undefined
+                          ? '待确认 / 未识别'
+                          : `¥${formatInteger(snapshot.xingtu_price)}`}
+                      </Typography.Text>
+                      <Typography.Text type="secondary">
+                        统计口径：{snapshot.stats_version}
+                      </Typography.Text>
+                    </Space>
+                  ) : (
+                    <Typography.Text type="secondary">近期表现：尚未更新</Typography.Text>
+                  )}
+                  <div style={{ marginTop: 8 }}>
+                    <Button size="small" type="primary" onClick={() => onOpenAssistant?.(value)}>
+                      {snapshot ? '重新更新' : '更新近期表现'}
+                    </Button>
+                  </div>
+                </div>
+              }
+            >
+              <a style={{ ...SECONDARY_TEXT_STYLE, display: 'inline-block', maxWidth: '100%' }}>
+                {formatSnapshotStatusText(snapshot)}
+              </a>
+            </Popover>
+          </div>
+        )
+      }
+    },
     { title: '达人类型', dataIndex: 'creator_type', width: 84, ellipsis: true },
     {
       title: '历史合作次数',
@@ -72,7 +150,7 @@ function buildRadarColumns(targetCpm) {
     {
       title: '历史CPM中位数',
       dataIndex: 'median_cpm',
-      width: 92,
+      width: 84,
       align: 'right',
       render: (value) => (value === null || value === undefined ? PLACEHOLDER : formatCpm(value))
     },
@@ -104,7 +182,7 @@ function buildRadarColumns(targetCpm) {
     {
       title: '风险提示',
       key: 'recentRisk',
-      width: 96,
+      width: 88,
       render: (_, record) =>
         record.recent_risk ? (
           <Tooltip
@@ -129,6 +207,8 @@ export default function RepurchaseRadar() {
   const [radar, setRadar] = useState(null)
   // 近期表现助手（V3-alpha P2A）：只生成前端确认草稿，不写数据库
   const [assistantOpen, setAssistantOpen] = useState(false)
+  // P2B：助手绑定的雷达达人（从行内入口进入时固定；header 入口为空需用户选择）
+  const [assistantCreator, setAssistantCreator] = useState(null)
   const [confirmedDraft, setConfirmedDraft] = useState(null)
 
   const loadRadar = useCallback(async () => {
@@ -152,7 +232,12 @@ export default function RepurchaseRadar() {
   const summary = radar?.summary
   const targetCpm = radar?.target_cpm
   const groups = radar?.groups || []
-  const columns = buildRadarColumns(targetCpm ?? 30)
+  const creatorOptions = groups.flatMap((group) => group.creators.map((item) => item.creator))
+  const openAssistant = (creatorName) => {
+    setAssistantCreator(creatorName || null)
+    setAssistantOpen(true)
+  }
+  const columns = buildRadarColumns(targetCpm ?? 30, openAssistant)
   const statisticCardStyle = { height: '100%', minHeight: 96 }
 
   return (
@@ -179,7 +264,7 @@ export default function RepurchaseRadar() {
             </Typography.Text>
           </Space>
           <Space wrap>
-            <Button onClick={() => setAssistantOpen(true)}>更新近期表现</Button>
+            <Button onClick={() => openAssistant(null)}>更新近期表现</Button>
             <Button icon={<ReloadOutlined />} onClick={loadRadar} loading={loading}>
               刷新
             </Button>
@@ -203,8 +288,14 @@ export default function RepurchaseRadar() {
 
       <RecentPerformanceAssistantModal
         open={assistantOpen}
+        creator={assistantCreator}
+        creatorOptions={creatorOptions}
         onCancel={() => setAssistantOpen(false)}
         onConfirmed={(draft) => setConfirmedDraft(draft)}
+        onSaved={() => {
+          // 保存成功后单次重拉雷达，让对应达人立即显示最新快照（含 recent_snapshot summary）
+          loadRadar()
+        }}
       />
 
       {loadError && (

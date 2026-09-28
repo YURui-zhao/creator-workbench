@@ -76,6 +76,42 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_import_batches_created_at ON import_batches(created_at);
   CREATE INDEX IF NOT EXISTS idx_import_batch_records_batch ON import_batch_records(batch_id);
   CREATE INDEX IF NOT EXISTS idx_import_batch_items_batch ON import_batch_items(batch_id);
+
+  -- V3-alpha P2B：达人近期表现快照（append-only，只保存人工确认后的结构化数据）
+  -- 说明：
+  --   · 不保存原截图 / base64 / 图片路径 / API Key / provider 原始响应 / prompt 全文
+  --   · 只允许新增，不提供覆盖更新（历史快照需要可追溯「当时看到的近期状态」）
+  --   · plays_json 保留每条人工确认后的 raw_text / normalized_play / excluded / source_image_index / position_index / needs_review
+  --   · stats_version 记录当时采用的统计口径（去极值规则 / quantile 算法 / trend 阈值）
+  CREATE TABLE IF NOT EXISTS creator_recent_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    creator TEXT NOT NULL,
+    recognized_creator_name_raw TEXT,
+    source_type TEXT NOT NULL DEFAULT 'screenshot',
+    xingtu_price_raw TEXT,
+    xingtu_price REAL,
+    plays_json TEXT NOT NULL,
+    recognized_count INTEGER NOT NULL DEFAULT 0,
+    valid_count INTEGER NOT NULL DEFAULT 0,
+    excluded_count INTEGER NOT NULL DEFAULT 0,
+    unresolved_count INTEGER NOT NULL DEFAULT 0,
+    analysis_count INTEGER NOT NULL DEFAULT 0,
+    median_play REAL,
+    p25_play REAL,
+    p75_play REAL,
+    recent_median_play REAL,
+    prior_median_play REAL,
+    trend_ratio REAL,
+    -- 每一列都显式声明类型，不依赖「逗号前共享类型」写法：
+    -- 否则 SQLite 会把未声明类型的列当成无类型（NUMERIC 亲和性）列，schema 容易悄悄退化
+    trend_label TEXT NOT NULL,
+    stats_status TEXT NOT NULL,
+    stats_version TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_recent_snapshots_creator_created
+    ON creator_recent_snapshots(creator, created_at);
 `)
 
 // 首次启动写入示例项目（前端工作台展示用）

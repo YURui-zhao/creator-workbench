@@ -110,10 +110,15 @@ export function setPlayExcluded(draft, playId, excluded) {
 export function summarizeDraft(draft) {
   const plays = Array.isArray(draft?.plays) ? draft.plays : []
   const excludedCount = plays.filter((play) => play.excluded).length
+  // 与后端「有效样本」定义保持一致：未排除 且 可确定性解析（normalized_play !== null）
+  const unresolvedCount = plays.filter(
+    (play) => !play.excluded && (play.normalized_play === null || play.normalized_play === undefined)
+  ).length
   return {
     identified_count: plays.length,
     excluded_count: excludedCount,
-    valid_count: plays.length - excludedCount,
+    unresolved_count: unresolvedCount,
+    valid_count: plays.length - excludedCount - unresolvedCount,
     needs_review_count: plays.filter((play) => play.needs_review && !play.excluded).length,
     xingtu_price: draft?.xingtu_price ?? null
   }

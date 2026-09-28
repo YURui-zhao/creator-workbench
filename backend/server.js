@@ -7,6 +7,7 @@ import db from './db.js'
 import aiRouter from './routes/ai.js'
 import cyclesRouter from './routes/cycles.js'
 import importBatchesRouter from './routes/importBatches.js'
+import recentSnapshotsRouter from './routes/recentSnapshots.js'
 import recordsRouter from './routes/records.js'
 import projectsRouter from './routes/projects.js'
 import statsRouter from './routes/stats.js'
@@ -55,6 +56,7 @@ app.get('/api/health', (req, res) => {
 app.use('/api/ai', aiRouter)
 app.use('/api/cycles', cyclesRouter)
 app.use('/api/import', importBatchesRouter)
+app.use('/api/recent-snapshots', recentSnapshotsRouter)
 app.use('/api/records', recordsRouter)
 app.use('/api/projects', projectsRouter)
 app.use('/api/stats', statsRouter)

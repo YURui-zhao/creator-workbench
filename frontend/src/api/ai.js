@@ -59,3 +59,20 @@ export function suggestFieldMappingsAI(columns) {
     { timeout: 60000, headers: buildAiHeaders() }
   )
 }
+
+/**
+ * 近期表现助手（V3-alpha P2A）：截图 -> 可见事实
+ * 入参：images = [{ mime, base64 }]（1~3 张，png/jpg/jpeg/webp；前端已完成缩放压缩）
+ * 返回：{ code, data: { provider, model, creator_name_raw, xingtu_price_raw, xingtu_price, plays, warnings } }
+ * 说明：
+ * - 只允许在用户显式点击「开始 AI 识别」后调用，选择/粘贴图片本身绝不触发
+ * - 图片识别模型由后端固定（visionModel），前端不传 x-ai-model，也不允许编辑
+ * - 图片不会作为业务记录长期保存：后端不落盘、不入库、不记录图片正文
+ */
+export function extractCreatorScreenshot(images) {
+  return request.post(
+    '/ai/extract-creator-screenshot',
+    { images },
+    { timeout: 60000, headers: buildAiHeaders() }
+  )
+}

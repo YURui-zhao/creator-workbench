@@ -18,6 +18,7 @@ import { ReloadOutlined } from '@ant-design/icons'
 import { getRepurchaseRadar } from '../../api/records'
 import { getErrorMessage } from '../../utils/request'
 import { formatCpm, formatInteger } from '../../utils/format'
+import RecentPerformanceAssistantModal from '../../components/RecentPerformanceAssistantModal'
 
 // 历史状态 -> 展示文案（文字为主，颜色仅辅助，不依赖颜色理解）
 const STATUS_META = {
@@ -126,6 +127,9 @@ export default function RepurchaseRadar() {
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
   const [radar, setRadar] = useState(null)
+  // 近期表现助手（V3-alpha P2A）：只生成前端确认草稿，不写数据库
+  const [assistantOpen, setAssistantOpen] = useState(false)
+  const [confirmedDraft, setConfirmedDraft] = useState(null)
 
   const loadRadar = useCallback(async () => {
     setLoading(true)
@@ -174,11 +178,34 @@ export default function RepurchaseRadar() {
                 : ''}
             </Typography.Text>
           </Space>
-          <Button icon={<ReloadOutlined />} onClick={loadRadar} loading={loading}>
-            刷新
-          </Button>
+          <Space wrap>
+            <Button onClick={() => setAssistantOpen(true)}>更新近期表现</Button>
+            <Button icon={<ReloadOutlined />} onClick={loadRadar} loading={loading}>
+              刷新
+            </Button>
+          </Space>
         </div>
+
+        {confirmedDraft && (
+          <Alert
+            type="success"
+            showIcon
+            style={{ marginTop: 12 }}
+            message={`已确认识别结果：${confirmedDraft.creator_name || '未命名达人'}${
+              confirmedDraft.xingtu_price === null ? '' : ` · 星图价 ¥${formatInteger(confirmedDraft.xingtu_price)}`
+            }`}
+            description={`识别作品 ${confirmedDraft.summary.identified_count} 条，有效 ${confirmedDraft.summary.valid_count} 条，排除 ${confirmedDraft.summary.excluded_count} 条。P2A 暂不写入数据库，也不参与历史雷达判定。`}
+            closable
+            onClose={() => setConfirmedDraft(null)}
+          />
+        )}
       </Card>
+
+      <RecentPerformanceAssistantModal
+        open={assistantOpen}
+        onCancel={() => setAssistantOpen(false)}
+        onConfirmed={(draft) => setConfirmedDraft(draft)}
+      />
 
       {loadError && (
         <Alert

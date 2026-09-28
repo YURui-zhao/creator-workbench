@@ -1,7 +1,9 @@
 import { Router } from 'express'
 import {
   callDeepSeek,
+  callProviderVision,
   DeepSeekError,
+  getVisionModel,
   isProviderConfigured,
   resolveProvider
 } from '../services/deepseek.js'
@@ -10,6 +12,7 @@ import {
   parseTimeCycleToWeekCode,
   weekToDateRange
 } from '../utils/dateCycle.js'
+import { parsePlayText, parsePriceText } from '../utils/screenshotValues.js'
 
 const router = Router()
 
@@ -466,12 +469,16 @@ export async function validateRecords(records, callFn = callDeepSeek, rules = []
 router.get('/status', (req, res) => {
   const providerInfo = resolveProvider(req.headers['x-ai-provider'])
   const available = isProviderConfigured(providerInfo.key)
+  const visionModel = getVisionModel(providerInfo.key)
   ok(res, {
     available,
     keySource: available ? 'environment' : 'none',
     provider: providerInfo.key,
     providerLabel: providerInfo.label,
     model: req.headers['x-ai-model'] || providerInfo.model,
+    // P2A：对外只报告后端固定的图片识别模型（不可由 x-ai-model 覆盖）
+    visionModel,
+    visionAvailable: Boolean(visionModel),
     msg: available
       ? '本地环境已配置'
       : `后端环境未配置 ${providerInfo.label} API Key`
@@ -633,6 +640,259 @@ router.post('/validate-records', async (req, res) => {
     }
     console.error('[ai] 智能校验异常')
     return fail(res, 500, 'AI 校验服务异常，请稍后重试')
+  }
+})
+
+// ============================================================
+// 近期表现助手（V3-alpha P2A）：截图 -> 可见事实
+// ------------------------------------------------------------
+// 边界（必须保持）：
+//   - 只在用户显式点击后调用；不自动上传、不重试
+//   - 图片只在内存中处理：不落盘、不入库、不写日志、不回显 base64
+//   - 模型固定取后端预设 visionModel（x-ai-model 不得覆盖），endpoint 固定官方地址
+//   - AI 只输出「看见什么」的 raw_text；数字换算由 backend/utils/screenshotValues.js 完成
+//   - AI 返回非法 JSON / 结构不符 → 直接识别失败，不做任何猜测式修复
+// ============================================================
+
+export const MAX_SCREENSHOT_COUNT = 3
+// 单图 base64 解码后上限 1.5MB；总数上限 3.2MB（与前端压缩目标一致，确保请求体落在 5mb JSON limit 内）
+export const MAX_SCREENSHOT_BYTES = 1572864
+export const MAX_SCREENSHOT_TOTAL_BYTES = 3355400
+// 单张截图最多采纳的作品条目（防止模型异常返回超长数组；截断会显式告知前端）
+export const MAX_RECOGNIZED_PLAYS = 60
+export const ALLOWED_SCREENSHOT_MIMES = ['image/png', 'image/jpeg', 'image/webp']
+
+const SCREENSHOT_MIME_ALIASES = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+  'image/jpg': 'image/jpeg'
+}
+
+/** 归一化图片 MIME（仅允许 png / jpg / jpeg / webp），非法返回 null */
+export function normalizeScreenshotMime(raw) {
+  const text = String(raw ?? '').trim().toLowerCase()
+  if (!text) return null
+  const mime = SCREENSHOT_MIME_ALIASES[text] || text
+  return ALLOWED_SCREENSHOT_MIMES.includes(mime) ? mime : null
+}
+
+/** 去掉可能存在的 data URL 前缀（前端正常只发纯 base64，这里做防御式兼容） */
+export function stripBase64Prefix(value) {
+  return String(value ?? '').trim().replace(/^data:image\/[a-z0-9.+-]+;base64,/i, '')
+}
+
+/**
+ * base64 解码并返回真实字节数（不信任前端声明的体积）
+ * 非法 base64 返回 null
+ */
+export function decodeScreenshotBase64(base64) {
+  const text = stripBase64Prefix(base64)
+  if (!text) return null
+  if (text.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(text)) return null
+  const buffer = Buffer.from(text, 'base64')
+  // 反向校验：非法字符被 Buffer 静默丢弃时会不一致
+  if (buffer.length === 0 || buffer.toString('base64').replace(/=+$/, '') !== text.replace(/=+$/, '')) {
+    return null
+  }
+  return buffer.length
+}
+
+/**
+ * 校验并归一化请求里的图片数组
+ * @returns {{ ok: true, images: Array<{mime: string, base64: string, bytes: number}> } | { ok: false, message: string }}
+ */
+export function validateScreenshotPayload(rawImages) {
+  if (!Array.isArray(rawImages) || rawImages.length === 0) {
+    return { ok: false, message: '请至少选择 1 张截图' }
+  }
+  if (rawImages.length > MAX_SCREENSHOT_COUNT) {
+    return { ok: false, message: `单次最多识别 ${MAX_SCREENSHOT_COUNT} 张截图` }
+  }
+
+  const images = []
+  let totalBytes = 0
+  for (let index = 0; index < rawImages.length; index += 1) {
+    const item = rawImages[index] || {}
+    const mime = normalizeScreenshotMime(item.mime)
+    if (!mime) {
+      return {
+        ok: false,
+        message: `第 ${index + 1} 张截图格式不支持（仅支持 png / jpg / jpeg / webp）`
+      }
+    }
+    const base64 = stripBase64Prefix(item.base64)
+    const bytes = decodeScreenshotBase64(base64)
+    if (bytes === null) {
+      return { ok: false, message: `第 ${index + 1} 张截图内容不是合法图片数据` }
+    }
+    if (bytes > MAX_SCREENSHOT_BYTES) {
+      return {
+        ok: false,
+        message: `第 ${index + 1} 张截图超过单图上限（1.5MB），请压缩后重试`
+      }
+    }
+    totalBytes += bytes
+    if (totalBytes > MAX_SCREENSHOT_TOTAL_BYTES) {
+      return { ok: false, message: '截图总体积超过上限（3.2MB），请减少张数或压缩后重试' }
+    }
+    images.push({ mime, base64, bytes })
+  }
+  return { ok: true, images }
+}
+
+/** P2A 系统提示词：只允许输出可见事实，禁止换算、禁止猜测、禁止去重、禁止补足 */
+export function buildScreenshotSystemPrompt() {
+  return `
+你是截图信息提取助手，服务于「达人投放工作台」。用户会按顺序提供 1~3 张达人主页 / 星图截图（第 1 张即 source_image_index=1）。
+
+你只负责「看见什么」，不负责任何计算、估价、判断或补全。
+
+必须遵守：
+1. 只输出一个严格 JSON 对象，不要输出任何解释、Markdown 代码块或多余文字。
+2. 输出结构固定为：
+{"creator_name_raw": string|null, "xingtu_price_raw": string|null, "plays": [{"source_image_index": number, "position_index": number, "raw_text": string}], "warnings": [string]}
+3. raw_text 必须逐字保留截图上的原始写法（例如 "5.2万"、"1.3w"、"12K"），绝对不要换算成数字，也不要补充单位或格式化。
+4. 不允许猜测：看不清、被遮挡、无法确定的字段输出 null，并在 warnings 里说明。
+5. plays 按「图片顺序 + 图片内从上到下的视觉顺序」逐条输出：
+   - source_image_index 为该条目所在截图的编号（第 1 张为 1）；
+   - position_index 为该条目在该张截图内的 1-based 顺序；
+   - 不要跨图片去重（多张截图可能包含同一作品，也要分别保留）；
+   - 不要为了凑数量补足任何条目（识别到多少就输出多少）。
+6. 不要输出发布日期、播放时间、点赞数、粉丝数等本次没有要求的内容；不要推测任何日期。
+7. 如果整张截图都无法识别出有效信息，输出空的 plays 数组并在 warnings 中说明。
+
+输出示例：
+{"creator_name_raw":"Gary","xingtu_price_raw":"¥3,000","plays":[{"source_image_index":1,"position_index":1,"raw_text":"5.2万"},{"source_image_index":1,"position_index":2,"raw_text":"12K"}],"warnings":[]}
+`
+}
+
+/** P2A 用户指令（只描述任务，不含任何图片正文） */
+export function buildScreenshotUserText(imageCount) {
+  return `共 ${imageCount} 张截图，按顺序编号为 1~${imageCount}。请提取：达人昵称（creator_name_raw）、星图刊例价（xingtu_price_raw）、以及每张截图里可见的作品播放量（plays）。`
+}
+
+/** 从 AI 返回文本中解析出结构化「可见事实」，非法 JSON / 结构不符直接抛错，不做猜测修复 */
+export function parseCreatorScreenshotResult(content) {
+  let parsed
+  try {
+    parsed = parseAiResult(content)
+  } catch {
+    throw new DeepSeekError('AI 返回内容不是合法 JSON，识别失败（不会自动猜测补全），请重试或改用手工填写', 502)
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new DeepSeekError('AI 返回结构不符合要求，识别失败（不会自动猜测补全）', 502)
+  }
+  if (!Array.isArray(parsed.plays)) {
+    throw new DeepSeekError('AI 返回结构缺少 plays 数组，识别失败（不会自动猜测补全）', 502)
+  }
+
+  const toRawText = (value) => {
+    if (value === null || value === undefined) return null
+    const text = String(value).trim()
+    return text === '' ? null : text
+  }
+  const toPositiveIndex = (value) => {
+    const num = Number(value)
+    return Number.isInteger(num) && num > 0 ? num : null
+  }
+
+  const priceRaw = toRawText(parsed.xingtu_price_raw)
+  const price = parsePriceText(priceRaw)
+
+  const rawPlays = parsed.plays.slice(0, MAX_RECOGNIZED_PLAYS)
+  const plays = rawPlays.map((item, index) => {
+    const rawText = toRawText(item?.raw_text)
+    const normalized = parsePlayText(rawText)
+    return {
+      source_image_index: toPositiveIndex(item?.source_image_index),
+      // position_index 缺失时回退为「返回顺序」，只用于展示排序，不代表 AI 推断出的真实发布时间
+      position_index: toPositiveIndex(item?.position_index) ?? index + 1,
+      raw_text: normalized.raw_text,
+      normalized_play: normalized.value,
+      needs_review: normalized.needs_review,
+      reason: normalized.reason
+    }
+  })
+
+  const warnings = (Array.isArray(parsed.warnings) ? parsed.warnings : [])
+    .map((item) => (typeof item === 'string' ? item.trim() : ''))
+    .filter(Boolean)
+    .slice(0, 20)
+  if (parsed.plays.length > MAX_RECOGNIZED_PLAYS) {
+    warnings.push(`AI 返回的作品条目超过 ${MAX_RECOGNIZED_PLAYS} 条，已截断，请人工核对`)
+  }
+
+  return {
+    creator_name_raw: toRawText(parsed.creator_name_raw),
+    xingtu_price_raw: priceRaw,
+    xingtu_price: price.value,
+    xingtu_price_needs_review: price.needs_review,
+    xingtu_price_reason: price.reason,
+    plays,
+    warnings,
+    recognized_count: plays.length,
+    truncated: parsed.plays.length > MAX_RECOGNIZED_PLAYS
+  }
+}
+
+/**
+ * 执行截图识别（可注入 callFn，便于测试完全离线）
+ * @param {Array<{mime: string, base64: string}>} images 已经过校验的图片
+ * @param {Function} [callFn] 默认 callProviderVision
+ * @param {{ provider?: string, apiKey?: string }} [options]
+ */
+export async function extractCreatorScreenshot(images, callFn = callProviderVision, options = {}) {
+  const provider = resolveProvider(options.provider).key
+  const content = await callFn({
+    systemPrompt: buildScreenshotSystemPrompt(),
+    userText: buildScreenshotUserText(images.length),
+    images,
+    provider,
+    apiKey: options.apiKey
+  })
+  const result = parseCreatorScreenshotResult(content)
+  return {
+    provider,
+    // 对外只报告真正使用的固定 vision 模型；x-ai-model 不会影响它
+    model: getVisionModel(provider),
+    ...result
+  }
+}
+
+/**
+ * POST /api/ai/extract-creator-screenshot
+ * 入参：{ images: [{ mime, base64 }] }（1~3 张，png/jpg/jpeg/webp）
+ * 出参：AI 只返回可见事实（raw_text）+ 确定性换算结果；不落盘、不入库、不记录图片正文
+ */
+router.post('/extract-creator-screenshot', async (req, res) => {
+  const body = req.body && !Array.isArray(req.body) ? req.body : {}
+  const validated = validateScreenshotPayload(body.images)
+  if (!validated.ok) return fail(res, 400, validated.message)
+
+  const provider = resolveProvider(req.headers['x-ai-provider']).key
+  if (!getVisionModel(provider)) {
+    return fail(
+      res,
+      400,
+      `${resolveProvider(provider).label} 暂未开放图片识别（P2A 仅支持 DeepSeek Vision），请在右上角「AI配置」中切换到 DeepSeek`
+    )
+  }
+
+  try {
+    // 注意：这里不传 x-ai-model —— 图片识别模型固定由后端预设提供
+    const result = await extractCreatorScreenshot(validated.images, callProviderVision, {
+      provider,
+      apiKey: req.headers['x-ai-api-key']
+    })
+    ok(res, result)
+  } catch (err) {
+    if (err instanceof DeepSeekError || err.isDeepSeekError) {
+      return fail(res, err.status || 502, err.message)
+    }
+    console.error('[ai] 截图识别异常')
+    return fail(res, 500, 'AI 截图识别服务异常，请稍后重试')
   }
 })
 

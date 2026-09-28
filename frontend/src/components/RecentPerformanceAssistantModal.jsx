@@ -1,0 +1,571 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  Alert,
+  Button,
+  Divider,
+  Empty,
+  Input,
+  Modal,
+  Space,
+  Spin,
+  Tag,
+  Tooltip,
+  Typography,
+  message
+} from 'antd'
+import {
+  DeleteOutlined,
+  FileImageOutlined,
+  InboxOutlined,
+  ReloadOutlined,
+  SendOutlined
+} from '@ant-design/icons'
+import { extractCreatorScreenshot, getAiStatus } from '../api/ai'
+import { getAiConfig } from '../utils/aiConfig.js'
+import { getErrorMessage } from '../utils/request'
+import { formatInteger } from '../utils/format'
+import {
+  IMAGE_ACCEPT_ATTR,
+  MAX_IMAGE_BYTES,
+  MAX_SCREENSHOT_COUNT,
+  formatBytes,
+  prepareImageFile,
+  releasePreview,
+  validateSelection,
+  validateTotalBytes
+} from '../utils/screenshotImage.js'
+import {
+  buildConfirmedDraft,
+  buildDraftFromExtraction,
+  summarizeDraft,
+  togglePlayExcluded,
+  updateCreatorName,
+  updatePlayRawText,
+  updatePriceRawText
+} from '../utils/recentPerformanceDraft.js'
+
+const SEND_NOTICE =
+  '将向当前配置的 AI 服务发送所选截图，用于识别：达人昵称、星图刊例价、作品播放量。原图不会作为业务记录长期保存。'
+const ORDER_NOTICE =
+  '请确认作品顺序是否为从新到旧；如截图包含置顶或重复作品，可排除对应项。'
+
+/**
+ * 近期表现助手（V3-alpha P2A）
+ * - 选择 / 拖拽 / 粘贴截图后只在本地预览，绝不自动上传
+ * - 只有用户显式点击「开始 AI 识别」才会向 AI 发送截图
+ * - AI 只返回可见事实；数值由确定性解析器换算，用户可逐条修改 / 排除
+ * - 确认识别结果只在生成前端草稿，P2A 不写数据库、不估值、不给复投建议
+ */
+export default function RecentPerformanceAssistantModal({ open, onCancel, onConfirmed }) {
+  const [images, setImages] = useState([])
+  const [preparing, setPreparing] = useState(false)
+  const [prepareError, setPrepareError] = useState('')
+  const [aiLoading, setAiLoading] = useState(false)
+  const [aiError, setAiError] = useState('')
+  const [draft, setDraft] = useState(null)
+  const [confirmed, setConfirmed] = useState(null)
+  const [aiStatus, setAiStatus] = useState({ checked: false, available: false, visionModel: null, visionAvailable: false, providerLabel: '' })
+  const [dragging, setDragging] = useState(false)
+  const inputRef = useRef(null)
+  // 并发保护：识别进行中禁止重复点击（同一次请求不会被叠加）
+  const aiInFlightRef = useRef(false)
+
+  // 打开时读取 AI 状态（只查后端环境变量与固定 vision 模型，不发送 Key/图片）
+  useEffect(() => {
+    if (!open) return
+    let active = true
+    getAiStatus()
+      .then((res) => {
+        if (!active) return
+        setAiStatus({
+          checked: true,
+          available: Boolean(res?.data?.available),
+          providerLabel: res?.data?.providerLabel || '',
+          visionModel: res?.data?.visionModel || null,
+          visionAvailable: Boolean(res?.data?.visionAvailable)
+        })
+      })
+      .catch(() => {
+        if (active) {
+          setAiStatus({ checked: true, available: false, providerLabel: '', visionModel: null, visionAvailable: false })
+        }
+      })
+    return () => {
+      active = false
+    }
+  }, [open])
+
+  const resetAll = useCallback(() => {
+    setImages((list) => {
+      list.forEach(releasePreview)
+      return []
+    })
+    setPreparing(false)
+    setPrepareError('')
+    setAiError('')
+    setAiLoading(false)
+    setDraft(null)
+    setConfirmed(null)
+    aiInFlightRef.current = false
+  }, [])
+
+  const handleClose = () => {
+    if (aiLoading) return
+    resetAll()
+    onCancel?.()
+  }
+
+  const totalBytes = useMemo(
+    () => images.reduce((sum, image) => sum + (image.bytes || 0), 0),
+    [images]
+  )
+
+  // 添加图片：只做本地校验 + 本地压缩 + 预览；绝不触发 AI
+  const addFiles = useCallback(
+    async (fileList) => {
+      const files = Array.from(fileList || [])
+      if (!files.length) return
+      setPrepareError('')
+      let currentCount = 0
+      setImages((list) => {
+        currentCount = list.length
+        return list
+      })
+      const countCheck = validateSelection(files.length, currentCount)
+      if (!countCheck.ok) {
+        setPrepareError(countCheck.reason)
+        return
+      }
+
+      setPreparing(true)
+      const accepted = []
+      let failure = ''
+      for (const file of files) {
+        const result = await prepareImageFile(file)
+        if (!result.ok) {
+          failure = result.reason
+          break
+        }
+        if (result.image.oversize) {
+          releasePreview(result.image)
+          failure = `${file.name || '图片'} 压缩后仍超过 ${formatBytes(MAX_IMAGE_BYTES)}，请先裁剪或降低分辨率`
+          break
+        }
+        accepted.push(result.image)
+      }
+      setPreparing(false)
+
+      if (failure) {
+        accepted.forEach(releasePreview)
+        setPrepareError(failure)
+        return
+      }
+      setImages((list) => {
+        const next = [...list, ...accepted]
+        const totalCheck = validateTotalBytes(next.reduce((sum, image) => sum + (image.bytes || 0), 0))
+        if (!totalCheck.ok) {
+          setPrepareError(totalCheck.reason)
+          accepted.forEach(releasePreview)
+          return list
+        }
+        return next
+      })
+      // 图片变化后，之前的识别结果不再对应当前截图
+      setDraft(null)
+      setConfirmed(null)
+      setAiError('')
+    },
+    []
+  )
+
+  // 粘贴截图（Ctrl/Cmd + V）：仍然只在本地预览
+  useEffect(() => {
+    if (!open) return undefined
+    const handlePaste = (event) => {
+      const items = event.clipboardData?.items
+      if (!items) return
+      const files = []
+      for (const item of items) {
+        if (item.kind === 'file' && String(item.type || '').startsWith('image/')) {
+          const file = item.getAsFile()
+          if (file) files.push(file)
+        }
+      }
+      if (files.length) {
+        event.preventDefault()
+        addFiles(files)
+      }
+    }
+    document.addEventListener('paste', handlePaste)
+    return () => document.removeEventListener('paste', handlePaste)
+  }, [open, addFiles])
+
+  const removeImage = (image) => {
+    releasePreview(image)
+    setImages((list) => list.filter((item) => item.id !== image.id))
+    setDraft(null)
+    setConfirmed(null)
+    setAiError('')
+  }
+
+  const sessionKeyReady = Boolean(getAiConfig()?.apiKey)
+  const canStart = images.length > 0 && !preparing && !aiLoading
+
+  // 唯一的 AI 触发点：必须由用户显式点击
+  const handleStartRecognition = async () => {
+    if (aiInFlightRef.current || aiLoading) return
+    if (!images.length) {
+      message.warning('请先选择或粘贴 1~3 张截图')
+      return
+    }
+    if (!sessionKeyReady && !aiStatus.available) {
+      setAiError('未检测到可用的 AI 配置：请先在右上角「AI配置」中填写 DeepSeek API Key（或由后端环境变量提供）后再识别。')
+      return
+    }
+    if (!aiStatus.visionAvailable) {
+      setAiError('当前 AI 服务商暂未开放图片识别（P2A 仅支持 DeepSeek Vision），请在右上角「AI配置」中切换到 DeepSeek。')
+      return
+    }
+
+    aiInFlightRef.current = true
+    setAiLoading(true)
+    setAiError('')
+    setConfirmed(null)
+    try {
+      const res = await extractCreatorScreenshot(images.map((image) => ({ mime: image.mime, base64: image.base64 })))
+      setDraft(buildDraftFromExtraction(res?.data || {}))
+    } catch (error) {
+      // 识别失败：保留已选截图与人工修改，只提示失败原因
+      setAiError(getErrorMessage(error, 'AI 识别失败，请重试（截图与已修改内容均已保留）'))
+    } finally {
+      aiInFlightRef.current = false
+      setAiLoading(false)
+    }
+  }
+
+  const handleConfirm = () => {
+    if (!draft) return
+    const result = buildConfirmedDraft(draft)
+    setConfirmed(result)
+    onConfirmed?.(result)
+    message.success('已确认识别结果（P2A 暂不写入数据库）')
+  }
+
+  const summary = draft ? summarizeDraft(draft) : null
+
+  return (
+    <Modal
+      title="近期表现助手"
+      open={open}
+      onCancel={handleClose}
+      width={860}
+      maskClosable={!aiLoading}
+      footer={null}
+      destroyOnClose
+    >
+      <Space direction="vertical" size="middle" style={{ display: 'flex' }}>
+        <Typography.Text type="secondary">
+          粘贴 / 上传达人主页或星图截图，AI 只负责识别截图上的可见信息（昵称、星图刊例价、作品播放量），
+          数值换算与判断由系统确定性地完成，识别结果必须经你确认。P2A 阶段暂不写入数据库。
+        </Typography.Text>
+
+        <Alert type="info" showIcon message="发送范围" description={SEND_NOTICE} />
+
+        {/* 上传区：点击 / 拖拽 / 粘贴 */}
+        <div
+          onDragOver={(event) => {
+            event.preventDefault()
+            setDragging(true)
+          }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={(event) => {
+            event.preventDefault()
+            setDragging(false)
+            addFiles(event.dataTransfer?.files)
+          }}
+          style={{
+            border: `1px dashed ${dragging ? '#1677ff' : '#d9d9d9'}`,
+            background: dragging ? '#f0f7ff' : '#fafafa',
+            borderRadius: 8,
+            padding: '18px 16px',
+            textAlign: 'center',
+            cursor: 'pointer'
+          }}
+          onClick={() => inputRef.current?.click()}
+        >
+          <p style={{ margin: 0, fontSize: 22 }}>
+            <InboxOutlined />
+          </p>
+          <p style={{ margin: '6px 0 0' }}>点击选择图片，或拖拽图片到此处，也可直接 Ctrl / Cmd + V 粘贴截图</p>
+          <Typography.Text type="secondary">
+            仅支持 png / jpg / jpeg / webp，最多 {MAX_SCREENSHOT_COUNT} 张；单张处理后 ≤ 1.5MB，总发送体积 ≤ 3.2MB，
+            长边自动缩放到 2000px 以内（只缩小不放大）
+          </Typography.Text>
+          <input
+            ref={inputRef}
+            type="file"
+            accept={IMAGE_ACCEPT_ATTR}
+            multiple
+            style={{ display: 'none' }}
+            onChange={(event) => {
+              addFiles(event.target.files)
+              event.target.value = ''
+            }}
+          />
+        </div>
+
+        <Typography.Text type="secondary">
+          上传后不会自动发送，需点击下方的「开始 AI 识别」才会向 AI 发送截图。
+        </Typography.Text>
+
+        {prepareError && <Alert type="error" showIcon message={prepareError} />}
+
+        {preparing && <Spin size="small" tip="正在本地压缩图片..." />}
+
+        {images.length > 0 && (
+          <div>
+            <Space size={8} wrap>
+              <Typography.Text strong>已选择 {images.length} 张截图</Typography.Text>
+              <Typography.Text type="secondary">合计 {formatBytes(totalBytes)}</Typography.Text>
+            </Space>
+            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginTop: 8 }}>
+              {images.map((image, index) => (
+                <div
+                  key={image.id}
+                  style={{ border: '1px solid #f0f0f0', borderRadius: 8, padding: 8, width: 180 }}
+                >
+                  <img
+                    src={image.previewUrl}
+                    alt={image.name}
+                    style={{ width: '100%', height: 96, objectFit: 'cover', borderRadius: 6, background: '#fafafa' }}
+                  />
+                  <div style={{ marginTop: 6, fontSize: 12 }} title={image.name}>
+                    <FileImageOutlined /> 图 {index + 1} · {formatBytes(image.bytes)}
+                  </div>
+                  <div style={{ fontSize: 12, color: 'rgba(0,0,0,0.45)' }}>
+                    {image.width}×{image.height}
+                  </div>
+                  <Button
+                    size="small"
+                    type="link"
+                    danger
+                    icon={<DeleteOutlined />}
+                    disabled={aiLoading}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      removeImage(image)
+                    }}
+                  >
+                    移除
+                  </Button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <Space size={12} wrap>
+          <Tooltip
+            title={
+              aiStatus.visionAvailable
+                ? '图片识别模型由系统固定，不可编辑'
+                : '当前服务商暂未开放图片识别，请切换到 DeepSeek'
+            }
+          >
+            <Tag color={aiStatus.visionAvailable ? 'blue' : 'default'}>
+              图片识别模型：{aiStatus.visionModel || '未配置'}
+            </Tag>
+          </Tooltip>
+          <Typography.Text type="secondary">
+            {sessionKeyReady ? '已使用当前会话的 AI Key' : aiStatus.available ? '使用后端环境变量中的 AI Key' : '尚未配置 AI Key'}
+          </Typography.Text>
+        </Space>
+
+        {!sessionKeyReady && !aiStatus.available && aiStatus.checked && (
+          <Alert
+            type="warning"
+            showIcon
+            message="未检测到可用的 AI 配置"
+            description="请先在右上角「AI配置」中填写 DeepSeek API Key（或由后端环境变量提供）后再识别；系统不会自动调用 AI，也不会生成假的识别结果。"
+          />
+        )}
+
+        <Space size={12} wrap>
+          <Button
+            type="primary"
+            icon={<SendOutlined />}
+            disabled={!canStart}
+            loading={aiLoading}
+            onClick={handleStartRecognition}
+          >
+            开始 AI 识别
+          </Button>
+          {aiError && (
+            <Button
+              icon={<ReloadOutlined />}
+              disabled={!canStart}
+              onClick={handleStartRecognition}
+            >
+              重新识别
+            </Button>
+          )}
+          {images.length > 0 && (
+            <Button disabled={aiLoading} onClick={resetAll}>
+              清空重来
+            </Button>
+          )}
+        </Space>
+
+        {aiError && <Alert type="error" showIcon message={aiError} description="已保留当前截图与人工修改内容，可直接重试。" />}
+
+        {draft && (
+          <>
+            <Divider style={{ margin: '4px 0' }} />
+            <Typography.Title level={5} style={{ margin: 0 }}>
+              人工确认识别结果
+            </Typography.Title>
+            <Typography.Text type="secondary">
+              识别到 {summary.identified_count} 条作品（AI 识别到多少就展示多少，不会自动补足 15 条）；数值可修改，
+              无法确定性解析的条目请人工确认。{ORDER_NOTICE}
+            </Typography.Text>
+
+            {draft.warnings.length > 0 && (
+              <Alert
+                type="warning"
+                showIcon
+                message="AI 提示"
+                description={draft.warnings.map((item) => (
+                  <div key={item}>{item}</div>
+                ))}
+              />
+            )}
+
+            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+              <div>
+                <Typography.Text type="secondary">达人昵称</Typography.Text>
+                <Input
+                  value={draft.creator_name}
+                  placeholder="请核对达人昵称"
+                  style={{ width: 220 }}
+                  onChange={(event) => setDraft(updateCreatorName(draft, event.target.value))}
+                />
+              </div>
+              <div>
+                <Typography.Text type="secondary">星图刊例价（可修改原文，系统自动换算）</Typography.Text>
+                <div>
+                  <Input
+                    value={draft.xingtu_price_raw}
+                    placeholder="例如 ¥3,000"
+                    style={{ width: 180 }}
+                    onChange={(event) => setDraft(updatePriceRawText(draft, event.target.value))}
+                  />
+                  <Typography.Text strong style={{ marginLeft: 8 }}>
+                    {draft.xingtu_price === null ? '需人工确认' : `¥${formatInteger(draft.xingtu_price)}`}
+                  </Typography.Text>
+                  {draft.xingtu_price_needs_review && (
+                    <Tooltip title={draft.xingtu_price_reason || '无法确定性解析'}>
+                      <Tag color="warning" style={{ marginLeft: 8 }}>
+                        需人工确认
+                      </Tag>
+                    </Tooltip>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <Space size={8} wrap>
+                <Typography.Text strong>作品播放量</Typography.Text>
+                <Typography.Text type="secondary">
+                  编号 = 上传图片顺序 + 图片内从上到下顺序；修改原文后会立即重新换算
+                </Typography.Text>
+              </Space>
+              <div style={{ marginTop: 8 }}>
+                {draft.plays.length === 0 ? (
+                  <Empty description="本次没有识别到作品播放量（系统不会自动补足，可重新识别或手工填写）" />
+                ) : (
+                  draft.plays.map((play, index) => (
+                    <div
+                      key={play.id}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        flexWrap: 'wrap',
+                        padding: '6px 0',
+                        borderBottom: '1px solid #f5f5f5',
+                        opacity: play.excluded ? 0.55 : 1
+                      }}
+                    >
+                      <Typography.Text type="secondary" style={{ width: 24 }}>
+                        {String(index + 1).padStart(2, '0')}
+                      </Typography.Text>
+                      <Input
+                        size="small"
+                        value={play.raw_text ?? ''}
+                        placeholder="截图原文"
+                        style={{ width: 120 }}
+                        onChange={(event) => setDraft(updatePlayRawText(draft, play.id, event.target.value))}
+                      />
+                      <Typography.Text type="secondary">→</Typography.Text>
+                      <Typography.Text
+                        strong
+                        style={{ minWidth: 92, textDecoration: play.excluded ? 'line-through' : 'none' }}
+                      >
+                        {play.normalized_play === null ? '需人工确认' : formatInteger(play.normalized_play)}
+                      </Typography.Text>
+                      <Tag>{`图 ${play.source_image_index ?? '?'} · 第 ${play.position_index} 条`}</Tag>
+                      {play.needs_review && (
+                        <Tooltip title={play.reason || '无法确定性解析'}>
+                          <Tag color="warning">需人工确认</Tag>
+                        </Tooltip>
+                      )}
+                      {play.excluded && <Tag color="default">已排除</Tag>}
+                      <Button
+                        size="small"
+                        type="link"
+                        onClick={() => setDraft(togglePlayExcluded(draft, play.id))}
+                      >
+                        {play.excluded ? '恢复该条' : '排除该条'}
+                      </Button>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+              <Space size={16} wrap>
+                <Typography.Text>识别作品：{summary.identified_count}</Typography.Text>
+                <Typography.Text>有效作品：{summary.valid_count}</Typography.Text>
+                <Typography.Text>排除：{summary.excluded_count}</Typography.Text>
+                <Typography.Text>
+                  星图价：{summary.xingtu_price === null ? '需人工确认' : `¥${formatInteger(summary.xingtu_price)}`}
+                </Typography.Text>
+              </Space>
+              <Button type="primary" disabled={aiLoading} onClick={handleConfirm}>
+                确认识别结果
+              </Button>
+            </div>
+
+            {confirmed && (
+              <Alert
+                type="success"
+                showIcon
+                message="已生成确认草稿（P2A 到此结束）"
+                description="本次仅在前端形成确认结果，未写入数据库；不计算目标价、不做折扣与复投建议（进入 P2B/P3）。"
+              />
+            )}
+          </>
+        )}
+
+        <Divider style={{ margin: '4px 0' }} />
+        <div style={{ textAlign: 'right' }}>
+          <Button onClick={handleClose} disabled={aiLoading}>
+            关闭
+          </Button>
+        </div>
+      </Space>
+    </Modal>
+  )
+}

@@ -111,6 +111,11 @@ export default function AiConfigModal({ open, onCancel, onSaved, onDisconnected,
         <Typography.Text type="secondary">
           密钥仅保留在当前浏览器会话，刷新后仍可使用。接口地址由服务商固定；断开不会删除后端环境变量。
         </Typography.Text>
+        <div style={{ marginTop: 4 }}>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            这里的「模型」用于文本类 AI 任务（智能校验 / 字段映射 / 周期识别）；截图识别的图片模型由后端固定（DeepSeek：deepseek-flash），不在此处编辑。
+          </Typography.Text>
+        </div>
         <div style={{ marginTop: 16 }}>
           <Button danger onClick={handleDisconnect}>断开 AI</Button>
         </div>

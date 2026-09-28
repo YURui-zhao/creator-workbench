@@ -10,6 +10,9 @@ const PROVIDERS = {
     label: 'DeepSeek',
     endpoint: 'https://api.deepseek.com/v1/chat/completions',
     model: 'deepseek-chat',
+    // P2A：图片识别固定使用官方 vision 模型（deepseek-flash 官方文档明确支持 Vision）。
+    // 该字段只能由后端预设提供，请求头 x-ai-model 不得覆盖。
+    visionModel: 'deepseek-flash',
     apiKeyEnv: 'DEEPSEEK_API_KEY',
     supportsJsonMode: true // 支持 response_format: json_object
   },
@@ -18,6 +21,8 @@ const PROVIDERS = {
     label: '智谱 AI',
     endpoint: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
     model: 'glm-4-flash',
+    // P2A 第一版只实现 DeepSeek Vision；智谱视觉模型作为后续备选，因此这里显式置空
+    visionModel: null,
     apiKeyEnv: 'ZHIPU_API_KEY',
     supportsJsonMode: false // 提示词已要求严格 JSON，避免部分模型不支持该参数
   }
@@ -36,8 +41,17 @@ export function listProviders() {
   return Object.values(PROVIDERS).map((item) => ({
     key: item.key,
     label: item.label,
-    model: item.model
+    model: item.model,
+    visionModel: item.visionModel || null
   }))
+}
+
+/**
+ * 取服务商固定的图片识别模型（P2A）
+ * 只从后端预设读取，绝不接受请求头 / 参数覆盖；未开放 Vision 的服务商返回 null。
+ */
+export function getVisionModel(provider) {
+  return resolveProvider(provider).visionModel || null
 }
 
 // ---------- 只读调用日志（不改变任何调用逻辑） ----------
@@ -62,10 +76,21 @@ function redactKey(value, key) {
   return key ? text.split(String(key)).join('[REDACTED]') : text
 }
 
+/**
+ * 图片正文兜底脱敏（P2A）：任何进入日志 / 错误信息的文本都不得包含图片 base64。
+ * 先剥离 data URL 形态，再兜底剥离超长 base64 片段（含图片正文与其它大块编码）。
+ */
+function redactImagePayload(value) {
+  return String(value)
+    .replace(/data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+/gi, 'data:image/***;base64,[REDACTED]')
+    // 兜底：错误文本里出现 64 位以上的 base64 片段（图片正文或其片段）一律剥离
+    .replace(/[A-Za-z0-9+/]{64,}={0,2}/g, '[REDACTED_BASE64]')
+}
+
 function summarizeError(err, mapped, key) {
   const detail = err?.response?.data?.error?.message || err?.response?.data?.message
   const text = detail || mapped?.message || err?.message || '未知错误'
-  return redactKey(text, key)
+  return redactImagePayload(redactKey(text, key))
     .replace(/sk-[A-Za-z0-9_-]+/gi, 'sk-***')
     .replace(/\b[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{8,}\b/g, '***.***')
     .replace(/\*{2,}[A-Za-z0-9_-]*/g, '****')
@@ -156,6 +181,14 @@ function toDeepSeekError(err, providerLabel = PROVIDERS[DEFAULT_PROVIDER].label,
   }
   const status = err.response?.status
   const detail = err.response?.data?.error?.message || err.response?.data?.message
+  // 3xx：明确拒绝跟随重定向（请求携带 API Key 与可能的图片正文）。
+  // 只回显状态码，绝不回显 Location / provider 原始 body / Key / base64。
+  if (status >= 300 && status < 400) {
+    return new DeepSeekError(
+      `${providerLabel} 接口返回重定向（HTTP ${status}），已按安全策略拒绝跟随，请稍后重试或检查服务商配置`,
+      502
+    )
+  }
   if (status === 401 || status === 403) {
     return new DeepSeekError(
       `${providerLabel} API Key 无效或未授权，请在页面右上角「AI配置」中检查密钥（或后端环境变量）`,
@@ -168,7 +201,8 @@ function toDeepSeekError(err, providerLabel = PROVIDERS[DEFAULT_PROVIDER].label,
   if (status >= 500) {
     return new DeepSeekError(`${providerLabel} 服务异常（${status}），请稍后重试`)
   }
-  const detailText = detail ? `：${redactKey(detail, key)}` : ''
+  // 上游错误原文也必须脱敏：既不回显 Key，也不回显图片 base64
+  const detailText = detail ? `：${redactImagePayload(redactKey(detail, key)).slice(0, 200)}` : ''
   return new DeepSeekError(`${providerLabel} 接口调用失败${detailText}`, 502)
 }
 
@@ -183,9 +217,89 @@ export async function callDeepSeek(systemPrompt, userContent, options = {}) {
   const startedAt = Date.now()
   const { temperature = 0, maxTokens = 4096, apiKey, provider, model } = options
   const providerInfo = resolveProvider(provider)
-  const finalUrl = providerInfo.endpoint
   const finalModel = (model && String(model).trim()) || providerInfo.model
 
+  return sendChatCompletion({
+    providerInfo,
+    model: finalModel,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userContent }
+    ],
+    temperature,
+    maxTokens,
+    apiKey,
+    startedAt
+  })
+}
+
+/**
+ * P2A：图片识别调用（DeepSeek Vision）
+ * - 模型固定取服务商预设的 visionModel，绝不接受请求头 / 参数覆盖
+ * - 接口地址仍固定为服务商官方 endpoint；不接受 baseURL
+ * - 图片以 OpenAI 兼容的 content parts 发送（data URL 内联 base64），不落盘
+ * @param {Object} params
+ * @param {string} params.systemPrompt 系统提示词
+ * @param {string} params.userText 文字指令（不含图片正文）
+ * @param {Array<{mime: string, base64: string}>} params.images 已由路由层校验过的图片
+ * @param {string} [params.provider] 服务商（deepseek / zhipu）
+ * @param {string} [params.apiKey] 页面传入的 Key（缺省用环境变量）
+ * @returns {Promise<string>} 模型返回的文本内容
+ */
+export async function callProviderVision({
+  systemPrompt,
+  userText,
+  images = [],
+  provider,
+  apiKey,
+  maxTokens = 4096
+} = {}) {
+  const startedAt = Date.now()
+  const providerInfo = resolveProvider(provider)
+  const visionModel = providerInfo.visionModel
+  if (!visionModel) {
+    throw new DeepSeekError(
+      `${providerInfo.label} 暂未开放图片识别（P2A 仅支持 DeepSeek Vision），请在右上角「AI配置」中切换到 DeepSeek`,
+      400
+    )
+  }
+
+  const content = [{ type: 'text', text: String(userText ?? '') }]
+  for (const image of Array.isArray(images) ? images : []) {
+    const mime = String(image?.mime || '').trim()
+    const base64 = String(image?.base64 || '').trim()
+    if (!mime || !base64) continue
+    content.push({ type: 'image_url', image_url: { url: `data:${mime};base64,${base64}` } })
+  }
+
+  return sendChatCompletion({
+    providerInfo,
+    model: visionModel,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content }
+    ],
+    temperature: 0,
+    maxTokens,
+    apiKey,
+    startedAt
+  })
+}
+
+/**
+ * 统一的 chat/completions 发送（文本与图片共用）：固定 endpoint、脱敏日志、统一错误映射
+ */
+async function sendChatCompletion({
+  providerInfo,
+  model,
+  messages,
+  temperature = 0,
+  maxTokens = 4096,
+  apiKey,
+  startedAt
+}) {
+  const finalUrl = providerInfo.endpoint
+  const finalModel = model
   let finalKey
   try {
     finalKey = getApiKey(providerInfo.key, apiKey)
@@ -205,10 +319,7 @@ export async function callDeepSeek(systemPrompt, userContent, options = {}) {
 
   const payload = {
     model: finalModel,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userContent }
-    ],
+    messages,
     temperature,
     max_tokens: maxTokens,
     stream: false
@@ -224,7 +335,12 @@ export async function callDeepSeek(systemPrompt, userContent, options = {}) {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${finalKey}`
       },
-      timeout: TIMEOUT
+      timeout: TIMEOUT,
+      // 安全边界（不可移除）：绝不跟随 3xx 跳转。
+      // 请求携带 API Key（以及 Vision 场景下的图片正文），
+      // 一旦跟随重定向就可能把凭据/正文发给不受信地址。
+      // axios 在 maxRedirects === 0 时直接使用原生 http/https 传输层，不经过 follow-redirects。
+      maxRedirects: 0
     })
 
     const content = response.data?.choices?.[0]?.message?.content

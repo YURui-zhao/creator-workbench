@@ -6,6 +6,7 @@ import {
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   OrderedListOutlined,
+  RadarChartOutlined,
   TeamOutlined,
   UserOutlined
 } from '@ant-design/icons'
@@ -20,6 +21,7 @@ const { Header, Sider, Content } = Layout
 const MENU_ITEMS = [
   { key: 'dashboard', icon: <BarChartOutlined />, label: '数据看板' },
   { key: 'creators', icon: <TeamOutlined />, label: '达人汇总' },
+  { key: 'repurchase-radar', icon: <RadarChartOutlined />, label: '复投雷达' },
   { key: 'records', icon: <OrderedListOutlined />, label: '投放管理' },
   { key: 'import-history', icon: <HistoryOutlined />, label: '导入历史' }
 ]
@@ -28,6 +30,7 @@ const MENU_ITEMS = [
 const MENU_PATHS = {
   dashboard: '/dashboard',
   creators: '/creators',
+  'repurchase-radar': '/repurchase-radar',
   records: '/records',
   'import-history': '/import-history'
 }

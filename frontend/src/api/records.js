@@ -73,6 +73,16 @@ export function getRecordFilters() {
 }
 
 /**
+ * 复投雷达（V3-alpha P1，只读）
+ * 后端一次性返回分组结果（优先关注 / 需要观察 / 暂不优先）+ 顶部汇总，
+ * 前端不做业务聚合，只负责展示。
+ * @param {{ current_date?: string }} [params] current_date 仅后端测试模式使用，正常调用不传
+ */
+export function getRepurchaseRadar(params = {}) {
+  return request.get('/records/repurchase-radar', { params })
+}
+
+/**
  * 明细导出下载地址（后端生成 xlsx，参数与周度聚合一致）
  * @param {{ startWeek?: string, endWeek?: string, creatorTypes?: string[], nicknames?: string[], caliber?: string, type?: string }} params
  */

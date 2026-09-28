@@ -1514,6 +1514,285 @@ router.get('/creator-summary', (req, res) => {
   })
 })
 
+// ============================================================
+// 复投雷达（V3-alpha P1，只读）
+// ------------------------------------------------------------
+// 只复用 V2 已冻结的口径，不新增指标定义：
+//   - 单条「累计 CPM」= total_cost / 累计播放量(second_week_play) × 1000
+//   - 有效样本语义 = computePlayMetrics 的 hasLatest && !latestAnomaly，且 latest > 0
+//     （latest 未填写 = 未观察；latest < first = 异常；latest = 0 是真实观测但 CPM 无定义）
+//   - 达人身份：按 nickname 单键聚合（与 CreatorSummary 一致，不做 creator master）
+// 不写库、不调用 AI、不访问外部网络。
+// ============================================================
+
+// 目标 CPM：单次合作累计 CPM <= 目标值视为达标（P1 固定常量，不做可配置、不做综合评分）
+export const REPURCHASE_TARGET_CPM = 30
+
+// 历史状态（明确业务规则，不用平均值决胜、不用综合评分）
+const RADAR_STATUS = {
+  passed: 'passed', // 有效样本 >= 2 且 pass_count > fail_count
+  mixed: 'mixed', // 有效样本 >= 2 且 pass_count === fail_count
+  failed: 'failed', // 有效样本 >= 2 且 pass_count < fail_count
+  insufficient: 'insufficient' // 有效样本 0 或 1（唯一一次达标也不算历史通过）
+}
+
+const RADAR_STATUS_LABELS = {
+  passed: '历史通过',
+  mixed: '表现分化',
+  failed: '暂不优先',
+  insufficient: '证据不足'
+}
+
+// 分组顺序：优先关注 / 需要观察 / 暂不优先
+const RADAR_GROUPS = [
+  { key: 'priority', label: '优先关注', statuses: [RADAR_STATUS.passed] },
+  { key: 'watch', label: '需要观察', statuses: [RADAR_STATUS.mixed, RADAR_STATUS.insufficient] },
+  { key: 'low_priority', label: '暂不优先', statuses: [RADAR_STATUS.failed] }
+]
+
+/** 严格解析 YYYY-MM-DD（含真实日期校验），非法返回 null */
+function toDateOnly(value) {
+  const text = String(value ?? '').trim()
+  if (!DATE_RE.test(text)) return null
+  const [year, month, day] = text.split('-').map(Number)
+  const utc = new Date(Date.UTC(year, month - 1, day))
+  if (
+    utc.getUTCFullYear() !== year ||
+    utc.getUTCMonth() !== month - 1 ||
+    utc.getUTCDate() !== day
+  ) {
+    return null
+  }
+  return text
+}
+
+/** 服务端本地「今天」（YYYY-MM-DD），用于计算距上次合作天数 */
+function todayDateOnly(now = new Date()) {
+  const pad = (num) => String(num).padStart(2, '0')
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+}
+
+/** 两个 YYYY-MM-DD 之间的整天数（按 UTC 归一化，避免时区 / 夏令时导致 ±1 天） */
+function diffDays(fromDate, toDate) {
+  const toUtc = (text) => {
+    const [year, month, day] = text.split('-').map(Number)
+    return Date.UTC(year, month - 1, day)
+  }
+  return Math.round((toUtc(toDate) - toUtc(fromDate)) / 86400000)
+}
+
+/**
+ * 中位数（原始精度）：奇数取中间值，偶数取中间两项平均。
+ * 不做任何逐条四舍五入 —— 达标判断与中位数必须基于 raw CPM，
+ * 只在最终 API 输出 median_cpm 时 round2。
+ */
+function medianOfRaw(values = []) {
+  if (!values.length) return null
+  const sorted = [...values].sort((a, b) => a - b)
+  const mid = Math.floor(sorted.length / 2)
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
+}
+
+/**
+ * 单条记录的「累计 CPM」原始值（与前端 calcCpm / recordLatestPlay 同口径；无有效样本返回 null）
+ * - 返回未四舍五入的 raw CPM：达标判断（<= 目标值）与中位数一律基于 raw 值，
+ *   避免「先 round2 再判断」造成 30.004 被误判为达标这类边界失真
+ * - latest 未填写 / latest < first（异常）/ latest <= 0 → null（不是有效 CPM 样本）
+ */
+export function computeRecordLatestCpm(row = {}) {
+  const metrics = computePlayMetrics(row)
+  if (!metrics.hasLatest || metrics.latestAnomaly) return null
+  if (!(metrics.latest > 0)) return null
+  return (metrics.cost / metrics.latest) * 1000
+}
+
+/**
+ * 复投雷达（纯函数，便于单测）：按 nickname 聚合 → 单次达标判定 → 历史状态 → 中位数 → 分组排序
+ * @param {Array<Object>} rows creator_records 行（含 nickname / creator_type / total_cost / first_play / second_week_play / publish_date）
+ * @param {{ referenceDate?: string }} [options] referenceDate 仅测试注入（YYYY-MM-DD），默认服务端本地今天
+ */
+export function buildRepurchaseRadar(rows = [], { referenceDate = null } = {}) {
+  const reference = toDateOnly(referenceDate) || todayDateOnly()
+  const creatorMap = new Map()
+  let rowIndex = 0
+
+  for (const row of rows) {
+    const nickname = String(row?.nickname || '').trim() || '未命名达人'
+    const creatorType = String(row?.creator_type || '').trim() || '未分类'
+    if (!creatorMap.has(nickname)) {
+      creatorMap.set(nickname, {
+        creator: nickname,
+        // 与 CreatorSummary 一致：保留首条记录的类型，空则「未分类」
+        creator_type: creatorType,
+        record_count: 0,
+        samples: [],
+        lastDate: null
+      })
+    }
+    const entry = creatorMap.get(nickname)
+    entry.record_count += 1
+
+    // 最近合作日期：合作新近度取该达人全部记录的 MAX(publish_date)，与 CPM 有效性无关
+    const publishDate = toDateOnly(row?.publish_date)
+    if (publishDate && (!entry.lastDate || publishDate > entry.lastDate)) {
+      entry.lastDate = publishDate
+    }
+
+    // 保存 raw CPM（不预先 round2）：达标判断 / 中位数 / 最近风险统一使用原始精度
+    const cpmRaw = computeRecordLatestCpm(row)
+    if (cpmRaw !== null) {
+      entry.samples.push({ cpmRaw, publishDate, index: rowIndex })
+    }
+    rowIndex += 1
+  }
+
+  const creators = [...creatorMap.values()].map((entry) => {
+    const validCount = entry.samples.length
+    // 达标判断使用 raw CPM：raw <= 目标值 => 达标；raw > 目标值 => 未达标
+    const passCount = entry.samples.filter((sample) => sample.cpmRaw <= REPURCHASE_TARGET_CPM).length
+    const failCount = validCount - passCount
+
+    let status = RADAR_STATUS.insufficient
+    if (validCount >= 2) {
+      if (passCount > failCount) status = RADAR_STATUS.passed
+      else if (passCount === failCount) status = RADAR_STATUS.mixed
+      else status = RADAR_STATUS.failed
+    }
+
+    // 最近连续 2 次「有效累计 CPM」都 > 目标值 → 风险提示（不改变历史状态）
+    const recent = [...entry.samples].sort((a, b) => {
+      const left = a.publishDate || ''
+      const right = b.publishDate || ''
+      if (left !== right) return left < right ? 1 : -1
+      return b.index - a.index
+    })
+    const recentRisk =
+      recent.length >= 2 &&
+      recent[0].cpmRaw > REPURCHASE_TARGET_CPM &&
+      recent[1].cpmRaw > REPURCHASE_TARGET_CPM
+
+    const daysSince =
+      entry.lastDate === null ? null : Math.max(0, diffDays(entry.lastDate, reference))
+
+    // 中位数用 raw CPM 求，只在对外输出时 round2（展示保留 2 位小数）
+    const medianRaw = medianOfRaw(entry.samples.map((sample) => sample.cpmRaw))
+
+    return {
+      creator: entry.creator,
+      creator_type: entry.creator_type,
+      record_count: entry.record_count,
+      valid_cpm_count: validCount,
+      pass_count: passCount,
+      fail_count: failCount,
+      historical_status: status,
+      historical_status_label: RADAR_STATUS_LABELS[status],
+      // 对外字段：中位数按 2 位小数展示
+      median_cpm: medianRaw === null ? null : round2(medianRaw),
+      // 内部字段（不对外输出）：排序必须用 raw 中位数，避免展示值相同被误判为并列
+      medianCpmRaw: medianRaw,
+      last_collaboration_date: entry.lastDate,
+      days_since_last_collaboration: daysSince,
+      recent_risk: recentRisk,
+      recent_risk_text: recentRisk ? '最近2次合作均未达到 CPM 30' : null
+    }
+  })
+
+  // 确定性排序（无加权评分）：中位 CPM 升序（无中位数排最后）→ 距上次合作更久优先 → 名称兜底
+  const compareNullableAsc = (left, right) => {
+    const leftNull = left === null || left === undefined
+    const rightNull = right === null || right === undefined
+    if (leftNull && rightNull) return 0
+    if (leftNull) return 1
+    if (rightNull) return -1
+    return left - right
+  }
+  const compareDaysDesc = (left, right) => {
+    const leftNull = left === null || left === undefined
+    const rightNull = right === null || right === undefined
+    if (leftNull && rightNull) return 0
+    if (leftNull) return 1
+    if (rightNull) return -1
+    return right - left
+  }
+  const watchStatusRank = (status) => (status === RADAR_STATUS.mixed ? 0 : 1)
+  const compareCreators = (a, b) => {
+    // 第一优先：raw 中位数升序（只有 raw 真正相等才进入第二条件）
+    const byMedian = compareNullableAsc(a.medianCpmRaw, b.medianCpmRaw)
+    if (byMedian !== 0) return byMedian
+    const byDays = compareDaysDesc(
+      a.days_since_last_collaboration,
+      b.days_since_last_collaboration
+    )
+    if (byDays !== 0) return byDays
+    if (a.creator === b.creator) return 0
+    return a.creator < b.creator ? -1 : 1
+  }
+
+  // 对外只返回展示字段，内部排序字段 medianCpmRaw 不暴露给前端
+  const toPublicCreator = ({ medianCpmRaw, ...publicFields }) => publicFields
+
+  const groups = RADAR_GROUPS.map((group) => {
+    const list = creators.filter((item) => group.statuses.includes(item.historical_status))
+    list.sort((a, b) => {
+      // 「需要观察」内先有证据的（mixed），再证据不足（insufficient）
+      if (group.key === 'watch') {
+        const byStatus = watchStatusRank(a.historical_status) - watchStatusRank(b.historical_status)
+        if (byStatus !== 0) return byStatus
+      }
+      return compareCreators(a, b)
+    })
+    return {
+      key: group.key,
+      label: group.label,
+      count: list.length,
+      creators: list.map(toPublicCreator)
+    }
+  })
+
+  return {
+    target_cpm: REPURCHASE_TARGET_CPM,
+    reference_date: reference,
+    // 排序规则说明（前端只做展示，不重新计算业务规则）
+    sort: {
+      priority:
+        '历史CPM中位数(raw) 升序 → days_since_last_collaboration 降序 → creator 名称升序',
+      watch: 'mixed 优先于 insufficient → 同组内同上规则',
+      low_priority:
+        '历史CPM中位数(raw) 升序 → days_since_last_collaboration 降序 → creator 名称升序'
+    },
+    groups,
+    summary: {
+      creator_count: creators.length,
+      record_count: creators.reduce((sum, item) => sum + item.record_count, 0),
+      valid_cpm_count: creators.reduce((sum, item) => sum + item.valid_cpm_count, 0),
+      priority_count: groups[0].count,
+      watch_count: groups[1].count,
+      low_priority_count: groups[2].count
+    }
+  }
+}
+
+/**
+ * 复投雷达（只读接口）
+ * - 不写库、不调用 AI、不访问外部网络
+ * - current_date 参数仅在测试模式（WORKBENCH_TEST_MODE=1）下生效，用于固定日期断言；
+ *   生产环境始终使用服务端本地日期，避免客户端左右业务判定
+ */
+router.get('/repurchase-radar', (req, res) => {
+  let referenceDate = null
+  const rawReference = req.query.current_date
+  if (rawReference !== undefined && rawReference !== '') {
+    const text = String(rawReference).trim()
+    if (process.env.WORKBENCH_TEST_MODE === '1') {
+      if (!toDateOnly(text)) return fail(res, 400, 'current_date 格式必须为 YYYY-MM-DD')
+      referenceDate = text
+    }
+    // 非测试模式：忽略该参数，生产始终以服务端本地当前日期为准
+  }
+  const rows = queryDetailRows()
+  return ok(res, buildRepurchaseRadar(rows, { referenceDate }))
+})
+
 // ---------- 筛选元数据（博主类型 / 达人昵称 / 数据周范围，供 BI 筛选面板初始化） ----------
 router.get('/filters', (req, res) => {
   const rows = db

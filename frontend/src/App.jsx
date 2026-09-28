@@ -4,6 +4,7 @@ import Records from './pages/Records'
 import Dashboard from './pages/Dashboard'
 import CreatorSummary from './pages/CreatorSummary'
 import ImportHistory from './pages/ImportHistory'
+import RepurchaseRadar from './pages/RepurchaseRadar'
 
 export default function App() {
   return (
@@ -20,6 +21,10 @@ export default function App() {
       {/* 达人汇总 */}
       <Route path="/creators" element={<MainLayout />}>
         <Route index element={<CreatorSummary />} />
+      </Route>
+      {/* 复投雷达（V3-alpha P1） */}
+      <Route path="/repurchase-radar" element={<MainLayout />}>
+        <Route index element={<RepurchaseRadar />} />
       </Route>
       {/* 导入历史 */}
       <Route path="/import-history" element={<MainLayout />}>

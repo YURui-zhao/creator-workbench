@@ -122,6 +122,11 @@ async function main() {
       path.join(frontend, 'components/RecentPerformanceAssistantModal.jsx'),
       'utf8'
     )
+    // Alpha.2 A2：payload 组装（observed_at）所在模块的源码，用于契约断言
+    const saveLibSourceForA2 = fs.readFileSync(
+      path.join(frontend, 'utils/recentPerformanceSave.js'),
+      'utf8'
+    )
 
     const route = ai.default.stack.find(
       (layer) => layer.route?.path === '/extract-creator-screenshot'
@@ -441,7 +446,74 @@ async function main() {
     )
     check('异常超长 plays 被截断且显式告警', rawPlaysCap.plays.length === ai.MAX_RECOGNIZED_PLAYS && rawPlaysCap.truncated === true && rawPlaysCap.warnings.length === 1)
 
-    console.log('\n===== 9. 网络重定向边界（3xx 绝不跟随）=====')
+    console.log('\n===== 9. Alpha.2 A2：人工确认页 UI 收敛（源码契约）=====')
+    check(
+      'A2-15 已删除「达人昵称」可编辑输入框（含 updateCreatorName 调用）',
+      !/请核对达人昵称/.test(modalSource) &&
+        !/updateCreatorName/.test(modalSource) &&
+        !/达人昵称<\/Typography\.Text>/.test(modalSource)
+    )
+    check(
+      'A2-16 顶部改为静态「正在更新：」+ 数据观察日期，不再让用户重选达人',
+      /正在更新：/.test(modalSource) &&
+        modalSource.indexOf('正在更新：') < modalSource.indexOf('>数据观察日期</Typography.Text>') &&
+        !/本次快照所属达人（雷达达人）/.test(modalSource)
+    )
+    check(
+      'A2-17 身份三态接入：一致=短暂提示 / 未识别=轻提示 / 不一致=黄色风险 + 显式确认',
+      /IDENTITY_STATUS\.matched/.test(modalSource) &&
+        /identityFlash/.test(modalSource) &&
+        /identityState\.status === IDENTITY_STATUS\.mismatch/.test(modalSource) &&
+        /未识别到达人昵称，请自行确认截图/.test(modalSource) &&
+        /我确认截图无误，仍保存到/.test(modalSource)
+    )
+    check(
+      'A2-18 「已核对」是短暂提示（定时清除），不是永久正文',
+      /const timer = setTimeout\(\(\) => setIdentityFlash\(false\), 4000\)/.test(modalSource) &&
+        /clearTimeout\(timer\)/.test(modalSource)
+    )
+    check(
+      'A2-19 AI 详情默认折叠，可展开查看原 warnings',
+      /const \[warningsExpanded, setWarningsExpanded\] = useState\(false\)/.test(modalSource) &&
+        /查看识别详情/.test(modalSource) &&
+        /收起识别详情/.test(modalSource) &&
+        /warningsExpanded &&[\s\S]{0,200}draft\.warnings\.map/.test(modalSource)
+    )
+    check(
+      'A2-20 待确认项计数只由「星图价 / 无法解析播放量 / 身份不一致」决定',
+      /countRequiredConfirmations\(\{/.test(modalSource) &&
+        /priceNeedsConfirmation,/.test(modalSource) &&
+        /unresolvedCount: summary\?\.unresolved_count \?\? 0,/.test(modalSource) &&
+        /identityStatus: identityState\.status/.test(modalSource) &&
+        /需要确认 \$\{requiredConfirmations\} 项/.test(modalSource)
+    )
+    check(
+      'A2-21 没有确认项时不显示黄色 Alert（改为轻量「识别结果已可检查」）',
+      /requiredConfirmations > 0 \?/.test(modalSource) && /识别结果已可检查/.test(modalSource)
+    )
+    check(
+      'A2-22 星图刊例价只保留一个字段 + 一个状态文案（不再重复「需人工确认」）',
+      /星图刊例价<\/Typography\.Text>/.test(modalSource) &&
+        /PRICE_FIELD_STATUS_LABELS\[priceFieldStatus\]/.test(modalSource) &&
+        (modalSource.match(/PRICE_FIELD_STATUS_LABELS\[priceFieldStatus\]/g) || []).length === 1 &&
+        !/draft\.xingtu_price === null \? '需人工确认'/.test(modalSource) &&
+        !/xingtu_price_needs_review && \(/.test(modalSource)
+    )
+    check(
+      'A2-23 星图价输入框文案为「请输入刊例价」（未识别时不伪装成已识别）',
+      /请输入刊例价，例如 ¥3,000/.test(modalSource)
+    )
+    check(
+      'A2-24 snapshot owner 仍是雷达达人（payload creator = boundCreator）',
+      /buildSnapshotPayload\(draft, \{[\s\S]{0,140}creator: boundCreator/.test(modalSource) &&
+        !/creator: draft\.creator_name/.test(modalSource)
+    )
+    check(
+      'A2-25 保持 A1：payload 仍携带 observed_at',
+      /observedAt\n?\s*\}\)/.test(modalSource) && /observed_at: String\(observedAt/.test(saveLibSourceForA2)
+    )
+
+    console.log('\n===== 10. 网络重定向边界（3xx 绝不跟随）=====')
     // A. Provider 返回 302 + Location: https://evil.example/collect
     calls.length = 0
     logs.length = 0

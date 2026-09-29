@@ -32,10 +32,15 @@ import { formatInteger, formatPlays } from '../utils/format'
 import {
   buildSnapshotPayload,
   canSaveSnapshot,
+  countRequiredConfirmations,
   formatPlayRange,
   formatTrendRatio,
+  getIdentityCheckState,
+  getPriceFieldStatus,
+  IDENTITY_STATUS,
   isValidDateOnly,
-  needsIdentityConfirmation,
+  PRICE_FIELD_STATUS,
+  PRICE_FIELD_STATUS_LABELS,
   todayLocalDateOnly,
   TREND_LABELS_FULL
 } from '../utils/recentPerformanceSave.js'
@@ -55,7 +60,6 @@ import {
   buildDraftFromExtraction,
   summarizeDraft,
   togglePlayExcluded,
-  updateCreatorName,
   updatePlayRawText,
   updatePriceRawText
 } from '../utils/recentPerformanceDraft.js'
@@ -93,6 +97,10 @@ export default function RecentPerformanceAssistantModal({
   const [identityConfirmed, setIdentityConfirmed] = useState(false)
   // Alpha.2：数据观察日期（默认浏览器本地今天；用户可改为截图实际观察的那天）
   const [observedAt, setObservedAt] = useState(() => todayLocalDateOnly())
+  // Alpha.2 A2：身份「已核对」只做短暂提示，不长期占位；AI 详情默认折叠
+  const [identityFlash, setIdentityFlash] = useState(false)
+  const [warningsExpanded, setWarningsExpanded] = useState(false)
+  const [priceManuallyEdited, setPriceManuallyEdited] = useState(false)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
   const [savedSnapshot, setSavedSnapshot] = useState(null)
@@ -149,6 +157,9 @@ export default function RecentPerformanceAssistantModal({
     setDraft(null)
     setConfirmed(null)
     setIdentityConfirmed(false)
+    setIdentityFlash(false)
+    setWarningsExpanded(false)
+    setPriceManuallyEdited(false)
     setSaveError('')
     setSavedSnapshot(null)
     aiInFlightRef.current = false
@@ -219,6 +230,9 @@ export default function RecentPerformanceAssistantModal({
       setDraft(null)
       setConfirmed(null)
       setIdentityConfirmed(false)
+      setIdentityFlash(false)
+      setWarningsExpanded(false)
+      setPriceManuallyEdited(false)
       setSavedSnapshot(null)
       setAiError('')
     },
@@ -253,6 +267,9 @@ export default function RecentPerformanceAssistantModal({
     setDraft(null)
     setConfirmed(null)
     setIdentityConfirmed(false)
+    setIdentityFlash(false)
+    setWarningsExpanded(false)
+    setPriceManuallyEdited(false)
     setSavedSnapshot(null)
     setAiError('')
   }
@@ -282,10 +299,19 @@ export default function RecentPerformanceAssistantModal({
     setConfirmed(null)
     try {
       const res = await extractCreatorScreenshot(images.map((image) => ({ mime: image.mime, base64: image.base64 })))
-      setDraft(buildDraftFromExtraction(res?.data || {}))
+      const nextDraft = buildDraftFromExtraction(res?.data || {})
+      setDraft(nextDraft)
       setConfirmed(null)
       setIdentityConfirmed(false)
+      setWarningsExpanded(false)
+      setPriceManuallyEdited(false)
       setSavedSnapshot(null)
+      // 身份一致时只做一次短暂提示（不长期占位）；不一致 / 未识别不在这里提示
+      const identity = getIdentityCheckState({
+        currentCreator: boundCreator,
+        recognizedCreatorName: nextDraft.creator_name
+      })
+      setIdentityFlash(identity.status === IDENTITY_STATUS.matched)
     } catch (error) {
       // 识别失败：保留已选截图与人工修改，只提示失败原因
       setAiError(getErrorMessage(error, 'AI 识别失败，请重试（截图与已修改内容均已保留）'))
@@ -345,8 +371,36 @@ export default function RecentPerformanceAssistantModal({
   }
 
   const summary = draft ? summarizeDraft(draft) : null
-  const recognizedName = draft?.creator_name || ''
-  const identityNeedsConfirm = needsIdentityConfirmation(boundCreator, recognizedName)
+  // Alpha.2 A2：达人身份核对三态（matched / unknown / mismatch）
+  // canonical creator 始终是雷达传入的 boundCreator；AI 昵称只用于判断有没有传错截图
+  const identityState = getIdentityCheckState({
+    currentCreator: boundCreator,
+    recognizedCreatorName: draft?.creator_name
+  })
+  const identityNeedsConfirm = identityState.status === IDENTITY_STATUS.mismatch
+  const identityMatched = identityState.status === IDENTITY_STATUS.matched
+  const identityUnknown = identityState.status === IDENTITY_STATUS.unknown
+
+  // 星图刊例价字段状态（只显示一个状态文案）
+  const priceFieldStatus = draft
+    ? getPriceFieldStatus({
+        rawText: draft.xingtu_price_raw,
+        price: draft.xingtu_price,
+        needsReview: draft.xingtu_price_needs_review,
+        manuallyEdited: priceManuallyEdited
+      })
+    : PRICE_FIELD_STATUS.missing
+  const priceNeedsConfirmation =
+    priceFieldStatus === PRICE_FIELD_STATUS.missing || priceFieldStatus === PRICE_FIELD_STATUS.invalid
+  // 只统计真正需要用户处理的事项（星图价 / 无法解析的播放量 / 身份不一致）
+  const requiredConfirmations = draft
+    ? countRequiredConfirmations({
+        priceNeedsConfirmation,
+        unresolvedCount: summary?.unresolved_count ?? 0,
+        identityStatus: identityState.status
+      })
+    : 0
+
   const canSave = canSaveSnapshot({
     confirmed: Boolean(confirmed),
     creator: boundCreator,
@@ -355,6 +409,13 @@ export default function RecentPerformanceAssistantModal({
     saving,
     savedSnapshot
   }) && isValidDateOnly(observedAt)
+
+  // 「已核对」短暂提示：4 秒后自动消失，不长期占据页面空间
+  useEffect(() => {
+    if (!identityFlash) return undefined
+    const timer = setTimeout(() => setIdentityFlash(false), 4000)
+    return () => clearTimeout(timer)
+  }, [identityFlash])
 
   /**
    * 草稿的任何人工修改都会让「确认识别结果」与「已保存」状态失效：
@@ -385,6 +446,27 @@ export default function RecentPerformanceAssistantModal({
         </Typography.Text>
 
         <Alert type="info" showIcon message="发送范围" description={SEND_NOTICE} />
+
+        {/* Alpha.2 A2：canonical creator 来自雷达（静态展示，不再让用户重选）；仅全局入口需要先选择达人 */}
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <Typography.Text type="secondary">正在更新：</Typography.Text>
+          {creator ? (
+            <Typography.Text strong>{creator}</Typography.Text>
+          ) : (
+            <Select
+              value={boundCreator || undefined}
+              placeholder="请选择本次快照所属达人"
+              style={{ width: 220 }}
+              showSearch
+              optionFilterProp="label"
+              onChange={(value) => {
+                setBoundCreator(value)
+                setIdentityConfirmed(false)
+              }}
+              options={creatorOptions.map((name) => ({ value: name, label: name }))}
+            />
+          )}
+        </div>
 
         {/* Alpha.2：数据观察日期（这批播放量 / 星图价是哪天看到的），与「何时保存进系统」分开 */}
         <div>
@@ -562,89 +644,130 @@ export default function RecentPerformanceAssistantModal({
               无法确定性解析的条目请人工确认。{ORDER_NOTICE}
             </Typography.Text>
 
-            {/* P2B：快照归属由用户点击的雷达达人决定，AI 识别昵称只作为 evidence */}
-            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'flex-end' }}>
-              <div>
-                <Typography.Text type="secondary">本次快照所属达人（雷达达人）</Typography.Text>
-                <div>
-                  {creator ? (
-                    <Typography.Text strong>{creator}</Typography.Text>
-                  ) : (
-                    <Select
-                      value={boundCreator || undefined}
-                      placeholder="请选择本次快照所属达人"
-                      style={{ width: 220 }}
-                      showSearch
-                      optionFilterProp="label"
-                      onChange={(value) => {
-                        setBoundCreator(value)
-                        setIdentityConfirmed(false)
-                      }}
-                      options={creatorOptions.map((name) => ({ value: name, label: name }))}
-                    />
-                  )}
-                </div>
-              </div>
-              {identityNeedsConfirm && (
-                <Alert
-                  type="warning"
-                  showIcon
-                  style={{ flex: '1 1 320px' }}
-                  message={`截图昵称「${recognizedName}」与当前达人「${boundCreator || '未选择'}」不一致，请确认是否上传了正确截图。`}
-                  description={
-                    <Checkbox
-                      checked={identityConfirmed}
-                      onChange={(event) => setIdentityConfirmed(event.target.checked)}
-                    >
-                      {`我确认本次快照保存到「${boundCreator || '未选择'}」`}
-                    </Checkbox>
-                  }
-                />
-              )}
-            </div>
+            {/* Alpha.2 A2：身份核对三态（一致：短暂提示；未识别：轻提示；不一致：黄色风险 + 显式确认） */}
+            {identityMatched && identityFlash && (
+              <Typography.Text type="success" style={{ fontSize: 12 }}>
+                ✓ 达人身份已核对
+              </Typography.Text>
+            )}
+            {identityUnknown && (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                未识别到达人昵称，请自行确认截图
+              </Typography.Text>
+            )}
 
-            {draft.warnings.length > 0 && (
+            {identityNeedsConfirm && (
               <Alert
                 type="warning"
                 showIcon
-                message="AI 提示"
-                description={draft.warnings.map((item) => (
-                  <div key={item}>{item}</div>
-                ))}
+                message={`截图识别昵称「${identityState.recognizedName}」与当前达人「${boundCreator || '未选择'}」不一致。请确认是否上传了正确截图。`}
+                description={
+                  <Checkbox
+                    checked={identityConfirmed}
+                    onChange={(event) => setIdentityConfirmed(event.target.checked)}
+                  >
+                    {`我确认截图无误，仍保存到「${boundCreator || '未选择'}」`}
+                  </Checkbox>
+                }
               />
             )}
 
-            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-              <div>
-                <Typography.Text type="secondary">达人昵称</Typography.Text>
-                <Input
-                  value={draft.creator_name}
-                  placeholder="请核对达人昵称"
-                  style={{ width: 220 }}
-                  onChange={(event) => applyDraftChange(updateCreatorName(draft, event.target.value))}
-                />
-              </div>
-              <div>
-                <Typography.Text type="secondary">星图刊例价（可修改原文，系统自动换算）</Typography.Text>
-                <div>
-                  <Input
-                    value={draft.xingtu_price_raw}
-                    placeholder="例如 ¥3,000"
-                    style={{ width: 180 }}
-                    onChange={(event) => applyDraftChange(updatePriceRawText(draft, event.target.value))}
-                  />
-                  <Typography.Text strong style={{ marginLeft: 8 }}>
-                    {draft.xingtu_price === null ? '需人工确认' : `¥${formatInteger(draft.xingtu_price)}`}
-                  </Typography.Text>
-                  {draft.xingtu_price_needs_review && (
-                    <Tooltip title={draft.xingtu_price_reason || '无法确定性解析'}>
-                      <Tag color="warning" style={{ marginLeft: 8 }}>
-                        需人工确认
-                      </Tag>
-                    </Tooltip>
-                  )}
-                </div>
-              </div>
+            {/* Alpha.2 A2：AI 详情默认折叠；只把「需要用户处理」的事项计入 X 项 */}
+            {requiredConfirmations > 0 ? (
+              <Alert
+                type="warning"
+                showIcon
+                message={`需要确认 ${requiredConfirmations} 项`}
+                description={
+                  <Space direction="vertical" size={4} style={{ display: 'flex' }}>
+                    <Typography.Text>
+                      {priceNeedsConfirmation ? '星图刊例价需补充/检查；' : ''}
+                      {(summary?.unresolved_count ?? 0) > 0
+                        ? `${summary.unresolved_count} 条播放量无法确定性解析；`
+                        : ''}
+                      {identityNeedsConfirm ? '识别昵称与当前达人不一致；' : ''}
+                      核对无误后即可保存。
+                    </Typography.Text>
+                    <div>
+                      <Button
+                        type="link"
+                        size="small"
+                        style={{ padding: 0 }}
+                        onClick={() => setWarningsExpanded((value) => !value)}
+                      >
+                        {warningsExpanded ? '收起识别详情' : '查看识别详情'}
+                      </Button>
+                    </div>
+                    {warningsExpanded &&
+                      (draft.warnings.length > 0 ? (
+                        draft.warnings.map((item) => (
+                          <Typography.Text key={item} type="secondary">
+                            · {item}
+                          </Typography.Text>
+                        ))
+                      ) : (
+                        <Typography.Text type="secondary">本次识别没有额外的解释性说明。</Typography.Text>
+                      ))}
+                  </Space>
+                }
+              />
+            ) : (
+              <Space direction="vertical" size={2} style={{ display: 'flex' }}>
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  识别结果已可检查
+                </Typography.Text>
+                {draft.warnings.length > 0 && (
+                  <>
+                    <div>
+                      <Button
+                        type="link"
+                        size="small"
+                        style={{ padding: 0 }}
+                        onClick={() => setWarningsExpanded((value) => !value)}
+                      >
+                        {warningsExpanded ? '收起识别详情' : '查看识别详情'}
+                      </Button>
+                    </div>
+                    {warningsExpanded &&
+                      draft.warnings.map((item) => (
+                        <Typography.Text key={item} type="secondary">
+                          · {item}
+                        </Typography.Text>
+                      ))}
+                  </>
+                )}
+              </Space>
+            )}
+
+            {/* Alpha.2 A2：星图刊例价只保留一个字段 + 一个状态文案 */}
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+              <Typography.Text type="secondary">星图刊例价</Typography.Text>
+              <Input
+                value={draft.xingtu_price_raw}
+                placeholder="请输入刊例价，例如 ¥3,000"
+                style={{ width: 200 }}
+                onChange={(event) => {
+                  setPriceManuallyEdited(true)
+                  applyDraftChange(updatePriceRawText(draft, event.target.value))
+                }}
+              />
+              <Typography.Text
+                type={
+                  priceFieldStatus === PRICE_FIELD_STATUS.identified ||
+                  priceFieldStatus === PRICE_FIELD_STATUS.confirmed
+                    ? 'success'
+                    : 'warning'
+                }
+                style={{ fontSize: 12 }}
+              >
+                {PRICE_FIELD_STATUS_LABELS[priceFieldStatus]}
+              </Typography.Text>
+              {priceFieldStatus === PRICE_FIELD_STATUS.identified ||
+              priceFieldStatus === PRICE_FIELD_STATUS.confirmed ? (
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  {`¥${formatInteger(draft.xingtu_price)}`}
+                </Typography.Text>
+              ) : null}
             </div>
 
             <div>
@@ -720,9 +843,10 @@ export default function RecentPerformanceAssistantModal({
                     </Typography.Text>
                   </Tooltip>
                 )}
-                <Typography.Text>
-                  星图价：{summary.xingtu_price === null ? '需人工确认' : `¥${formatInteger(summary.xingtu_price)}`}
-                </Typography.Text>
+                {/* 星图价状态只在字段处显示一次；摘要只展示已换算出的金额 */}
+                {summary.xingtu_price !== null && (
+                  <Typography.Text>{`星图价：¥${formatInteger(summary.xingtu_price)}`}</Typography.Text>
+                )}
               </Space>
               <Button type="primary" disabled={aiLoading} onClick={handleConfirm}>
                 确认识别结果

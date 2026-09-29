@@ -684,7 +684,92 @@ async function main() {
         snapA.data.pricing.pricing_version === 'creator-pricing-v1'
     )
 
-    console.log('\n===== 11. 无 AI / 无网络 / 只读实现 =====')
+    console.log('\n===== 11. Alpha.2 A2：身份三态 / 待确认项 / 星图价字段状态 =====')
+    const identityOf = saveLib.getIdentityCheckState
+    check(
+      'A2-1 AI 未识别昵称（null）→ unknown，且不需要确认',
+      identityOf({ currentCreator: '巴博斯', recognizedCreatorName: null }).status === 'unknown' &&
+        identityOf({ currentCreator: '巴博斯', recognizedCreatorName: null }).requiresConfirmation === false
+    )
+    check(
+      'A2-2 AI 未识别昵称（空串）→ unknown，且不需要确认',
+      identityOf({ currentCreator: '巴博斯', recognizedCreatorName: '' }).status === 'unknown' &&
+        identityOf({ currentCreator: '巴博斯', recognizedCreatorName: '   ' }).requiresConfirmation === false
+    )
+    check(
+      'A2-3 昵称一致 → matched，不阻塞也不需要确认',
+      identityOf({ currentCreator: '巴博斯', recognizedCreatorName: '巴博斯' }).status === 'matched' &&
+        identityOf({ currentCreator: '巴博斯', recognizedCreatorName: ' 巴博斯 ' }).requiresConfirmation === false
+    )
+    check(
+      'A2-4 昵称不一致 → mismatch，必须显式确认',
+      identityOf({ currentCreator: '巴博斯', recognizedCreatorName: 'Gary' }).status === 'mismatch' &&
+        identityOf({ currentCreator: '巴博斯', recognizedCreatorName: 'Gary' }).requiresConfirmation === true &&
+        identityOf({ currentCreator: '巴博斯', recognizedCreatorName: 'Gary' }).recognizedName === 'Gary'
+    )
+    check(
+      'A2-5 尚未确定当前达人时不误报不一致（unknown，不阻塞）',
+      identityOf({ currentCreator: '', recognizedCreatorName: 'Gary' }).status === 'unknown' &&
+        identityOf({ currentCreator: '', recognizedCreatorName: 'Gary' }).requiresConfirmation === false
+    )
+
+    const countOf = saveLib.countRequiredConfirmations
+    check(
+      'A2-6 昵称未识别不计入待确认项',
+      countOf({ priceNeedsConfirmation: false, unresolvedCount: 0, identityStatus: 'unknown' }) === 0
+    )
+    check(
+      'A2-7 昵称不一致 +1',
+      countOf({ priceNeedsConfirmation: false, unresolvedCount: 0, identityStatus: 'mismatch' }) === 1
+    )
+    check(
+      'A2-8 星图价未识别/解析失败 +1',
+      countOf({ priceNeedsConfirmation: true, unresolvedCount: 0, identityStatus: 'matched' }) === 1
+    )
+    check(
+      'A2-9 无法解析的播放量每条 +1',
+      countOf({ priceNeedsConfirmation: false, unresolvedCount: 3, identityStatus: 'matched' }) === 3 &&
+        countOf({ priceNeedsConfirmation: true, unresolvedCount: 2, identityStatus: 'mismatch' }) === 4
+    )
+    check(
+      'A2-10 解释性说明（无这些字段）不增加计数',
+      countOf({ unresolvedCount: 'nope', priceNeedsConfirmation: false, identityStatus: 'matched' }) === 0 &&
+        countOf() === 0
+    )
+
+    const priceStatusOf = saveLib.getPriceFieldStatus
+    check(
+      'A2-11 星图价字段四态：已识别 / 已确认 / 需补充 / 请检查',
+      priceStatusOf({ rawText: '4100', price: 4100, needsReview: false, manuallyEdited: false }) === 'identified' &&
+        priceStatusOf({ rawText: '4100', price: 4100, needsReview: false, manuallyEdited: true }) === 'confirmed' &&
+        priceStatusOf({ rawText: '', price: null, needsReview: false }) === 'missing' &&
+        priceStatusOf({ rawText: '面议', price: null, needsReview: true }) === 'invalid'
+    )
+    check(
+      'A2-12 状态文案唯一来源（已识别 / 已确认 / 需补充 / 请检查）',
+      saveLib.PRICE_FIELD_STATUS_LABELS.identified === '已识别' &&
+        saveLib.PRICE_FIELD_STATUS_LABELS.confirmed === '已确认' &&
+        saveLib.PRICE_FIELD_STATUS_LABELS.missing === '需补充' &&
+        saveLib.PRICE_FIELD_STATUS_LABELS.invalid === '请检查'
+    )
+
+    // snapshot owner 永远是雷达达人：AI 识别成别的昵称也不能改变 owner
+    const mismatchPayload = saveLib.buildSnapshotPayload(
+      { creator_name: 'Gary', xingtu_price_raw: '¥4100', plays: [{ raw_text: '5.2万' }] },
+      { creator: '巴博斯', identityConfirmed: true, observedAt: '2026-09-29' }
+    )
+    check(
+      'A2-13 AI 昵称 ≠ 当前达人时，payload 的 creator 仍是当前达人（AI 不能改 owner）',
+      mismatchPayload.creator === '巴博斯' &&
+        mismatchPayload.recognized_creator_name_raw === 'Gary' &&
+        mismatchPayload.observed_at === '2026-09-29'
+    )
+    check(
+      'A2-14 A1 observed_at 未回退（仍随 payload 提交）',
+      saveLib.buildSnapshotPayload({ creator_name: '巴博斯', plays: [] }, { creator: '巴博斯', observedAt: '2026-09-25' }).observed_at === '2026-09-25'
+    )
+
+    console.log('\n===== 12. 无 AI / 无网络 / 只读实现 =====')
     const routeSource = fs.readFileSync(path.join(root, 'backend/routes/recentSnapshots.js'), 'utf8')
     check('P2B 路由不引用任何 AI 服务', !/deepseek|callProviderVision|extract-creator-screenshot/i.test(routeSource))
     check('P2B 路由只注册 POST / 与 GET /latest', snapshotRouter.stack.filter((l) => l.route).map((l) => `${Object.keys(l.route.methods)[0].toUpperCase()} ${l.route.path}`).sort().join(' | ') === 'GET /latest | POST /', snapshotRouter.stack.filter((l) => l.route).map((l) => `${Object.keys(l.route.methods)[0].toUpperCase()} ${l.route.path}`).join(' | '))

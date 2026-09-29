@@ -143,6 +143,72 @@ export function formatObservedAtHint(snapshot) {
 }
 
 /**
+ * 达人身份核对三态（Alpha.2 Sprint A2）
+ * snapshot owner 永远来自雷达传入的 currentCreator；AI 识别昵称只用于「有没有传错截图」。
+ * - matched  ：识别昵称与当前达人一致 → 不需确认，不阻塞
+ * - unknown  ：AI 未识别到昵称（或尚未确定当前达人）→ 不是 mismatch，不需确认，不阻塞
+ * - mismatch ：识别到不同昵称 → 真正的身份风险，必须由用户显式确认
+ */
+export const IDENTITY_STATUS = {
+  matched: 'matched',
+  unknown: 'unknown',
+  mismatch: 'mismatch'
+}
+
+export function getIdentityCheckState({ currentCreator, recognizedCreatorName } = {}) {
+  const current = String(currentCreator ?? '').trim()
+  const recognized = String(recognizedCreatorName ?? '').trim()
+  if (!recognized || !current) {
+    return { status: IDENTITY_STATUS.unknown, requiresConfirmation: false, recognizedName: recognized }
+  }
+  if (isCreatorNameMatched(current, recognized)) {
+    return { status: IDENTITY_STATUS.matched, requiresConfirmation: false, recognizedName: recognized }
+  }
+  return { status: IDENTITY_STATUS.mismatch, requiresConfirmation: true, recognizedName: recognized }
+}
+
+/** 星图刊例价字段状态（只保留一个状态文案，避免同一含义出现两次） */
+export const PRICE_FIELD_STATUS = {
+  identified: 'identified', // AI 识别成功且未被人工改动
+  confirmed: 'confirmed', // 用户手工修改过
+  missing: 'missing', // 未识别 / 未填写
+  invalid: 'invalid' // 有原文但确定性解析不了
+}
+
+export const PRICE_FIELD_STATUS_LABELS = {
+  identified: '已识别',
+  confirmed: '已确认',
+  missing: '需补充',
+  invalid: '请检查'
+}
+
+export function getPriceFieldStatus({ rawText, price, needsReview = false, manuallyEdited = false } = {}) {
+  const text = String(rawText ?? '').trim()
+  if (!text) return PRICE_FIELD_STATUS.missing
+  if (needsReview || price === null || price === undefined) return PRICE_FIELD_STATUS.invalid
+  return manuallyEdited ? PRICE_FIELD_STATUS.confirmed : PRICE_FIELD_STATUS.identified
+}
+
+/**
+ * 「需要确认 X 项」计数（Alpha.2 Sprint A2）：
+ * 只统计真正需要用户处理的事项 —— 星图价未识别/解析失败（1 项）、无法解析的播放量条目（每条 1 项）、
+ * 以及 AI 识别昵称与当前达人不一致（1 项）。
+ * 解释性说明（均值线、参考线、日期轴、昵称未识别等）不计入。
+ */
+export function countRequiredConfirmations({
+  priceNeedsConfirmation = false,
+  unresolvedCount = 0,
+  identityStatus = IDENTITY_STATUS.matched
+} = {}) {
+  let count = 0
+  if (priceNeedsConfirmation) count += 1
+  const unresolved = Number(unresolvedCount)
+  if (Number.isFinite(unresolved) && unresolved > 0) count += Math.floor(unresolved)
+  if (identityStatus === IDENTITY_STATUS.mismatch) count += 1
+  return count
+}
+
+/**
  * 保存闸门（纯函数，便于测试）：只有「已确认 + 已绑定达人 + 需要时已完成名称确认 +
  * 没有正在保存 + 当前草稿尚未保存过」时才允许提交。
  * 已保存过的同一份草稿会被锁定，避免重复点击产生重复快照；

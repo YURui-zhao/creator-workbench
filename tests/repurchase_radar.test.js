@@ -567,6 +567,63 @@ async function main() {
       empty.data.summary.creator_count === 0 &&
       empty.data.summary.record_count === 0
   )
+
+  console.log('\n===== 15. Alpha.2：主表「数据观察日期」展示语义 =====')
+  const saveLib = await import(
+    pathToFileURL(path.join(REPO_ROOT, 'frontend/src/utils/recentPerformanceSave.js')).href
+  )
+  const { formatObservedAtHint } = saveLib
+  check('已导出主表日期展示纯函数', typeof formatObservedAtHint === 'function')
+  check(
+    '有快照 + observed_at=2026-09-29 → 「数据截至 09-29」（只取月日）',
+    formatObservedAtHint({ observed_at: '2026-09-29' }) === '数据截至 09-29',
+    formatObservedAtHint({ observed_at: '2026-09-29' })
+  )
+  check(
+    '有快照但 observed_at=null → 「观察日期未知」（旧 Alpha.1 快照）',
+    formatObservedAtHint({ observed_at: null }) === '观察日期未知' &&
+      formatObservedAtHint({ observed_at: '' }) === '观察日期未知' &&
+      formatObservedAtHint({ observed_at: undefined }) === '观察日期未知'
+  )
+  check(
+    '没有快照 → 空字符串（保持「尚未更新」，不追加观察日期）',
+    formatObservedAtHint(null) === '' && formatObservedAtHint(undefined) === '',
+    JSON.stringify(formatObservedAtHint(null))
+  )
+  check(
+    '不可解析的 observed_at 不猜日期 → 「观察日期未知」',
+    formatObservedAtHint({ observed_at: '2026/09/29' }) === '观察日期未知' &&
+      formatObservedAtHint({ observed_at: '2026-9-29' }) === '观察日期未知'
+  )
+  check(
+    '日期不做时区换算（01-01 不会因 UTC 变成 12-31）',
+    formatObservedAtHint({ observed_at: '2026-01-01' }) === '数据截至 01-01'
+  )
+  const saveUtilSource = fs.readFileSync(
+    path.join(REPO_ROOT, 'frontend/src/utils/recentPerformanceSave.js'),
+    'utf8'
+  )
+  const hintFnSource = saveUtilSource.slice(saveUtilSource.indexOf('export function formatObservedAtHint'))
+  check(
+    '展示函数不使用 Date / toISOString（避免 ±1 天）',
+    !/new Date\(|toISOString\(|getTimezoneOffset/.test(hintFnSource.slice(0, 600))
+  )
+  const radarPageSource = fs.readFileSync(
+    path.join(REPO_ROOT, 'frontend/src/pages/RepurchaseRadar/index.jsx'),
+    'utf8'
+  )
+  check(
+    '雷达主表第一列渲染该提示（接入未丢失）',
+    /formatObservedAtHint\(snapshot\)/.test(radarPageSource) &&
+      /const observedHint = formatObservedAtHint\(snapshot\)/.test(radarPageSource) &&
+      /\{observedHint && \(/.test(radarPageSource)
+  )
+  check(
+    '未新增列 / 未改表格宽度结构（仍是 9 列且列宽常量不变）',
+    /const RADAR_TABLE_WIDTH = 836/.test(radarPageSource) &&
+      (radarPageSource.match(/title: '/g) || []).length === 9,
+    `columnTitles=${(radarPageSource.match(/title: '/g) || []).length}`
+  )
 }
 
 main()

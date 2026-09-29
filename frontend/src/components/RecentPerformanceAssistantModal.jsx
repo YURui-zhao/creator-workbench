@@ -3,6 +3,7 @@ import {
   Alert,
   Button,
   Checkbox,
+  DatePicker,
   Divider,
   Empty,
   Input,
@@ -15,6 +16,7 @@ import {
   Typography,
   message
 } from 'antd'
+import dayjs from 'dayjs'
 import {
   DeleteOutlined,
   FileImageOutlined,
@@ -32,7 +34,9 @@ import {
   canSaveSnapshot,
   formatPlayRange,
   formatTrendRatio,
+  isValidDateOnly,
   needsIdentityConfirmation,
+  todayLocalDateOnly,
   TREND_LABELS_FULL
 } from '../utils/recentPerformanceSave.js'
 import { buildPricingRows } from '../utils/pricingDisplay.js'
@@ -87,6 +91,8 @@ export default function RecentPerformanceAssistantModal({
   // P2B：快照必须绑定到用户点击的雷达达人（header 入口需先选择达人）
   const [boundCreator, setBoundCreator] = useState('')
   const [identityConfirmed, setIdentityConfirmed] = useState(false)
+  // Alpha.2：数据观察日期（默认浏览器本地今天；用户可改为截图实际观察的那天）
+  const [observedAt, setObservedAt] = useState(() => todayLocalDateOnly())
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
   const [savedSnapshot, setSavedSnapshot] = useState(null)
@@ -101,6 +107,7 @@ export default function RecentPerformanceAssistantModal({
     if (!open) return
     setBoundCreator(String(creator ?? '').trim())
     setIdentityConfirmed(false)
+    setObservedAt(todayLocalDateOnly())
     setSaveError('')
     setSavedSnapshot(null)
   }, [open, creator])
@@ -311,11 +318,19 @@ export default function RecentPerformanceAssistantModal({
       message.warning('截图昵称与当前达人不一致，请勾选确认后再保存')
       return
     }
+    if (!isValidDateOnly(observedAt)) {
+      message.warning('请先填写数据观察日期（这批播放量和刊例价是哪天看到的）')
+      return
+    }
     setSaving(true)
     setSaveError('')
     try {
       const res = await saveRecentSnapshot(
-        buildSnapshotPayload(draft, { creator: boundCreator, identityConfirmed })
+        buildSnapshotPayload(draft, {
+          creator: boundCreator,
+          identityConfirmed,
+          observedAt
+        })
       )
       setSavedSnapshot(res?.data || null)
       onSaved?.(res?.data || null)
@@ -339,7 +354,7 @@ export default function RecentPerformanceAssistantModal({
     identityConfirmed,
     saving,
     savedSnapshot
-  })
+  }) && isValidDateOnly(observedAt)
 
   /**
    * 草稿的任何人工修改都会让「确认识别结果」与「已保存」状态失效：
@@ -370,6 +385,24 @@ export default function RecentPerformanceAssistantModal({
         </Typography.Text>
 
         <Alert type="info" showIcon message="发送范围" description={SEND_NOTICE} />
+
+        {/* Alpha.2：数据观察日期（这批播放量 / 星图价是哪天看到的），与「何时保存进系统」分开 */}
+        <div>
+          <Typography.Text type="secondary">数据观察日期</Typography.Text>
+          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
+            <DatePicker
+              value={observedAt ? dayjs(observedAt) : null}
+              format="YYYY-MM-DD"
+              allowClear={false}
+              style={{ width: 180 }}
+              placeholder="请选择观察日期"
+              onChange={(value) => setObservedAt(value ? value.format('YYYY-MM-DD') : '')}
+            />
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              这批播放量和刊例价是哪天看到的（默认今天，可改为实际观察的那天）
+            </Typography.Text>
+          </div>
+        </div>
 
         {/* 上传区：点击 / 拖拽 / 粘贴 */}
         <div
@@ -733,9 +766,12 @@ export default function RecentPerformanceAssistantModal({
                 <Alert
                   type="success"
                   showIcon
-                  message={`已保存快照 #${savedSnapshot.id}（${savedSnapshot.created_at || ''}）`}
+                  message={`已保存快照 #${savedSnapshot.id}（保存于 ${savedSnapshot.created_at || ''}）`}
                   description={
                     <Space direction="vertical" size={2}>
+                      <Typography.Text>
+                        数据观察日期：{savedSnapshot.observed_at || '观察日期未知'}
+                      </Typography.Text>
                       <Typography.Text>
                         有效样本：{formatInteger(savedSnapshot.valid_count)}
                         {savedSnapshot.excluded_count > 0 ? `，排除 ${formatInteger(savedSnapshot.excluded_count)}` : ''}

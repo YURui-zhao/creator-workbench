@@ -259,6 +259,10 @@ export default function CreatorDecisionDrawer({
             <Typography.Text>{formatInteger(snapshot.valid_count)}</Typography.Text>
           </div>
           <div style={factRowStyle}>
+            <Typography.Text type="secondary">数据观察日期</Typography.Text>
+            <Typography.Text>{snapshot.observed_at || '观察日期未知'}</Typography.Text>
+          </div>
+          <div style={factRowStyle}>
             <Typography.Text type="secondary">中位播放 / 典型区间</Typography.Text>
             <Typography.Text>
               {formatPlays(snapshot.median_play)}

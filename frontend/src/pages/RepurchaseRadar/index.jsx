@@ -24,6 +24,7 @@ import RecentPerformanceAssistantModal from '../../components/RecentPerformanceA
 import CreatorDecisionDrawer from '../../components/CreatorDecisionDrawer'
 import {
   formatPlayRange,
+  formatObservedAtHint,
   formatSnapshotStatusText,
   formatTrendRatio,
   TREND_LABELS_FULL
@@ -72,6 +73,8 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
       width: 140,
       render: (value, record) => {
         const snapshot = record.recent_snapshot
+        // Alpha.2：主表行内暴露「这份近期数据是哪天观察的」（无快照时不显示）
+        const observedHint = formatObservedAtHint(snapshot)
         return (
           <div style={{ minWidth: 0 }}>
             <div style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
@@ -87,7 +90,8 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
                     <Space direction="vertical" size={2} style={{ display: 'flex' }}>
                       <Typography.Text strong>近期表现</Typography.Text>
                       <Typography.Text type="secondary">
-                        更新于：{snapshot.created_at || '-'}
+                        数据截至：{snapshot.observed_at || '观察日期未知'}
+                        {snapshot.created_at ? `　保存于：${snapshot.created_at}` : ''}
                       </Typography.Text>
                       <Typography.Text>有效样本：{formatInteger(snapshot.valid_count)}</Typography.Text>
                       {snapshot.stats_status === 'ok' ? (
@@ -179,6 +183,18 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
                 {snapshot?.pricing?.target_price !== null && snapshot?.pricing?.target_price !== undefined && (
                   <span style={{ display: 'block', whiteSpace: 'nowrap' }}>
                     目标价 {formatPrice(snapshot.pricing.target_price)}
+                  </span>
+                )}
+                {observedHint && (
+                  <span
+                    style={{
+                      display: 'block',
+                      whiteSpace: 'nowrap',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis'
+                    }}
+                  >
+                    {observedHint}
                   </span>
                 )}
               </a>

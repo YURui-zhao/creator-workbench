@@ -147,6 +147,8 @@ async function main() {
       creator,
       recognized_creator_name_raw: creator,
       xingtu_price_raw: priceRaw,
+      // Alpha.2：数据观察日期必填
+      observed_at: '2026-09-26',
       plays: plays.map(play)
     })
     const garySnapshot = await callRoute(postSnapshotHandler, {

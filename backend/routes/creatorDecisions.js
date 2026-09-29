@@ -148,6 +148,8 @@ export function buildRecentEvidence(snapshotRow) {
     snapshot_id: snapshotRow.id,
     stats_version: snapshotRow.stats_version,
     created_at: snapshotRow.created_at,
+    // Alpha.2：数据观察日期同样作为事实冻结进证据（旧快照为 null）
+    observed_at: snapshotRow.observed_at ?? null,
     valid_count: snapshotRow.valid_count,
     median_play: snapshotRow.median_play ?? null,
     p25_play: snapshotRow.p25_play ?? null,

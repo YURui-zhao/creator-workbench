@@ -254,6 +254,7 @@ async function main() {
         creator: 'Gary',
         recognized_creator_name_raw: 'Gary',
         xingtu_price_raw: '3000元',
+        observed_at: '2026-09-26', // Alpha.2：数据观察日期必填
         plays: ['52000', '43000', '61000', '50000', '55000', '60000'].map(play)
       }
     })
@@ -295,6 +296,7 @@ async function main() {
         creator: '甲达人',
         recognized_creator_name_raw: '甲达人',
         xingtu_price_raw: '10000元',
+        observed_at: '2026-09-26', // Alpha.2：数据观察日期必填
         plays: ['10000', '20000', '30000', '40000', '50000', '60000', '70000', '80000'].map(play)
       }
     })

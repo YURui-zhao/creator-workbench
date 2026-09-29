@@ -28,6 +28,31 @@ export const TREND_LABELS_FULL = {
   insufficient: '样本不足'
 }
 
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/
+
+/**
+ * 本地年月日 → YYYY-MM-DD。
+ * 刻意不使用 new Date().toISOString().slice(0, 10)：toISOString 走 UTC，
+ * 在东八区凌晨会得到「昨天」，导致数据观察日期凭空少一天。
+ */
+export function todayLocalDateOnly(now = new Date()) {
+  const pad = (value) => String(value).padStart(2, '0')
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+}
+
+/** 严格校验 YYYY-MM-DD（含真实日历校验，2026-02-30 一类不算有效） */
+export function isValidDateOnly(value) {
+  const text = String(value ?? '').trim()
+  if (!DATE_ONLY_RE.test(text)) return false
+  const [year, month, day] = text.split('-').map(Number)
+  const utc = new Date(Date.UTC(year, month - 1, day))
+  return (
+    utc.getUTCFullYear() === year &&
+    utc.getUTCMonth() === month - 1 &&
+    utc.getUTCDate() === day
+  )
+}
+
 /** 名称比较用的轻量归一化（与后端 normalizeCreatorNameForCompare 一致） */
 export function normalizeCreatorNameForCompare(name) {
   return String(name ?? '').trim().toLowerCase().replace(/\s+/g, '')
@@ -51,9 +76,14 @@ export function needsIdentityConfirmation(creator, recognizedNameRaw) {
  * 组装保存 payload：只包含人工确认后的 raw 事实
  * 明确不发送 normalized_play / median / p25 / p75 等派生值（后端会重新解析与计算）
  */
-export function buildSnapshotPayload(draft, { creator, identityConfirmed = false } = {}) {
+export function buildSnapshotPayload(
+  draft,
+  { creator, identityConfirmed = false, observedAt = '' } = {}
+) {
   return {
     creator: String(creator ?? '').trim(),
+    // Alpha.2：数据观察日期由用户明确确认（不是 AI 推断，也不从截图猜）
+    observed_at: String(observedAt ?? '').trim(),
     recognized_creator_name_raw: normalizeRawText(draft?.creator_name),
     identity_confirmed: Boolean(identityConfirmed),
     xingtu_price_raw: normalizeRawText(draft?.xingtu_price_raw),
@@ -95,6 +125,21 @@ export function formatSnapshotStatusText(snapshot) {
   }
   const trend = TREND_LABELS[snapshot.trend_label] || ''
   return `${formatPlays(snapshot.median_play)}${trend ? ` · ${trend}` : ''}`
+}
+
+/**
+ * 雷达主表行内「数据观察日期」提示（Alpha.2 Sprint A1）
+ * - 有快照且有 observed_at → 数据截至 MM-DD
+ * - 有快照但 observed_at 为空/不可解析 → 观察日期未知（旧 Alpha.1 快照；绝不用 created_at 冒充）
+ * - 没有快照 → 空字符串（保持「尚未更新」，不追加观察日期）
+ * observed_at 是 date-only 字符串，直接按字符串取月日，不使用 Date / toISOString（避免时区 ±1 天）。
+ */
+export function formatObservedAtHint(snapshot) {
+  if (!snapshot) return ''
+  const observed = String(snapshot.observed_at ?? '').trim()
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(observed)
+  if (!match) return '观察日期未知'
+  return `数据截至 ${match[2]}-${match[3]}`
 }
 
 /**

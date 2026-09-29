@@ -189,6 +189,7 @@ async function main() {
         creator: 'Gary',
         recognized_creator_name_raw: 'Gary',
         xingtu_price_raw: '3000元',
+        observed_at: '2026-09-26', // Alpha.2：数据观察日期必填
         plays: ['39000', '40000', '42000', '43000', '50000', '52000', '55000', '61000', '62000', '64000', '65000'].map(play)
       }
     })

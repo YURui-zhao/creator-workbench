@@ -14,6 +14,24 @@ const router = Router()
 const MAX_CREATOR_LENGTH = 100
 const MAX_RAW_TEXT_LENGTH = 60
 const MAX_PRICE_RAW_LENGTH = 60
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+
+/**
+ * 严格校验 YYYY-MM-DD（含真实日历校验，2026-02-30 一类必须拒绝）
+ * observed_at 是用户明确确认的业务事实，不接受 AI 推断、不从截图猜测。
+ */
+function isValidDateOnly(value) {
+  if (typeof value !== 'string') return false
+  const text = value.trim()
+  if (!DATE_RE.test(text)) return false
+  const [year, month, day] = text.split('-').map(Number)
+  const utc = new Date(Date.UTC(year, month - 1, day))
+  return (
+    utc.getUTCFullYear() === year &&
+    utc.getUTCMonth() === month - 1 &&
+    utc.getUTCDate() === day
+  )
+}
 
 function ok(res, data) {
   res.json({ code: 200, data, msg: 'success' })
@@ -125,9 +143,21 @@ export function validateSnapshotPayload(body) {
 
   if (errors.length) return { ok: false, message: errors[0] }
 
+  // Alpha.2：数据观察日期必填（后端独立校验，不信任前端）
+  if (body.observed_at === null || body.observed_at === undefined || body.observed_at === '') {
+    return { ok: false, message: '数据观察日期（observed_at）不能为空' }
+  }
+  if (!isValidDateOnly(body.observed_at)) {
+    return {
+      ok: false,
+      message: '数据观察日期（observed_at）必须是真实存在的日期，格式为 YYYY-MM-DD'
+    }
+  }
+  const observedAt = body.observed_at.trim()
+
   return {
     ok: true,
-    value: { creator, recognizedRaw, xingtuPriceRaw, identityConfirmed, plays }
+    value: { creator, recognizedRaw, xingtuPriceRaw, identityConfirmed, plays, observedAt }
   }
 }
 
@@ -198,6 +228,8 @@ export function toPublicSnapshot(row) {
     stats_status: row.stats_status ?? null,
     stats_version: row.stats_version,
     created_at: row.created_at,
+    // Alpha.2：业务观察日期（旧数据为 NULL → 「观察日期未知」）
+    observed_at: row.observed_at ?? null,
     // P3 价格判断层：只消费本快照的统计字段，确定性派生（不写库）
     pricing: computeCreatorPricing({
       stats_status: row.stats_status,
@@ -215,6 +247,7 @@ export function toSnapshotSummary(row) {
   return {
     id: row.id,
     created_at: row.created_at,
+    observed_at: row.observed_at ?? null,
     valid_count: row.valid_count,
     analysis_count: row.analysis_count,
     median_play: row.median_play ?? null,
@@ -236,7 +269,17 @@ export function toSnapshotSummary(row) {
 }
 
 const MAKE_SUMMARY_COLUMNS =
-  'id, creator, created_at, valid_count, analysis_count, median_play, p25_play, p75_play, trend_label, xingtu_price, stats_status, stats_version'
+  'id, creator, created_at, observed_at, valid_count, analysis_count, median_play, p25_play, p75_play, trend_label, xingtu_price, stats_status, stats_version'
+
+/**
+ * 「latest snapshot」排序（Alpha.2 起为唯一口径，GET /latest 与 radar 批量合并共用）：
+ *   1) 有 observed_at 的快照优先（NULL 不得覆盖已有明确观察日期的快照）
+ *   2) observed_at DESC
+ *   3) created_at DESC
+ *   4) id DESC
+ * 若某达人所有快照 observed_at 皆为 NULL，则退化为原 created_at / id 逻辑（兼容 Alpha.1 数据）。
+ */
+const LATEST_SNAPSHOT_ORDER_SQL = 'ORDER BY observed_at IS NULL ASC, observed_at DESC, created_at DESC, id DESC'
 
 /**
  * 批量读取多个达人的最新快照 summary（单条 SQL，避免前端 N+1）
@@ -253,7 +296,7 @@ export function loadLatestSnapshotSummaries(creatorList = []) {
       `SELECT ${MAKE_SUMMARY_COLUMNS}
        FROM creator_recent_snapshots
        WHERE creator IN (${placeholders})
-       ORDER BY created_at DESC, id DESC`
+       ${LATEST_SNAPSHOT_ORDER_SQL}`
     )
     .all(...creators)
   for (const row of rows) {
@@ -276,7 +319,7 @@ router.post('/', (req, res) => {
   const validated = validateSnapshotPayload(req.body)
   if (!validated.ok) return fail(res, 400, validated.message)
 
-  const { creator, recognizedRaw, xingtuPriceRaw, plays } = validated.value
+  const { creator, recognizedRaw, xingtuPriceRaw, plays, observedAt } = validated.value
 
   // creator 必须存在于历史投放记录中（P2B 不引入 creator master）
   if (!findCreatorRecord(creator)) {
@@ -293,8 +336,8 @@ router.post('/', (req, res) => {
          creator, recognized_creator_name_raw, source_type, xingtu_price_raw, xingtu_price, plays_json,
          recognized_count, valid_count, excluded_count, unresolved_count, analysis_count,
          median_play, p25_play, p75_play, recent_median_play, prior_median_play,
-         trend_ratio, trend_label, stats_status, stats_version
-       ) VALUES (?, ?, 'screenshot', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         trend_ratio, trend_label, stats_status, stats_version, observed_at
+       ) VALUES (?, ?, 'screenshot', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       creator,
@@ -315,7 +358,8 @@ router.post('/', (req, res) => {
       stats.trend_ratio,
       stats.trend_label,
       stats.stats_status,
-      STATS_VERSION
+      STATS_VERSION,
+      observedAt
     )
 
   const saved = db
@@ -338,7 +382,7 @@ router.get('/latest', (req, res) => {
     .prepare(
       `SELECT * FROM creator_recent_snapshots
        WHERE creator = ?
-       ORDER BY created_at DESC, id DESC
+       ${LATEST_SNAPSHOT_ORDER_SQL}
        LIMIT 1`
     )
     .get(creator)

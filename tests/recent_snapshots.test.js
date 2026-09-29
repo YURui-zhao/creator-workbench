@@ -85,6 +85,10 @@ const play = (raw_text, extra = {}) => ({
   ...extra
 })
 
+// Alpha.2：observed_at 必填。默认观察日期仅用于「与 observed_at 语义无关」的既有用例；
+// observed_at 专项语义在最后新增的小节中单独覆盖。
+const DEFAULT_OBSERVED_AT = '2026-09-29'
+
 async function main() {
   const networkGuard = forbidNetwork()
   try {
@@ -95,6 +99,9 @@ async function main() {
       pathToFileURL(path.join(root, 'backend/utils/recentPerformanceStats.js')).href
     )
     const records = await import(pathToFileURL(path.join(root, 'backend/routes/records.js')).href)
+    const decisions = await import(
+      pathToFileURL(path.join(root, 'backend/routes/creatorDecisions.js')).href
+    )
     const saveLib = await import(
       pathToFileURL(path.join(frontend, 'utils/recentPerformanceSave.js')).href
     )
@@ -110,13 +117,22 @@ async function main() {
     const postHandler = findHandler(snapshotRouter, '/', 'post')
     const latestHandler = findHandler(snapshotRouter, '/latest', 'get')
     const radarHandler = findHandler(records.default, '/repurchase-radar', 'get')
+    const createDecisionHandler = findHandler(decisions.default, '/', 'post')
 
     const callRoute = async (handler, { body = {}, query = {}, headers = {} } = {}) => {
       const res = response()
       await handler({ body, query, headers }, res)
       return { status: res.statusCode, body: res.body, data: res.body?.data, msg: res.body?.msg }
     }
-    const save = (payload, headers) => callRoute(postHandler, { body: payload, headers })
+    // 对象 payload 自动带上 observed_at（Alpha.2 起必填）；数组等非法 body 原样透传，
+    // 以便「请求体不是对象 → 400」这类既有断言仍然走原路径。
+    const save = (payload, headers) => {
+      const body =
+        payload && typeof payload === 'object' && !Array.isArray(payload)
+          ? { observed_at: DEFAULT_OBSERVED_AT, ...payload }
+          : payload
+      return callRoute(postHandler, { body, headers })
+    }
     const latest = (creator) => callRoute(latestHandler, { query: { creator } })
     const radar = () => callRoute(radarHandler, { query: {} })
 
@@ -127,7 +143,7 @@ async function main() {
       'xingtu_price', 'plays_json', 'recognized_count', 'valid_count', 'excluded_count',
       'unresolved_count', 'analysis_count', 'median_play', 'p25_play', 'p75_play',
       'recent_median_play', 'prior_median_play', 'trend_ratio', 'trend_label',
-      'stats_status', 'stats_version', 'created_at'
+      'stats_status', 'stats_version', 'created_at', 'observed_at'
     ]
     check('creator_recent_snapshots 列齐全', expectedColumns.every((name) => columns.includes(name)), JSON.stringify(columns))
     // DDL 类型回归守卫：每列必须显式声明类型，禁止「逗号前共享类型」写法导致无类型列
@@ -153,7 +169,7 @@ async function main() {
     )
     check(
       '状态列类型均为 TEXT',
-      ['trend_label', 'stats_status', 'stats_version'].every((name) => columnTypes[name] === 'TEXT')
+      ['trend_label', 'stats_status', 'stats_version', 'observed_at'].every((name) => columnTypes[name] === 'TEXT')
     )
     check(
       '没有任何列缺失类型声明',
@@ -387,10 +403,24 @@ async function main() {
     check('前端：选择目标达人后才提示不一致', saveLib.needsIdentityConfirmation('旧史新解', 'Gary') === true)
     const payload = saveLib.buildSnapshotPayload(
       { creator_name: 'Gary', xingtu_price_raw: '¥3000', plays: [{ raw_text: '5.2万', normalized_play: 52000, excluded: true, source_image_index: 2, position_index: 3 }] },
-      { creator: 'Gary', identityConfirmed: false }
+      { creator: 'Gary', identityConfirmed: false, observedAt: '2026-09-25' }
     )
     check('前端 payload 不含任何派生统计值', !('normalized_play' in payload.plays[0]) && !('median_play' in payload) && !('valid_count' in payload), JSON.stringify(payload))
     check('前端 payload 保留 raw 事实', payload.plays[0].raw_text === '5.2万' && payload.plays[0].excluded === true && payload.plays[0].source_image_index === 2)
+    check('前端 payload 携带数据观察日期', payload.observed_at === '2026-09-25', JSON.stringify(payload.observed_at))
+    // Alpha.2：本地日期（不能用 UTC，否则东八区凌晨会少一天）
+    check(
+      '本地日期生成：东八区凌晨 00:30 仍是当天（不使用 toISOString）',
+      saveLib.todayLocalDateOnly(new Date(2026, 8, 29, 0, 30)) === '2026-09-29' &&
+        new Date(2026, 8, 29, 0, 30).toISOString().slice(0, 10) === '2026-09-28'
+    )
+    check(
+      '前端日期校验与后端一致（2026-02-30 / 2026-9-29 / 空 均无效）',
+      saveLib.isValidDateOnly('2026-09-29') === true &&
+        saveLib.isValidDateOnly('2026-02-30') === false &&
+        saveLib.isValidDateOnly('2026-9-29') === false &&
+        saveLib.isValidDateOnly('') === false
+    )
     check('前端状态文案：无快照 → 尚未更新', saveLib.formatSnapshotStatusText(null) === '尚未更新')
     check('前端状态文案：样本不足', saveLib.formatSnapshotStatusText({ stats_status: 'insufficient', median_play: null }) === '样本不足')
     check('前端状态文案：中位 + 趋势', saveLib.formatSnapshotStatusText({ stats_status: 'ok', median_play: 52000, trend_label: 'stable' }) === '5.2万 · 稳定')
@@ -459,7 +489,202 @@ async function main() {
       flatten(radarWithSnapshot.data).find((item) => item.creator === '戊达人')?.recent_snapshot?.valid_count === 8
     )
 
-    console.log('\n===== 10. 无 AI / 无网络 / 只读实现 =====')
+    console.log('\n===== 10. Alpha.2：observed_at（数据观察日期）与 latest 新语义 =====')
+    const eightPlays = () => ['1万', '2万', '3万', '4万', '5万', '6万', '7万', '8万'].map((text) => play(text))
+    const pinCreatedAt = (id, createdAt) =>
+      db.prepare('UPDATE creator_recent_snapshots SET created_at = ? WHERE id = ?').run(createdAt, id)
+    // 本节使用全新达人，避免与前序小节已保存的快照相互干扰（语义断言必须确定）
+    const OBS_A = '观测达人甲'
+    const OBS_B = '观测达人乙'
+    const OBS_C = '观测达人丙'
+    const OBS_D = '观测达人丁'
+    const OBS_E = '观测达人戊'
+    const OBS_F = '观测达人己'
+    const OBS_G = '观测达人庚' // 本节刻意不保存任何快照（用于 radar「无快照 → null」断言）
+    const seedObsCreator = (nickname) =>
+      insertRecord.run('2026-W36', nickname, '数码', 1000, '2026-09-05', 10000, 50000)
+    db.transaction(() => {
+      for (const nickname of [OBS_A, OBS_B, OBS_C, OBS_D, OBS_E, OBS_F, OBS_G]) seedObsCreator(nickname)
+    })()
+    // 雷达 P1 基线：在「本节达人已入库、但尚未保存任何快照」时采集，
+    // 因此 observed_at 相关的所有写入都不得改变任何达人的 P1 字段与顺序
+    const radarBaselineBeforeObs = await radar()
+    const baselineCreators = new Set(
+      radarBaselineBeforeObs.data.groups.flatMap((group) => group.creators.map((item) => item.creator))
+    )
+    const baselineP1 = radarBaselineBeforeObs.data.groups
+      .flatMap((group) => group.creators)
+      .map((item) => {
+        const { recent_snapshot, recent_decision, ...rest } = item
+        return rest
+      })
+
+    check(
+      'schema：observed_at 为 TEXT 且可空（旧快照保持 NULL，不伪装 created_at）',
+      columnTypes.observed_at === 'TEXT' && notNull.observed_at === 0,
+      `${columnTypes.observed_at}/${notNull.observed_at}`
+    )
+
+    const obsSaved = await save({
+      creator: OBS_A,
+      recognized_creator_name_raw: OBS_A,
+      xingtu_price_raw: '3000',
+      observed_at: '2026-09-26',
+      plays: eightPlays()
+    })
+    check(
+      '新快照保存并返回 observed_at（created_at 语义不变，仍为保存时间）',
+      obsSaved.status === 200 &&
+        obsSaved.data.observed_at === '2026-09-26' &&
+        typeof obsSaved.data.created_at === 'string' &&
+        obsSaved.data.created_at.slice(0, 4) === '2026',
+      JSON.stringify({ observed_at: obsSaved.data?.observed_at, created_at: obsSaved.data?.created_at })
+    )
+    check(
+      'GET /latest 返回 observed_at',
+      (await latest(OBS_A)).data.snapshot.id === obsSaved.data.id &&
+        (await latest(OBS_A)).data.snapshot.observed_at === '2026-09-26'
+    )
+
+    const missingObserved = await callRoute(postHandler, { body: { creator: OBS_A, plays: [play('1万')] } })
+    check(
+      '缺少 observed_at → 400（Alpha.2 起必填）',
+      missingObserved.status === 400 && /观察日期/.test(missingObserved.msg),
+      missingObserved.msg
+    )
+    for (const bad of ['2026/09/26', '20260926', '2026-9-26', '2026-02-30', '2026-13-01', 'today', 20260926, true]) {
+      const res = await callRoute(postHandler, {
+        body: { creator: OBS_A, observed_at: bad, plays: [play('1万')] }
+      })
+      check(`非法 observed_at（${JSON.stringify(bad)}）→ 400`, res.status === 400, res.msg)
+    }
+    check(
+      'observed_at 空白字符串 → 400',
+      (await callRoute(postHandler, { body: { creator: OBS_A, observed_at: '   ', plays: [play('1万')] } })).status === 400
+    )
+    check(
+      '闰年真实日期 2028-02-29 允许保存',
+      (await save({ creator: OBS_F, observed_at: '2028-02-29', plays: eightPlays() })).status === 200
+    )
+
+    // ---- 关键场景：补录旧截图不得让「最近表现」倒退 ----
+    const snapA = await save({ creator: OBS_B, observed_at: '2026-09-29', plays: eightPlays() })
+    pinCreatedAt(snapA.data.id, '2026-09-29 08:00:00')
+    const snapB = await save({ creator: OBS_B, observed_at: '2026-09-25', plays: eightPlays() })
+    pinCreatedAt(snapB.data.id, '2026-09-30 08:00:00') // B 保存得更晚
+    check(
+      '补录旧观察日期（B 保存更晚）→ latest 仍为 observed 09-29 的 A',
+      (await latest(OBS_B)).data.snapshot.id === snapA.data.id,
+      JSON.stringify({ latest: (await latest(OBS_B)).data.snapshot?.observed_at })
+    )
+    const snapC = await save({ creator: OBS_B, observed_at: '2026-10-01', plays: eightPlays() })
+    pinCreatedAt(snapC.data.id, '2026-10-01 08:00:00')
+    check('出现更新的 observed_at → latest 切换为 C', (await latest(OBS_B)).data.snapshot.id === snapC.data.id)
+
+    // ---- 同一 observed_at：created_at DESC, id DESC ----
+    const same1 = await save({ creator: OBS_C, observed_at: '2026-10-05', plays: eightPlays() })
+    pinCreatedAt(same1.data.id, '2026-10-05 07:00:00')
+    const same2 = await save({ creator: OBS_C, observed_at: '2026-10-05', plays: eightPlays() })
+    pinCreatedAt(same2.data.id, '2026-10-05 09:00:00')
+    check(
+      '同一 observed_at → created_at 更晚者优先',
+      (await latest(OBS_C)).data.snapshot.id === same2.data.id
+    )
+    const same3 = await save({ creator: OBS_C, observed_at: '2026-10-05', plays: eightPlays() })
+    pinCreatedAt(same3.data.id, '2026-10-05 09:00:00') // 同 created_at，id 更大
+    check('同一 observed_at + 同一 created_at → id 更大者优先', (await latest(OBS_C)).data.snapshot.id === same3.data.id)
+
+    // ---- 旧数据（observed_at NULL）不得覆盖明确观察日期 ----
+    const insertLegacySnapshot = (creator, createdAt, median) =>
+      Number(
+        db
+          .prepare(
+            `INSERT INTO creator_recent_snapshots (
+               creator, source_type, plays_json, recognized_count, valid_count, excluded_count,
+               unresolved_count, analysis_count, median_play, p25_play, p75_play,
+               trend_label, stats_status, stats_version, created_at, observed_at
+             ) VALUES (?, 'screenshot', ?, 8, 8, 0, 0, 8, ?, ?, ?, 'stable', 'ok', ?, ?, NULL)`
+          )
+          .run(creator, JSON.stringify([]), median, median, median, 'recent-performance-v1', createdAt)
+          .lastInsertRowid
+      )
+    const legacyLater = insertLegacySnapshot(OBS_D, '2026-10-08 08:00:00', 60000)
+    const observedOlder = await save({ creator: OBS_D, observed_at: '2026-09-20', plays: eightPlays() })
+    pinCreatedAt(observedOlder.data.id, '2026-09-20 08:00:00')
+    check(
+      '旧快照 observed_at=NULL（保存更晚）不覆盖已有明确观察日期的快照',
+      (await latest(OBS_D)).data.snapshot.id === observedOlder.data.id,
+      JSON.stringify({ latestId: (await latest(OBS_D)).data.snapshot?.id, legacyId: legacyLater })
+    )
+    const legacyOnlyA = insertLegacySnapshot(OBS_E, '2026-09-10 08:00:00', 30000)
+    const legacyOnlyB = insertLegacySnapshot(OBS_E, '2026-09-11 08:00:00', 40000)
+    check(
+      '全部 observed_at=NULL 的达人 → 保留 created_at/id fallback（取保存更晚者）',
+      (await latest(OBS_E)).data.snapshot.id === legacyOnlyB && legacyOnlyB !== legacyOnlyA
+    )
+
+    // ---- radar 使用同一 latest 语义，且不改变 P1 ----
+    const radarAfterObserved = await radar()
+    const creatorSnapshot = (data, creator) =>
+      data.groups.flatMap((group) => group.creators).find((item) => item.creator === creator)?.recent_snapshot
+    check(
+      'radar 合并的是 latest observed snapshot（观测达人乙 = C / observed 10-01）',
+      creatorSnapshot(radarAfterObserved.data, OBS_B)?.id === snapC.data.id &&
+        creatorSnapshot(radarAfterObserved.data, OBS_B)?.observed_at === '2026-10-01'
+    )
+    check(
+      'radar summary 携带 observed_at（无快照达人仍为 null）',
+      'observed_at' in creatorSnapshot(radarAfterObserved.data, OBS_B) &&
+        creatorSnapshot(radarAfterObserved.data, OBS_G) === null
+    )
+    check(
+      'radar 的 P1 字段与 observed_at 无关（既有达人与本节插入新达人前的基线完全一致）',
+      JSON.stringify(
+        radarAfterObserved.data.groups
+          .flatMap((g) => g.creators)
+          .filter((item) => baselineCreators.has(item.creator))
+          .map((item) => {
+            const { recent_snapshot, recent_decision, ...rest } = item
+            return rest
+          })
+      ) === JSON.stringify(baselineP1)
+    )
+
+    // ---- Decision evidence 冻结 observed_at ----
+    const decisionRes = await callRoute(createDecisionHandler, {
+      body: {
+        creator: OBS_A,
+        decision_stage: 'contact',
+        snapshot_id: obsSaved.data.id,
+        ip_judgement: 'strong',
+        human_decision: 'contact_now'
+      }
+    })
+    check(
+      'Decision evidence 冻结 observed_at',
+      decisionRes.status === 200 && decisionRes.data.recent_evidence.observed_at === '2026-09-26',
+      JSON.stringify(decisionRes.data?.recent_evidence)
+    )
+    check(
+      '旧快照（observed_at=NULL）冻结进证据时为 null，不回填 created_at',
+      (() => {
+        const row = db.prepare('SELECT * FROM creator_recent_snapshots WHERE id = ?').get(legacyLater)
+        return decisions.buildRecentEvidence(row).observed_at === null
+      })()
+    )
+
+    // ---- 无漂移：observed_at 不参与统计 / 价格 / V2 指标 ----
+    const statsSame = ['median_play', 'p25_play', 'p75_play', 'trend_label', 'trend_ratio', 'valid_count', 'analysis_count'].every(
+      (key) => snapA.data[key] === snapB.data[key]
+    )
+    check('observed_at 不改变统计口径（同样本不同 observed_at → median/P25/P75/trend 完全一致）', statsSame)
+    check(
+      'observed_at 不改变 creatorPricing（同星图价 → 同一套目标价 / 参考区间 / 价格状态）',
+      JSON.stringify(snapA.data.pricing) === JSON.stringify(snapB.data.pricing) &&
+        snapA.data.pricing.pricing_version === 'creator-pricing-v1'
+    )
+
+    console.log('\n===== 11. 无 AI / 无网络 / 只读实现 =====')
     const routeSource = fs.readFileSync(path.join(root, 'backend/routes/recentSnapshots.js'), 'utf8')
     check('P2B 路由不引用任何 AI 服务', !/deepseek|callProviderVision|extract-creator-screenshot/i.test(routeSource))
     check('P2B 路由只注册 POST / 与 GET /latest', snapshotRouter.stack.filter((l) => l.route).map((l) => `${Object.keys(l.route.methods)[0].toUpperCase()} ${l.route.path}`).sort().join(' | ') === 'GET /latest | POST /', snapshotRouter.stack.filter((l) => l.route).map((l) => `${Object.keys(l.route.methods)[0].toUpperCase()} ${l.route.path}`).join(' | '))

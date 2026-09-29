@@ -107,7 +107,10 @@ db.exec(`
     trend_label TEXT NOT NULL,
     stats_status TEXT NOT NULL,
     stats_version TEXT NOT NULL,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    -- V3-alpha.2 Sprint A1：业务观察日期（这批播放量 / 星图价是哪天看到的）
+    -- 语义与 created_at（何时保存进系统）永久分开；格式固定 YYYY-MM-DD；旧数据保持 NULL
+    observed_at TEXT
   );
 
   CREATE INDEX IF NOT EXISTS idx_recent_snapshots_creator_created
@@ -162,6 +165,20 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_decision_outcomes_record
     ON creator_decision_outcomes(record_id);
 `)
+
+// V3-alpha.2 Sprint A1：为既有数据库安全补充 observed_at（数据观察日期）
+// 说明：
+//   · 只在列不存在时 ALTER TABLE，不覆盖任何已有快照
+//   · 绝不把 created_at 伪装成 observed_at —— 保存日期不一定等于真实观察日期，
+//     旧快照保持 NULL，由 UI 显示「观察日期未知」
+const snapshotColumns = db
+  .prepare('PRAGMA table_info(creator_recent_snapshots)')
+  .all()
+  .map((column) => column.name)
+if (!snapshotColumns.includes('observed_at')) {
+  db.exec('ALTER TABLE creator_recent_snapshots ADD COLUMN observed_at TEXT')
+  console.log('[db] 已为 creator_recent_snapshots 添加 observed_at 列（历史快照保持 NULL）')
+}
 
 // 首次启动写入示例项目（前端工作台展示用）
 const projectCount = db.prepare('SELECT COUNT(*) AS n FROM projects').get().n

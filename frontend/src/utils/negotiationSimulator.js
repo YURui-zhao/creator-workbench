@@ -15,6 +15,12 @@ export const SIMULATOR_MAX_RATE = 0.7
 export const SIMULATOR_DEFAULT_RATE = 0.7 // 默认区间内价格最高的一档，由用户自行向下探索
 export const SIMULATOR_STEP_RATE = 0.01 // 0.1 折
 
+// 统一的「恰好相等」比较容差：与后端 creatorPricing 的 epsilon 语义一致。
+// 只用于边界稳定判定，不参与任何数值输出；判定一律基于 raw 值，不做 round 后再比较。
+// 例如 xingtu=3000 / rate=0.55 → 3000*0.55 = 1650.0000000000002，
+// 裸 <= 1650 会误判为「高于参考区间」，加上 epsilon 后稳定判为 within_reference_range。
+export const COMPARE_EPSILON = 1e-6
+
 export const SIMULATOR_STATUS = {
   atOrBelowTarget: 'at_or_below_target',
   withinReferenceRange: 'within_reference_range',
@@ -28,6 +34,7 @@ export const SIMULATOR_STATUS_LABELS = {
 }
 
 const isFiniteNumber = (value) => typeof value === 'number' && Number.isFinite(value)
+const lte = (a, b) => a <= b + COMPARE_EPSILON
 
 /** 把任意输入夹到 [2折, 7折]，并归一到 0.1 折步长 */
 export function clampSimulatorRate(rate) {
@@ -91,9 +98,10 @@ export function simulateNegotiation({
   const price = xingtuPrice * selectedRate
   const cpm = isFiniteNumber(medianPlay) && medianPlay > 0 ? (price / medianPlay) * 1000 : null
 
+  // raw 价格 + 统一 epsilon 比较：恰好等于边界时不得因二进制浮点误差被判成「高于」
   let status = SIMULATOR_STATUS.aboveReferenceRange
-  if (price <= targetPrice) status = SIMULATOR_STATUS.atOrBelowTarget
-  else if (price <= referenceHigh) status = SIMULATOR_STATUS.withinReferenceRange
+  if (lte(price, targetPrice)) status = SIMULATOR_STATUS.atOrBelowTarget
+  else if (lte(price, referenceHigh)) status = SIMULATOR_STATUS.withinReferenceRange
 
   return {
     ...base,

@@ -140,7 +140,60 @@ async function main() {
     const medianZero = simulateNegotiation({ xingtuPrice: 3000, medianPlay: 0, targetPrice: 1560, referenceHigh: 1830, rate: 0.7 })
     check('中位播放为 0 时不计算 CPM（仍可看价格与状态）', medianZero.available === true && medianZero.cpm === null && medianZero.price === 2100)
 
-    console.log('\n===== 5. 源码契约（不写库 / 不调 AI / 逻辑集中）=====')
+    console.log('\n===== 5. 金额边界浮点稳定（epsilon，raw 值判定）=====')
+    // 标准边界场景：星图 3000 / 中位播放 48000 → target 1440 / reference_high 1650
+    const edgeBase = { xingtuPrice: 3000, medianPlay: 48000, targetPrice: 1440, referenceHigh: 1650 }
+    const raw55 = 3000 * 0.55
+    check(
+      '复现二进制浮点误差：3000 × 0.55 = 1650.0000000000002（裸 <= 会误判）',
+      raw55 !== 1650 && raw55 <= 1650 + 1e-6 && Math.abs(raw55 - 1650) < 1e-9,
+      String(raw55)
+    )
+    const atHighEdge = simulateNegotiation({ ...edgeBase, rate: 0.55 })
+    check(
+      '5.5折（raw 1650.0000000000002）恰好等于参考区间上限 → within_reference_range，不得判成 above_reference_range',
+      atHighEdge.price === 1650 &&
+        atHighEdge.status === 'within_reference_range' &&
+        atHighEdge.status_label === '已进入 CPM30参考区间',
+      JSON.stringify(atHighEdge)
+    )
+    const atTargetEdge = simulateNegotiation({ ...edgeBase, rate: 0.48 })
+    check(
+      '4.8折（= 3000 × 0.48）恰好等于 CPM30目标价 → at_or_below_target',
+      atTargetEdge.price === 1440 && atTargetEdge.status === 'at_or_below_target',
+      JSON.stringify(atTargetEdge)
+    )
+    const justInside = simulateNegotiation({ xingtuPrice: 3000.000001, medianPlay: 48000, targetPrice: 1440, referenceHigh: 1650, rate: 0.55 })
+    check(
+      '超出边界不足 epsilon（差 5.5e-10）仍按「恰好相等」判 within_reference_range',
+      justInside.status === 'within_reference_range',
+      JSON.stringify(justInside)
+    )
+    const reallyAbove = simulateNegotiation({ xingtuPrice: 3000.0001, medianPlay: 48000, targetPrice: 1440, referenceHigh: 1650, rate: 0.55 })
+    check(
+      '真正超过 epsilon（差 5.5e-5）仍判 above_reference_range（容差不吞掉真实差距）',
+      reallyAbove.status === 'above_reference_range',
+      JSON.stringify(reallyAbove)
+    )
+    const stepAbove = simulateNegotiation({ ...edgeBase, rate: 0.56 })
+    check(
+      '5.6折（1680，真实高于上限 30 元）→ above_reference_range',
+      stepAbove.price === 1680 && stepAbove.status === 'above_reference_range' && stepAbove.status_label === '仍高于 CPM30参考区间',
+      JSON.stringify(stepAbove)
+    )
+    const stepBetween = simulateNegotiation({ ...edgeBase, rate: 0.49 })
+    check(
+      '4.9折（1470，高于目标价但在参考区间内）→ within_reference_range',
+      stepBetween.price === 1470 && stepBetween.status === 'within_reference_range',
+      JSON.stringify(stepBetween)
+    )
+    check(
+      'epsilon 只用于判定、不参与数值输出（price / CPM 仍按 raw 值正常展示）',
+      sim.COMPARE_EPSILON === 1e-6 && atHighEdge.cpm === 34.4 && atHighEdge.zhe_label === '5.5折',
+      `eps=${sim.COMPARE_EPSILON} cpm=${atHighEdge.cpm}`
+    )
+
+    console.log('\n===== 6. 源码契约（不写库 / 不调 AI / 逻辑集中）=====')
     const simSource = fs.readFileSync(path.join(frontend, 'utils/negotiationSimulator.js'), 'utf8')
     const drawerSource = fs.readFileSync(path.join(frontend, 'components/CreatorDecisionDrawer.jsx'), 'utf8')
     check('试算器模块不引用网络 / AI / 存储', !/fetch\(|axios|deepseek|localStorage|sessionStorage/i.test(simSource))

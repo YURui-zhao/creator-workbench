@@ -241,6 +241,10 @@ async function main() {
           'fail_count',
           'historical_status',
           'historical_status_label',
+          'work_priority',
+          'work_priority_reason',
+          'work_priority_label',
+          'single_sample_cpm',
           'median_cpm',
           'last_collaboration_date',
           'days_since_last_collaboration',
@@ -392,10 +396,20 @@ async function main() {
     '两次调用顺序完全一致（稳定排序）',
     JSON.stringify(secondCall.data.groups) === JSON.stringify(base.data.groups)
   )
+  // Alpha.2 B1 起，「需要观察」内先按工作优先级（高注意力优先），同层才有证据的（mixed）先于证据不足
   check(
-    '「需要观察」内 mixed 先于 insufficient',
-    watch.findIndex((item) => item.historical_status === 'insufficient') >
-      watch.findIndex((item) => item.historical_status === 'mixed')
+    '「需要观察」内先按 work_priority 排序，同层 mixed 先于 insufficient',
+    (() => {
+      const rank = (value) => ({ high_attention: 0, medium_attention: 1, normal_attention: 2 })[value] ?? 3
+      const ranks = watch.map((item) => rank(item.work_priority))
+      const sortedByPriority = ranks.every((value, i) => i === 0 || ranks[i - 1] <= value)
+      const sameRankStatuses = watch.map((item) => `${rank(item.work_priority)}:${item.historical_status}`)
+      // 同一优先级层内：mixed 必须排在 insufficient 之前
+      const firstInsufficientNormal = sameRankStatuses.indexOf('2:insufficient')
+      const lastMixedNormal = sameRankStatuses.lastIndexOf('2:mixed')
+      return sortedByPriority && (firstInsufficientNormal === -1 || lastMixedNormal < firstInsufficientNormal)
+    })(),
+    JSON.stringify(watch.map((item) => `${item.creator}:${item.work_priority}:${item.historical_status}`))
   )
 
   console.log('\n===== 12c. 排序精度：raw 中位数不同但展示值相同 =====')
@@ -623,6 +637,197 @@ async function main() {
     /const RADAR_TABLE_WIDTH = 836/.test(radarPageSource) &&
       (radarPageSource.match(/title: '/g) || []).length === 9,
     `columnTitles=${(radarPageSource.match(/title: '/g) || []).length}`
+  )
+
+  console.log('\n===== 16. Alpha.2 B1：工作优先级（只分配注意力，不改变历史证据结论）=====')
+  db.prepare('DELETE FROM creator_records').run()
+  // 单样本阈值边界全部覆盖（累计播放量统一 100000，便于手算：CPM = cost / 100）
+  const B1_SEED = [
+    // 单样本 CPM 8 → high_attention
+    ['2026-W33', '优先级甲', '数码', 800, '2026-08-10', 20000, 100000],
+    // 单样本 CPM 10（含等号）→ high_attention
+    ['2026-W33', '优先级乙', '数码', 1000, '2026-08-10', 20000, 100000],
+    // 单样本 raw 10.0001（展示 round2 = 10）→ 必须按 raw 判为 medium_attention
+    ['2026-W34', '优先级丙', '数码', 1000.01, '2026-08-17', 20000, 100000],
+    // 单样本 CPM 20（含等号）→ medium_attention
+    ['2026-W35', '优先级丁', '数码', 2000, '2026-08-24', 20000, 100000],
+    // 单样本 raw 20.0001（展示 round2 = 20）→ 必须按 raw 判为 normal_attention
+    ['2026-W36', '优先级戊', '数码', 2000.01, '2026-08-31', 20000, 100000],
+    // 单样本 CPM 99.99 → normal_attention
+    ['2026-W37', '优先级己', '数码', 9999, '2026-09-07', 20000, 100000],
+    // 单样本 CPM 100（含等号）→ low_priority（移入「暂不优先」）
+    ['2026-W38', '优先级庚', '数码', 10000, '2026-09-14', 20000, 100000],
+    // 单样本 CPM 150 → low_priority
+    ['2026-W39', '优先级辛', '数码', 15000, '2026-09-21', 20000, 100000],
+    // 没有有效样本（累计播放量未填）→ normal_attention，仍留在「需要观察」
+    ['2026-W39', '优先级壬', '数码', 5000, '2026-09-21', 20000, null],
+    // 多样本 passed（15 / 25）→ high_attention，但仍按原 P1 多数规则判定
+    ['2026-W37', '多样本甲', '美妆', 1500, '2026-08-10', 20000, 100000],
+    ['2026-W38', '多样本甲', '美妆', 2500, '2026-08-17', 20000, 100000],
+    // 多样本 mixed（10 / 50）→ normal_attention
+    ['2026-W37', '多样本乙', '美妆', 1000, '2026-08-10', 20000, 100000],
+    ['2026-W38', '多样本乙', '美妆', 5000, '2026-08-17', 20000, 100000],
+    // 多样本 failed（40 / 50 / 60）→ low_priority，无单样本标记
+    ['2026-W37', '多样本丙', '美妆', 4000, '2026-08-10', 20000, 100000],
+    ['2026-W38', '多样本丙', '美妆', 5000, '2026-08-17', 20000, 100000],
+    ['2026-W39', '多样本丙', '美妆', 6000, '2026-08-24', 20000, 100000]
+  ]
+  db.transaction(() => {
+    for (const row of B1_SEED) insert.run(...row)
+  })()
+  const b1 = await call({ current_date: REFERENCE_DATE })
+  const b1Priority = byCreator(b1.data.groups[0].creators)
+  const b1Watch = byCreator(b1.data.groups[1].creators)
+  const b1Low = byCreator(b1.data.groups[2].creators)
+
+  check(
+    'B1-1 单样本 CPM 8 → evidence 仍 insufficient，但 work_priority = high_attention（留在需要观察）',
+    b1Watch['优先级甲']?.historical_status === 'insufficient' &&
+      b1Watch['优先级甲']?.work_priority === 'high_attention' &&
+      b1Watch['优先级甲']?.work_priority_reason === 'single_sample_cpm_le_10' &&
+      b1Watch['优先级甲']?.work_priority_label === '单次表现突出' &&
+      b1Watch['优先级甲']?.single_sample_cpm === 8 &&
+      !b1Priority['优先级甲'] &&
+      !b1Low['优先级甲']
+  )
+  check(
+    'B1-2 单样本 CPM = 10（含等号）→ high_attention',
+    b1Watch['优先级乙']?.work_priority === 'high_attention' &&
+      b1Watch['优先级乙']?.single_sample_cpm === 10
+  )
+  check(
+    'B1-3 单样本 raw 10.0001（展示 10）→ medium_attention（raw 判定，不是展示值）',
+    b1Watch['优先级丙']?.work_priority === 'medium_attention' &&
+      b1Watch['优先级丙']?.work_priority_reason === 'single_sample_cpm_le_20' &&
+      b1Watch['优先级丙']?.single_sample_cpm === 10 &&
+      b1Watch['优先级丙']?.work_priority_label === '优先补数据'
+  )
+  check(
+    'B1-4 单样本 CPM = 20（含等号）→ medium_attention',
+    b1Watch['优先级丁']?.work_priority === 'medium_attention'
+  )
+  check(
+    'B1-5 单样本 raw 20.0001（展示 20）→ normal_attention',
+    b1Watch['优先级戊']?.work_priority === 'normal_attention' &&
+      b1Watch['优先级戊']?.work_priority_reason === 'single_sample_cpm_normal' &&
+      b1Watch['优先级戊']?.work_priority_label === null
+  )
+  check(
+    'B1-6 单样本 CPM 99.99 → normal_attention（无标记）',
+    b1Watch['优先级己']?.work_priority === 'normal_attention' &&
+      b1Watch['优先级己']?.work_priority_label === null
+  )
+  check(
+    'B1-7 单样本 CPM = 100 → low_priority，移入「暂不优先」，evidence 仍是 insufficient',
+    b1Low['优先级庚']?.work_priority === 'low_priority' &&
+      b1Low['优先级庚']?.work_priority_reason === 'single_sample_cpm_ge_100' &&
+      b1Low['优先级庚']?.work_priority_label === '单次合作明显低效' &&
+      b1Low['优先级庚']?.historical_status === 'insufficient' &&
+      !b1Watch['优先级庚'] &&
+      !b1Priority['优先级庚']
+  )
+  check(
+    'B1-8 单样本 CPM 150 → 同样进入「暂不优先」',
+    b1Low['优先级辛']?.work_priority === 'low_priority' && !b1Watch['优先级辛']
+  )
+  check(
+    'B1-9 无有效样本 → insufficient + normal_attention（不做正负判断），仍在需要观察',
+    b1Watch['优先级壬']?.valid_cpm_count === 0 &&
+      b1Watch['优先级壬']?.historical_status === 'insufficient' &&
+      b1Watch['优先级壬']?.work_priority === 'normal_attention' &&
+      b1Watch['优先级壬']?.work_priority_reason === 'no_valid_sample' &&
+      b1Watch['优先级壬']?.single_sample_cpm === null
+  )
+  check(
+    'B1-10 多样本 passed（15 / 25）→ 原 P1 结论不变 + high_attention',
+    b1Priority['多样本甲']?.historical_status === 'passed' &&
+      b1Priority['多样本甲']?.pass_count === 2 &&
+      b1Priority['多样本甲']?.work_priority === 'high_attention' &&
+      b1Priority['多样本甲']?.work_priority_reason === 'multi_sample_passed' &&
+      b1Priority['多样本甲']?.work_priority_label === null &&
+      b1Priority['多样本甲']?.single_sample_cpm === null
+  )
+  check(
+    'B1-11 多样本 mixed（10 / 50）→ 原结论不变（mixed）+ normal_attention',
+    b1Watch['多样本乙']?.historical_status === 'mixed' &&
+      b1Watch['多样本乙']?.pass_count === 1 &&
+      b1Watch['多样本乙']?.fail_count === 1 &&
+      b1Watch['多样本乙']?.work_priority === 'normal_attention' &&
+      b1Watch['多样本乙']?.work_priority_reason === 'multi_sample_mixed'
+  )
+  check(
+    'B1-12 多样本 failed（40 / 50 / 60）→ 原结论不变（failed）+ low_priority，无单样本标记',
+    b1Low['多样本丙']?.historical_status === 'failed' &&
+      b1Low['多样本丙']?.pass_count === 0 &&
+      b1Low['多样本丙']?.fail_count === 3 &&
+      b1Low['多样本丙']?.work_priority === 'low_priority' &&
+      b1Low['多样本丙']?.work_priority_reason === 'multi_sample_failed' &&
+      b1Low['多样本丙']?.work_priority_label === null
+  )
+  check(
+    'B1-13 单样本高 / 中 / 普通不会改变「优先关注」资格（证据不足一律不进 priority）',
+    b1Priority['优先级甲'] === undefined &&
+      b1Priority['优先级乙'] === undefined &&
+      b1Priority['优先级丙'] === undefined &&
+      b1Priority['优先级丁'] === undefined
+  )
+  check(
+    'B1-14 分组归属：需要观察 = insufficient(非低效) + mixed；暂不优先 = failed + 单样本低效',
+    b1.data.groups[0].count === 1 &&
+      b1.data.groups[1].count === 8 &&
+      b1.data.groups[2].count === 3 &&
+      b1.data.summary.watch_count === 8 &&
+      b1.data.summary.low_priority_count === 3,
+    `${b1.data.groups[0].count}/${b1.data.groups[1].count}/${b1.data.groups[2].count}`
+  )
+  check(
+    'B1-15 「需要观察」内 work_priority 顺序 high → medium → normal',
+    (() => {
+      const rank = (value) => ({ high_attention: 0, medium_attention: 1, normal_attention: 2 })[value] ?? 3
+      const ranks = b1.data.groups[1].creators.map((item) => rank(item.work_priority))
+      return ranks.every((value, i) => i === 0 || ranks[i - 1] <= value)
+    })(),
+    JSON.stringify(b1.data.groups[1].creators.map((item) => `${item.creator}:${item.work_priority}`))
+  )
+  check(
+    'B1-16 同层（normal）内单样本按 raw 单次 CPM 升序（20.0001 → 99.99 → 无样本排最后）',
+    (() => {
+      const names = b1.data.groups[1].creators.map((item) => item.creator)
+      const idx = (name) => names.indexOf(name)
+      return idx('优先级戊') < idx('优先级己') && idx('优先级己') < idx('优先级壬')
+    })(),
+    JSON.stringify(b1.data.groups[1].creators.map((item) => item.creator))
+  )
+  check(
+    'B1-17 work_priority 枚举与排序说明冻结在 API（前端不重新推导）',
+    b1.data.groups.every((group) =>
+      group.creators.every((item) =>
+        ['high_attention', 'medium_attention', 'normal_attention', 'low_priority'].includes(item.work_priority)
+      )
+    ) && /work_priority\(high→medium→normal\)/.test(b1.data.sort.watch)
+  )
+  check(
+    'B1-18 纯函数 computeWorkPriority 边界可直接验证（10 / 20 / 100 含等号）',
+    recordsModule.computeWorkPriority({ validCount: 1, status: 'insufficient', singleSampleCpmRaw: 10 }).work_priority === 'high_attention' &&
+      recordsModule.computeWorkPriority({ validCount: 1, status: 'insufficient', singleSampleCpmRaw: 10.0000001 }).work_priority === 'medium_attention' &&
+      recordsModule.computeWorkPriority({ validCount: 1, status: 'insufficient', singleSampleCpmRaw: 20 }).work_priority === 'medium_attention' &&
+      recordsModule.computeWorkPriority({ validCount: 1, status: 'insufficient', singleSampleCpmRaw: 20.0000001 }).work_priority === 'normal_attention' &&
+      recordsModule.computeWorkPriority({ validCount: 1, status: 'insufficient', singleSampleCpmRaw: 99.999 }).work_priority === 'normal_attention' &&
+      recordsModule.computeWorkPriority({ validCount: 1, status: 'insufficient', singleSampleCpmRaw: 100 }).work_priority === 'low_priority'
+  )
+  check(
+    'B1-19 工作优先级不影响历史证据字段（insufficient 的数量与单次 CPM 无关）',
+    b1.data.groups[1].creators.concat(b1.data.groups[2].creators)
+      .filter((item) => item.valid_cpm_count < 2)
+      .every((item) => item.historical_status === 'insufficient')
+  )
+  check(
+    'B1-20 雷达仍只读 / 无 AI / 无网络（响应无非有限数值）',
+    !/NaN|Infinity/.test(JSON.stringify(b1.data)) &&
+      db.prepare('SELECT COUNT(*) AS n FROM creator_records').get().n === B1_SEED.length &&
+      !/fetch\(|axios|deepseek|callProviderVision/i.test(
+        fs.readFileSync(path.join(REPO_ROOT, 'backend/routes/records.js'), 'utf8').split("/repurchase-radar'")[1]?.slice(0, 1200) || ''
+      )
   )
 }
 

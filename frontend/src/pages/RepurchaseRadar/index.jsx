@@ -41,9 +41,19 @@ const STATUS_META = {
 
 const GROUP_HINTS = {
   priority: '有效合作样本 ≥ 2 且多数单次累计 CPM ≤ 目标值',
-  watch: '表现分化，或有效样本不足 2 次（证据不足不进入「历史通过」）',
-  low_priority: '有效合作样本 ≥ 2 且多数单次累计 CPM 未达标'
+  watch: '表现分化，或有效样本不足 2 次（证据不足不进入「历史通过」）；按工作优先级排序',
+  low_priority: '有效合作样本 ≥ 2 且多数单次累计 CPM 未达标，或仅 1 次样本且明显低效'
 }
+
+// Alpha.2 B1：工作优先级标记颜色（文案与判定全部来自后端，前端只上色）
+// 只影响「先看谁」的注意力分配，不改变历史证据结论
+const WORK_PRIORITY_TAG_COLORS = {
+  high_attention: 'gold',
+  medium_attention: 'orange',
+  low_priority: 'default'
+}
+
+const WORK_PRIORITY_TOOLTIP = '工作优先级只表示「今天先看谁」，不改变历史证据结论'
 
 // P5：雷达 Popover 里「投放结果」只做轻量事实展示（状态码 -> 短文案），不使用长句
 const OUTCOME_CPM_SHORT_LABELS = {
@@ -70,7 +80,7 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
     {
       title: '达人名称 / 近期表现',
       dataIndex: 'creator',
-      width: 140,
+      width: 128,
       render: (value, record) => {
         const snapshot = record.recent_snapshot
         // Alpha.2：主表行内暴露「这份近期数据是哪天观察的」（无快照时不显示）
@@ -252,10 +262,23 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
     {
       title: '历史状态',
       dataIndex: 'historical_status',
-      width: 84,
-      render: (value) => {
+      width: 96,
+      render: (value, record) => {
         const meta = STATUS_META[value] || { label: value, color: 'default' }
-        return <Tag color={meta.color}>{meta.label}</Tag>
+        // 工作优先级标记（仅单样本突出 / 优先补数据 / 单次明显低效时出现，文案由后端给出）
+        const priorityLabel = record.work_priority_label
+        return (
+          <div>
+            <Tag color={meta.color}>{meta.label}</Tag>
+            {priorityLabel && (
+              <Tooltip title={WORK_PRIORITY_TOOLTIP}>
+                <Tag color={WORK_PRIORITY_TAG_COLORS[record.work_priority] || 'default'}>
+                  {priorityLabel}
+                </Tag>
+              </Tooltip>
+            )}
+          </div>
+        )
       }
     },
     {
@@ -430,6 +453,11 @@ export default function RepurchaseRadar() {
             <Typography.Text>
               历史状态：有效样本 ≥ 2 次时按达标次数与未达标次数比较（多者取胜，平局为表现分化）；
               有效样本只有 0 或 1 次时一律为证据不足，不进入历史通过。
+            </Typography.Text>
+            <Typography.Text>
+              工作优先级（只影响「先看谁」，不改变上面的历史状态）：仅 1 次有效样本时，累计 CPM ≤ 10
+              标记「单次表现突出」，10～20 标记「优先补数据」，≥ 100 标记「单次合作明显低效」（移入暂不优先）；
+              多样本仍以历史状态为准。
             </Typography.Text>
           </Space>
         }

@@ -1555,6 +1555,68 @@ const RADAR_GROUPS = [
   { key: 'low_priority', label: '暂不优先', statuses: [RADAR_STATUS.failed] }
 ]
 
+// ---------- Alpha.2 B1：工作优先级（注意力分配）----------
+// 只回答「今天先花时间看谁」，**不改变任何历史证据结论**：
+// 单样本达标 / 失准仍然是 historical_status = insufficient，只是注意力优先级不同。
+// 阈值本轮固定（后续按真实使用再调整），用 raw CPM 判断，不用展示值。
+const WORK_PRIORITY = {
+  high: 'high_attention', // 单次有效 CPM <= 10
+  medium: 'medium_attention', // 10 < 单次有效 CPM <= 20
+  normal: 'normal_attention', // 20 < 单次有效 CPM < 100（或没有可用样本 / 多样本 mixed）
+  low: 'low_priority' // 单次有效 CPM >= 100，或多样本 failed
+}
+
+export const WORK_PRIORITY_THRESHOLDS = { high: 10, medium: 20, low: 100 }
+
+// work_priority_reason → 行内轻量标记文案（无标记时为 null；前端只渲染后端给出的文案）
+const WORK_PRIORITY_REASON_LABELS = {
+  single_sample_cpm_le_10: '单次表现突出',
+  single_sample_cpm_le_20: '优先补数据',
+  single_sample_cpm_normal: null,
+  single_sample_cpm_ge_100: '单次合作明显低效',
+  no_valid_sample: null,
+  multi_sample_passed: null,
+  multi_sample_mixed: null,
+  multi_sample_failed: null
+}
+
+/**
+ * 工作优先级（纯函数，便于单测）
+ * - validCount = 1：用唯一一次有效累计 CPM 的 raw 值分层（<=10 / <=20 / <100 / >=100）
+ * - validCount = 0：没有可用样本 → normal（不做正负判断）
+ * - validCount >= 2：直接跟随原 P1 证据结论（passed → high / mixed → normal / failed → low），
+ *   不引入任何新的多数规则
+ * @param {{ validCount: number, status: string, singleSampleCpmRaw: number|null }} params
+ */
+export function computeWorkPriority({ validCount = 0, status = RADAR_STATUS.insufficient, singleSampleCpmRaw = null } = {}) {
+  if (validCount === 1 && singleSampleCpmRaw !== null && Number.isFinite(singleSampleCpmRaw)) {
+    if (singleSampleCpmRaw <= WORK_PRIORITY_THRESHOLDS.high) {
+      return { work_priority: WORK_PRIORITY.high, work_priority_reason: 'single_sample_cpm_le_10' }
+    }
+    if (singleSampleCpmRaw <= WORK_PRIORITY_THRESHOLDS.medium) {
+      return { work_priority: WORK_PRIORITY.medium, work_priority_reason: 'single_sample_cpm_le_20' }
+    }
+    if (singleSampleCpmRaw < WORK_PRIORITY_THRESHOLDS.low) {
+      return { work_priority: WORK_PRIORITY.normal, work_priority_reason: 'single_sample_cpm_normal' }
+    }
+    return { work_priority: WORK_PRIORITY.low, work_priority_reason: 'single_sample_cpm_ge_100' }
+  }
+  if (validCount === 0) {
+    return { work_priority: WORK_PRIORITY.normal, work_priority_reason: 'no_valid_sample' }
+  }
+  if (status === RADAR_STATUS.passed) {
+    return { work_priority: WORK_PRIORITY.high, work_priority_reason: 'multi_sample_passed' }
+  }
+  if (status === RADAR_STATUS.failed) {
+    return { work_priority: WORK_PRIORITY.low, work_priority_reason: 'multi_sample_failed' }
+  }
+  return { work_priority: WORK_PRIORITY.normal, work_priority_reason: 'multi_sample_mixed' }
+}
+
+/** 单样本「明显低效」是否应离开「需要观察」进入「暂不优先」（历史证据结论不变） */
+const isLowPrioritySingleSample = (item) =>
+  item.historical_status === RADAR_STATUS.insufficient && item.work_priority === WORK_PRIORITY.low
+
 /** 严格解析 YYYY-MM-DD（含真实日期校验），非法返回 null */
 function toDateOnly(value) {
   const text = String(value ?? '').trim()
@@ -1695,6 +1757,14 @@ export function buildRepurchaseRadar(rows = [], { referenceDate = null } = {}) {
     // 中位数用 raw CPM 求，只在对外输出时 round2（展示保留 2 位小数）
     const medianRaw = medianOfRaw(entry.samples.map((sample) => sample.cpmRaw))
 
+    // Alpha.2 B1：注意力优先级（不影响上面任何历史证据字段）
+    const singleSampleCpmRaw = validCount === 1 ? entry.samples[0].cpmRaw : null
+    const { work_priority: workPriority, work_priority_reason: workPriorityReason } = computeWorkPriority({
+      validCount,
+      status,
+      singleSampleCpmRaw
+    })
+
     return {
       creator: entry.creator,
       creator_type: entry.creator_type,
@@ -1704,6 +1774,12 @@ export function buildRepurchaseRadar(rows = [], { referenceDate = null } = {}) {
       fail_count: failCount,
       historical_status: status,
       historical_status_label: RADAR_STATUS_LABELS[status],
+      // 对外字段：注意力优先级由后端统一计算，前端不重新推导业务规则
+      work_priority: workPriority,
+      work_priority_reason: workPriorityReason,
+      work_priority_label: WORK_PRIORITY_REASON_LABELS[workPriorityReason] ?? null,
+      // 仅单样本有值（raw 单次累计 CPM 的展示值），多样本为 null
+      single_sample_cpm: singleSampleCpmRaw === null ? null : round2(singleSampleCpmRaw),
       // 对外字段：中位数按 2 位小数展示
       median_cpm: medianRaw === null ? null : round2(medianRaw),
       // 内部字段（不对外输出）：排序必须用 raw 中位数，避免展示值相同被误判为并列
@@ -1733,6 +1809,13 @@ export function buildRepurchaseRadar(rows = [], { referenceDate = null } = {}) {
     return right - left
   }
   const watchStatusRank = (status) => (status === RADAR_STATUS.mixed ? 0 : 1)
+  // 「需要观察」内的工作优先级顺序：高注意力 → 中注意力 → 普通
+  const workPriorityRank = (value) => {
+    if (value === WORK_PRIORITY.high) return 0
+    if (value === WORK_PRIORITY.medium) return 1
+    if (value === WORK_PRIORITY.normal) return 2
+    return 3
+  }
   const compareCreators = (a, b) => {
     // 第一优先：raw 中位数升序（只有 raw 真正相等才进入第二条件）
     const byMedian = compareNullableAsc(a.medianCpmRaw, b.medianCpmRaw)
@@ -1749,11 +1832,25 @@ export function buildRepurchaseRadar(rows = [], { referenceDate = null } = {}) {
   // 对外只返回展示字段，内部排序字段 medianCpmRaw 不暴露给前端
   const toPublicCreator = ({ medianCpmRaw, ...publicFields }) => publicFields
 
+  // 分组归属：历史状态仍是第一依据；只有「单样本明显低效」会从需要观察移到暂不优先
+  const matchesGroup = (item, group) => {
+    if (group.key === 'priority') return item.historical_status === RADAR_STATUS.passed
+    if (group.key === 'watch') {
+      return (
+        item.historical_status === RADAR_STATUS.mixed ||
+        (item.historical_status === RADAR_STATUS.insufficient && !isLowPrioritySingleSample(item))
+      )
+    }
+    return item.historical_status === RADAR_STATUS.failed || isLowPrioritySingleSample(item)
+  }
+
   const groups = RADAR_GROUPS.map((group) => {
-    const list = creators.filter((item) => group.statuses.includes(item.historical_status))
+    const list = creators.filter((item) => matchesGroup(item, group))
     list.sort((a, b) => {
-      // 「需要观察」内先有证据的（mixed），再证据不足（insufficient）
+      // 「需要观察」内先按工作优先级（高注意力优先），同层再有证据的（mixed）先于证据不足（insufficient）
       if (group.key === 'watch') {
+        const byPriority = workPriorityRank(a.work_priority) - workPriorityRank(b.work_priority)
+        if (byPriority !== 0) return byPriority
         const byStatus = watchStatusRank(a.historical_status) - watchStatusRank(b.historical_status)
         if (byStatus !== 0) return byStatus
       }
@@ -1774,9 +1871,10 @@ export function buildRepurchaseRadar(rows = [], { referenceDate = null } = {}) {
     sort: {
       priority:
         '历史CPM中位数(raw) 升序 → days_since_last_collaboration 降序 → creator 名称升序',
-      watch: 'mixed 优先于 insufficient → 同组内同上规则',
+      watch:
+        'work_priority(high→medium→normal) → mixed 优先于 insufficient → 历史CPM中位数(raw) 升序 → days_since_last_collaboration 降序 → creator 名称升序',
       low_priority:
-        '历史CPM中位数(raw) 升序 → days_since_last_collaboration 降序 → creator 名称升序'
+        '历史CPM中位数(raw) 升序 → days_since_last_collaboration 降序 → creator 名称升序（含「单样本明显低效」的 insufficient 达人）'
     },
     groups,
     summary: {

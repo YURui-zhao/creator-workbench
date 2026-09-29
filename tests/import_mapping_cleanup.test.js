@@ -4,6 +4,8 @@
  *
  * 运行方式：node tests/import_mapping_cleanup.test.js
  * 特性：不启动服务、不打开浏览器；直接在内存里驱动 Express 路由 handler（假 req/res）
+ * 隔离方式：通过 WORKBENCH_DB_PATH 指向临时数据库（必须先于 import backend/db.js 设置），
+ *          单独运行或全量运行都不会连接真实 backend/workbench.db，结束后删除临时库。
  *
  * 说明：测试会真实写入 1 个自测批次 + 2 条投放记录，并在 finally 中完整清理，
  *      最后断言 creator_records / import_batches 恢复测试前状态。
@@ -14,9 +16,15 @@
  *   CASE 3  全库不存在孤儿 mapping（record 已删 / batch 已删）
  */
 const path = require('node:path')
+const fs = require('node:fs')
+const os = require('node:os')
 const { pathToFileURL } = require('node:url')
 
 const REPO_ROOT = path.resolve(__dirname, '..')
+
+// 隔离数据库：必须在使用任何 backend 模块（backend/db.js）之前设置
+const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'import-mapping-cleanup-'))
+process.env.WORKBENCH_DB_PATH = path.join(TMP_DIR, 'isolated.db')
 
 let passCount = 0
 let failCount = 0
@@ -262,4 +270,11 @@ async function main() {
 main().catch((err) => {
   console.error('测试执行异常：', err)
   process.exitCode = 1
+}).finally(() => {
+  // 清理隔离数据库（含 WAL / SHM），真实库始终未被触碰
+  try {
+    fs.rmSync(TMP_DIR, { recursive: true, force: true })
+  } catch {
+    // 清理失败不影响测试结论
+  }
 })

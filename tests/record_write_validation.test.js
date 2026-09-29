@@ -4,6 +4,8 @@
  *
  * 运行方式：node tests/record_write_validation.test.js
  * 特性：不启动服务、不打开浏览器；直接在内存里驱动 Express 路由 handler（假 req/res）
+ * 隔离方式：通过 WORKBENCH_DB_PATH 指向临时数据库（必须先于 import backend/db.js 设置），
+ *          单独运行或全量运行都不会连接真实 backend/workbench.db，结束后删除临时库。
  *
  * 说明：测试会真实写入自测记录，并在 finally 中完整清理，
  *      最后断言 creator_records 恢复测试前基线（不污染真实 12 条数据）。
@@ -11,9 +13,15 @@
  * 覆盖：POST 单条、PUT 部分更新（最终状态交叉校验 / 未传 vs null vs 0）、batch 批量。
  */
 const path = require('node:path')
+const fs = require('node:fs')
+const os = require('node:os')
 const { pathToFileURL } = require('node:url')
 
 const REPO_ROOT = path.resolve(__dirname, '..')
+// 隔离数据库：必须在使用任何 backend 模块（backend/db.js）之前设置
+const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'record-write-validation-'))
+process.env.WORKBENCH_DB_PATH = path.join(TMP_DIR, 'isolated.db')
+
 const PLAY_RANGE_ERROR = '累计播放量不能小于7日播放量，请检查数据是否录入正确'
 
 let passCount = 0
@@ -588,4 +596,11 @@ async function main() {
 main().catch((err) => {
   console.error('测试执行异常：', err)
   process.exitCode = 1
+}).finally(() => {
+  // 清理隔离数据库（含 WAL / SHM），真实库始终未被触碰
+  try {
+    fs.rmSync(TMP_DIR, { recursive: true, force: true })
+  } catch {
+    // 清理失败不影响测试结论
+  }
 })

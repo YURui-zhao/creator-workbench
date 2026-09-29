@@ -26,3 +26,25 @@ export function previewCreatorDecisionQuote({ creator, snapshotId, currentQuoteR
     { timeout: 20000 }
   )
 }
+
+/**
+ * P5：取该决策可关联的真实投放记录候选（只含同一达人，按发布日期倒序）
+ * 候选里的花费 / 播放 / CPM 全部由后端复用 V2 口径生成，前端不重新计算。
+ */
+export function getDecisionOutcomeCandidates(decisionId) {
+  return request.get(`/creator-decisions/${decisionId}/outcome-candidates`)
+}
+
+/** P5：把一条真实投放记录关联到决策（只提交关联关系，不提交任何派生指标） */
+export function linkDecisionOutcome(decisionId, { recordId, timingConfirmed = false }) {
+  return request.post(
+    `/creator-decisions/${decisionId}/outcome`,
+    { record_id: recordId, timing_confirmed: timingConfirmed === true },
+    { timeout: 20000 }
+  )
+}
+
+/** P5：解除关联（只删除 mapping，不删除任何投放数据或决策记录） */
+export function unlinkDecisionOutcome(decisionId) {
+  return request.delete(`/creator-decisions/${decisionId}/outcome`)
+}

@@ -1612,6 +1612,19 @@ export function computeRecordLatestCpm(row = {}) {
 }
 
 /**
+ * 单条记录的「7日 CPM」原始值（V2 冻结口径：cost / first_play × 1000）
+ * - 与 computeRecordLatestCpm 完全对称：同样先走 computePlayMetrics，不新增第二套播放口径
+ * - first 未填写（null/''）→ null；first = 0 是真实观测但分母为 0、CPM 无定义 → null
+ * - 不负责四舍五入；展示层再按 1 位小数格式化
+ */
+export function computeRecordFirstCpm(row = {}) {
+  const metrics = computePlayMetrics(row)
+  if (!metrics.hasFirst) return null
+  if (!(metrics.first > 0)) return null
+  return (metrics.cost / metrics.first) * 1000
+}
+
+/**
  * 复投雷达（纯函数，便于单测）：按 nickname 聚合 → 单次达标判定 → 历史状态 → 中位数 → 分组排序
  * @param {Array<Object>} rows creator_records 行（含 nickname / creator_type / total_cost / first_play / second_week_play / publish_date）
  * @param {{ referenceDate?: string }} [options] referenceDate 仅测试注入（YYYY-MM-DD），默认服务端本地今天

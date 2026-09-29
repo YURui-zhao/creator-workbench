@@ -7,6 +7,7 @@ import db from './db.js'
 import aiRouter from './routes/ai.js'
 import cyclesRouter from './routes/cycles.js'
 import creatorDecisionsRouter from './routes/creatorDecisions.js'
+import creatorDecisionOutcomesRouter from './routes/creatorDecisionOutcomes.js'
 import importBatchesRouter from './routes/importBatches.js'
 import recentSnapshotsRouter from './routes/recentSnapshots.js'
 import recordsRouter from './routes/records.js'
@@ -57,6 +58,8 @@ app.get('/api/health', (req, res) => {
 app.use('/api/ai', aiRouter)
 app.use('/api/cycles', cyclesRouter)
 app.use('/api/creator-decisions', creatorDecisionsRouter)
+// P5：同一前缀下追加 outcome 关联子路径（P4 router 本身不做任何改动）
+app.use('/api/creator-decisions', creatorDecisionOutcomesRouter)
 app.use('/api/import', importBatchesRouter)
 app.use('/api/recent-snapshots', recentSnapshotsRouter)
 app.use('/api/records', recordsRouter)

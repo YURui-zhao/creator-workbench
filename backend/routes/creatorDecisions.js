@@ -4,6 +4,7 @@ import { buildRepurchaseRadar } from './records.js'
 import { parsePriceText } from '../utils/screenshotValues.js'
 import { computeCreatorPricing } from '../utils/creatorPricing.js'
 import { assessCurrentQuote } from '../utils/currentQuoteAssessment.js'
+import { loadOutcomeSummaries } from './creatorDecisionOutcomes.js'
 import { PRICING_VERSION, TARGET_CPM } from '../utils/creatorBusinessRules.js'
 
 const router = Router()
@@ -45,10 +46,14 @@ const findCreatorRecord = (creator) =>
   db.prepare('SELECT nickname FROM creator_records WHERE nickname = ? LIMIT 1').get(creator)
 
 const DECISION_SUMMARY_COLUMNS =
-  'id, creator, created_at, decision_stage, current_quote, ip_judgement, human_decision, pricing_version'
+  'id, creator, created_at, decision_stage, current_quote, ip_judgement, human_decision, pricing_version, target_cpm'
 
-/** 决策轻量 summary（雷达 Popover 用，不含 evidence JSON） */
-export function toDecisionSummary(row) {
+/**
+ * 决策轻量 summary（雷达 Popover 用，不含 evidence JSON）
+ * @param {Object} row
+ * @param {Object|null} [outcome] P5 关联的真实投放结果轻量事实（无关联为 null）
+ */
+export function toDecisionSummary(row, outcome = null) {
   if (!row) return null
   return {
     id: row.id,
@@ -58,7 +63,9 @@ export function toDecisionSummary(row) {
     ip_judgement: row.ip_judgement ?? null,
     human_decision: row.human_decision,
     human_decision_label: HUMAN_DECISION_LABELS[row.human_decision] || row.human_decision,
-    pricing_version: row.pricing_version
+    pricing_version: row.pricing_version,
+    // P5：只读展示「是否已关联投放结果 / CPM30 状态」，不参与 P1 分组与排序
+    outcome: outcome ?? null
   }
 }
 
@@ -86,8 +93,15 @@ export function loadLatestDecisionSummaries(creatorList = []) {
        ORDER BY created_at DESC, id DESC`
     )
     .all(...creators)
+  // 每位达人只保留最近一条决策，再一次性批量补齐 outcome（单条 JOIN SQL，无 N+1）
+  const latestByCreator = new Map()
   for (const row of rows) {
-    if (!map.has(row.creator)) map.set(row.creator, toDecisionSummary(row))
+    if (!latestByCreator.has(row.creator)) latestByCreator.set(row.creator, row)
+  }
+  const latestRows = [...latestByCreator.values()]
+  const outcomeMap = loadOutcomeSummaries(latestRows)
+  for (const row of latestRows) {
+    map.set(row.creator, toDecisionSummary(row, outcomeMap.get(row.id) || null))
   }
   return map
 }
@@ -265,8 +279,12 @@ export function validateDecisionPayload(body) {
   }
 }
 
-/** 数据库行 -> 对外 decision（evidence 为创建时固化的 JSON） */
-export function toPublicDecision(row) {
+/**
+ * 数据库行 -> 对外 decision（evidence 为创建时固化的 JSON）
+ * @param {Object} row
+ * @param {Object|null} [outcome] P5 关联的真实投放结果（live 事实；无关联为 null）
+ */
+export function toPublicDecision(row, outcome = null) {
   if (!row) return null
   const parseJson = (text) => {
     if (!text) return null
@@ -293,7 +311,9 @@ export function toPublicDecision(row) {
     target_cpm: row.target_cpm,
     pricing_version: row.pricing_version,
     system_context_version: row.system_context_version,
-    created_at: row.created_at
+    created_at: row.created_at,
+    // P5：真实投放结果（live，不固化）；evidence 仍为创建时的 frozen 快照
+    outcome: outcome ?? null
   }
 }
 
@@ -413,12 +433,14 @@ router.post('/', (req, res) => {
     )
 
   const saved = db.prepare('SELECT * FROM creator_decisions WHERE id = ?').get(info.lastInsertRowid)
-  ok(res, toPublicDecision(saved))
+  // 新创建的决策必然还没有 outcome 关联（append-only，关联是后续独立动作）
+  ok(res, toPublicDecision(saved, null))
 })
 
 /**
  * GET /api/creator-decisions?creator=...
- * 时间倒序（created_at DESC, id DESC），固定返回创建时固化的证据
+ * 时间倒序（created_at DESC, id DESC），固定返回创建时固化的证据；
+ * P5：附带 outcome（live 事实，单条 SQL 批量加载，避免 N+1）
  */
 router.get('/', (req, res) => {
   const creator = String(req.query?.creator ?? '').trim()
@@ -431,7 +453,11 @@ router.get('/', (req, res) => {
        ORDER BY created_at DESC, id DESC`
     )
     .all(creator)
-  ok(res, { creator, decisions: rows.map(toPublicDecision) })
+  const outcomeMap = loadOutcomeSummaries(rows)
+  ok(res, {
+    creator,
+    decisions: rows.map((row) => toPublicDecision(row, outcomeMap.get(row.id) || null))
+  })
 })
 
 export default router

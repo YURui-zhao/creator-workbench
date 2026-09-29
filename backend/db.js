@@ -140,6 +140,27 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_creator_decisions_creator_created
     ON creator_decisions(creator, created_at);
+
+  -- V3-alpha P5：决策 ↔ 真实投放结果 的关联（只保存关联关系，不改写 creator_decisions）
+  -- 说明：
+  --   · creator_decisions 是「当时的决策快照」，因此绝不 UPDATE 旧 decision 去挂 outcome
+  --   · 本表只保存 decision_id ↔ record_id 映射；花费 / 播放 / CPM / 发布日期等一律实时取自
+  --     creator_records（Outcome result = live，Decision evidence = frozen）
+  --   · P5-alpha：一条 decision 最多关联一个 record，一条 record 最多关联一个 decision
+  --     （UNIQUE 约束是并发下的最终保护，不做 many-to-many）
+  CREATE TABLE IF NOT EXISTS creator_decision_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_id INTEGER NOT NULL,
+    record_id INTEGER NOT NULL,
+    linked_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(decision_id),
+    UNIQUE(record_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_decision_outcomes_decision
+    ON creator_decision_outcomes(decision_id);
+  CREATE INDEX IF NOT EXISTS idx_decision_outcomes_record
+    ON creator_decision_outcomes(record_id);
 `)
 
 // 首次启动写入示例项目（前端工作台展示用）

@@ -148,6 +148,15 @@ export default function Records() {
     setPage(1)
   }, [searchParams, filterForm])
 
+  // 从决策记录跳转过来（/records?keyword=达人）：自动回填达人筛选并按达人查询
+  useEffect(() => {
+    const keyword = String(searchParams.get('keyword') || '').trim()
+    if (!keyword) return
+    filterForm.setFieldsValue({ nickname: keyword })
+    setFilters((prev) => (prev.keyword === keyword ? prev : { ...prev, keyword }))
+    setPage(1)
+  }, [searchParams, filterForm])
+
   // ---------- 数据加载（分页 + 筛选联动） ----------
   const loadData = useCallback(async () => {
     setLoading(true)

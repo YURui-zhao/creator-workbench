@@ -44,6 +44,15 @@ const GROUP_HINTS = {
   low_priority: '有效合作样本 ≥ 2 且多数单次累计 CPM 未达标'
 }
 
+// P5：雷达 Popover 里「投放结果」只做轻量事实展示（状态码 -> 短文案），不使用长句
+const OUTCOME_CPM_SHORT_LABELS = {
+  pending: '待更新',
+  anomaly: '异常',
+  zero_play: '累计播放为0',
+  met: '已达标',
+  not_met: '未达标'
+}
+
 // 列宽合计刻意控制在 1024 宽度下不产生页面级 / 表内横向滚动：
 // 「达人名称」列加宽以容纳第二行的近期表现状态，同时小幅收紧中位数与风险列
 const RADAR_TABLE_WIDTH = 836
@@ -122,13 +131,22 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
                       <Divider style={{ margin: '6px 0' }} />
                       <Typography.Text strong>最近决策</Typography.Text>
                       {record.recent_decision ? (
-                        <Typography.Text type="secondary">
-                          {String(record.recent_decision.created_at || '').slice(5, 10)} ·{' '}
-                          {record.recent_decision.human_decision_label}
-                          {record.recent_decision.current_quote === null
-                            ? ''
-                            : ` · 实际报价 ${formatPrice(record.recent_decision.current_quote)}`}
-                        </Typography.Text>
+                        <>
+                          <Typography.Text type="secondary">
+                            {String(record.recent_decision.created_at || '').slice(5, 10)} ·{' '}
+                            {record.recent_decision.human_decision_label}
+                            {record.recent_decision.current_quote === null
+                              ? ''
+                              : ` · 实际报价 ${formatPrice(record.recent_decision.current_quote)}`}
+                          </Typography.Text>
+                          {/* P5：轻量事实展示（是否已关联投放结果 / CPM30 状态），不参与 P1 分组与排序 */}
+                          <Typography.Text type="secondary">
+                            结果：
+                            {record.recent_decision.outcome
+                              ? `已关联 · CPM30${OUTCOME_CPM_SHORT_LABELS[record.recent_decision.outcome.target_cpm_status] || ''}`
+                              : '尚未关联'}
+                          </Typography.Text>
+                        </>
                       ) : (
                         <Typography.Text type="secondary">暂无决策记录</Typography.Text>
                       )}

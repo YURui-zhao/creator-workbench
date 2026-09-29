@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import {
   Alert,
   Button,
@@ -6,6 +7,7 @@ import {
   Drawer,
   Empty,
   Input,
+  Modal,
   Radio,
   Slider,
   Space,
@@ -18,11 +20,13 @@ import {
 import {
   createCreatorDecision,
   getCreatorDecisions,
-  previewCreatorDecisionQuote
+  previewCreatorDecisionQuote,
+  unlinkDecisionOutcome
 } from '../api/creatorDecisions'
 import { getErrorMessage } from '../utils/request'
-import { formatInteger, formatPlays } from '../utils/format'
+import { formatCpm, formatInteger, formatMoney, formatPlays } from '../utils/format'
 import { formatPrice, formatZhe } from '../utils/pricingDisplay.js'
+import OutcomeLinkModal from './OutcomeLinkModal.jsx'
 import {
   SIMULATOR_DEFAULT_RATE,
   SIMULATOR_MAX_RATE,
@@ -97,6 +101,10 @@ export default function CreatorDecisionDrawer({
   const [savedDecision, setSavedDecision] = useState(null)
   const [history, setHistory] = useState([])
   const [historyLoading, setHistoryLoading] = useState(false)
+  // P5：关联投放结果
+  const [linkModalDecision, setLinkModalDecision] = useState(null)
+  const [unlinkingId, setUnlinkingId] = useState(null)
+  const navigate = useNavigate()
 
   const loadHistory = useCallback(async () => {
     if (!creator) return
@@ -422,6 +430,114 @@ export default function CreatorDecisionDrawer({
     )
   }
 
+  // P5：只有「已拿到报价 + 决定实际投放」的决策才允许关联真实投放结果
+  const isOutcomeEligible = (item) =>
+    item?.decision_stage === 'post_quote' && ['repurchase', 'small_test'].includes(item?.human_decision)
+
+  const handleUnlink = (item) => {
+    Modal.confirm({
+      title: '解除关联',
+      content: '仅解除决策与投放结果的关联，不会删除任何投放数据或决策记录。',
+      okText: '解除关联',
+      cancelText: '取消',
+      onOk: async () => {
+        setUnlinkingId(item.id)
+        try {
+          await unlinkDecisionOutcome(item.id)
+          message.success('已解除关联')
+          await loadHistory()
+          onSaved?.(null)
+        } catch (error) {
+          message.error(getErrorMessage(error))
+        } finally {
+          setUnlinkingId(null)
+        }
+      }
+    })
+  }
+
+  /** 投放结果区块：live 事实（关联后随 creator_records 实时变化），不展示任何评价 */
+  const renderOutcomeSection = (item) => {
+    if (!isOutcomeEligible(item)) {
+      return (
+        <div style={{ marginTop: 8 }}>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            该决策未进入实际投放阶段。
+          </Typography.Text>
+        </div>
+      )
+    }
+    const outcome = item.outcome
+    if (!outcome) {
+      return (
+        <div style={{ marginTop: 8 }}>
+          <Space size={8} wrap>
+            <Typography.Text type="secondary">投放结果</Typography.Text>
+            <Typography.Text type="secondary">尚未关联</Typography.Text>
+            <Button size="small" onClick={() => setLinkModalDecision(item)}>
+              关联投放结果
+            </Button>
+          </Space>
+        </div>
+      )
+    }
+    const pending = outcome.latest_status === 'pending'
+    const anomaly = outcome.latest_status === 'anomaly'
+    return (
+      <div style={{ marginTop: 8, borderTop: '1px dashed #f0f0f0', paddingTop: 8 }}>
+        <Typography.Text strong style={{ fontSize: 12 }}>投放结果</Typography.Text>
+        <Space direction="vertical" size={2} style={{ display: 'flex', marginTop: 4 }}>
+          <div style={factRowStyle}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>发布日期</Typography.Text>
+            <Typography.Text style={{ fontSize: 12 }}>{outcome.publish_date || '-'}</Typography.Text>
+          </div>
+          <div style={factRowStyle}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>实际花费</Typography.Text>
+            <Typography.Text style={{ fontSize: 12 }}>{formatMoney(outcome.total_cost, '-')}</Typography.Text>
+          </div>
+          <div style={factRowStyle}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>7日播放</Typography.Text>
+            <Typography.Text style={{ fontSize: 12 }}>{formatPlays(outcome.first_play)}</Typography.Text>
+          </div>
+          <div style={factRowStyle}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>累计播放</Typography.Text>
+            <Typography.Text style={{ fontSize: 12 }}>
+              {pending ? '待更新' : formatPlays(outcome.latest_play)}
+            </Typography.Text>
+          </div>
+          <div style={factRowStyle}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>后续新增</Typography.Text>
+            <Typography.Text style={{ fontSize: 12 }}>
+              {pending || anomaly ? '待更新' : formatPlays(outcome.subsequent_play)}
+            </Typography.Text>
+          </div>
+          <div style={factRowStyle}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>7日CPM</Typography.Text>
+            <Typography.Text style={{ fontSize: 12 }}>{formatCpm(outcome.first_cpm)}</Typography.Text>
+          </div>
+          <div style={factRowStyle}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>累计CPM</Typography.Text>
+            <Typography.Text style={{ fontSize: 12 }}>
+              {pending || anomaly ? '待更新' : formatCpm(outcome.latest_cpm)}
+            </Typography.Text>
+          </div>
+          <div style={factRowStyle}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>CPM30状态</Typography.Text>
+            <Typography.Text style={{ fontSize: 12 }}>{outcome.target_cpm_status_label}</Typography.Text>
+          </div>
+        </Space>
+        <Space size={8} wrap style={{ marginTop: 6 }}>
+          <Button size="small" type="link" onClick={() => navigate(`/records?keyword=${encodeURIComponent(creator)}`)}>
+            查看投放记录
+          </Button>
+          <Button size="small" danger loading={unlinkingId === item.id} onClick={() => handleUnlink(item)}>
+            解除关联
+          </Button>
+        </Space>
+      </div>
+    )
+  }
+
   const renderHistory = () => (
     <Spin spinning={historyLoading}>
       {history.length === 0 ? (
@@ -449,6 +565,7 @@ export default function CreatorDecisionDrawer({
                   </Typography.Text>
                 </div>
               )}
+              {renderOutcomeSection(item)}
             </div>
           ))}
         </Space>
@@ -579,6 +696,16 @@ export default function CreatorDecisionDrawer({
           </Space>
         </Space>
       )}
+
+      <OutcomeLinkModal
+        open={Boolean(linkModalDecision)}
+        decision={linkModalDecision}
+        onClose={() => setLinkModalDecision(null)}
+        onLinked={async () => {
+          await loadHistory()
+          onSaved?.(null)
+        }}
+      />
     </Drawer>
   )
 }

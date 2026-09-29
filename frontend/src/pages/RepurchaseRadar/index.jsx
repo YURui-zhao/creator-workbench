@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Alert,
   Button,
@@ -6,8 +6,10 @@ import {
   Col,
   Divider,
   Empty,
+  Input,
   Popover,
   Row,
+  Select,
   Skeleton,
   Space,
   Statistic,
@@ -16,7 +18,7 @@ import {
   Tooltip,
   Typography
 } from 'antd'
-import { ReloadOutlined } from '@ant-design/icons'
+import { ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import { getRepurchaseRadar } from '../../api/records'
 import { getErrorMessage } from '../../utils/request'
 import { formatCpm, formatInteger } from '../../utils/format'
@@ -30,6 +32,13 @@ import {
   TREND_LABELS_FULL
 } from '../../utils/recentPerformanceSave.js'
 import { buildPricingRows, formatPrice } from '../../utils/pricingDisplay.js'
+import {
+  EMPTY_RADAR_FILTERS,
+  RADAR_GROUP_OPTIONS,
+  WORK_PRIORITY_FILTER_OPTIONS,
+  filterRadarGroups,
+  isRadarFilterActive
+} from '../../utils/radarFilters.js'
 
 // 历史状态 -> 展示文案（文字为主，颜色仅辅助，不依赖颜色理解）
 const STATUS_META = {
@@ -316,6 +325,8 @@ export default function RepurchaseRadar() {
   const [decisionOpen, setDecisionOpen] = useState(false)
   const [decisionCreatorItem, setDecisionCreatorItem] = useState(null)
   const [decisionView, setDecisionView] = useState('record')
+  // B2：检索状态（纯 UI 视图状态，不写库、不改变后端返回的任何业务字段）
+  const [filters, setFilters] = useState(EMPTY_RADAR_FILTERS)
 
   const loadRadar = useCallback(async () => {
     setLoading(true)
@@ -338,6 +349,14 @@ export default function RepurchaseRadar() {
   const summary = radar?.summary
   const targetCpm = radar?.target_cpm
   const groups = radar?.groups || []
+  // B2：检索只在已加载的雷达数据上做视图过滤（保留后端原排序，不重算任何业务规则）
+  const filterActive = isRadarFilterActive(filters)
+  const { groups: visibleGroups, visibleCount } = useMemo(
+    () => filterRadarGroups(radar?.groups || [], filters),
+    [radar, filters]
+  )
+  const totalCount = summary?.creator_count ?? 0
+  // 达人选择器（近期表现助手）始终基于全量达人，不受检索影响
   const creatorOptions = groups.flatMap((group) => group.creators.map((item) => item.creator))
   const openAssistant = (creatorName) => {
     setAssistantCreator(creatorName || null)
@@ -383,6 +402,38 @@ export default function RepurchaseRadar() {
             </Button>
           </Space>
         </div>
+
+        {/* B2：达人名称搜索 + 大组筛选 + 工作优先级筛选（纯前端视图过滤，AND 组合） */}
+        <Space wrap size={8} style={{ marginTop: 12 }}>
+          <Input
+            allowClear
+            value={filters.keyword}
+            onChange={(event) =>
+              setFilters((prev) => ({ ...prev, keyword: event.target.value }))
+            }
+            placeholder="搜索达人名称"
+            prefix={<SearchOutlined style={{ color: 'rgba(0, 0, 0, 0.35)' }} />}
+            style={{ width: 200 }}
+          />
+          <Select
+            value={filters.groupKey}
+            onChange={(value) => setFilters((prev) => ({ ...prev, groupKey: value }))}
+            options={RADAR_GROUP_OPTIONS}
+            style={{ width: 132 }}
+          />
+          <Select
+            value={filters.workPriority}
+            onChange={(value) => setFilters((prev) => ({ ...prev, workPriority: value }))}
+            options={WORK_PRIORITY_FILTER_OPTIONS}
+            style={{ width: 152 }}
+          />
+          <Button disabled={!filterActive} onClick={() => setFilters(EMPTY_RADAR_FILTERS)}>
+            清空筛选
+          </Button>
+          <Typography.Text type="secondary">
+            显示 {formatInteger(visibleCount)} / {formatInteger(totalCount)} 位达人
+          </Typography.Text>
+        </Space>
 
         {confirmedDraft && (
           <Alert
@@ -523,14 +574,19 @@ export default function RepurchaseRadar() {
         </Col>
       </Row>
 
-      {groups.map((group) => (
+      {visibleGroups.map((group) => (
         <Card
           key={group.key}
           style={{ marginTop: 16 }}
           title={
             <Space size={8} wrap>
               <Typography.Text strong>{group.label}</Typography.Text>
-              <Tag>{`${formatInteger(group.count)} 位达人`}</Tag>
+              {/* 原始 group.count 始终是全量口径；有筛选时补充「命中 / 全量」 */}
+              <Tag>
+                {filterActive
+                  ? `${formatInteger(group.matched_count)} / ${formatInteger(group.count)} 位达人`
+                  : `${formatInteger(group.count)} 位达人`}
+              </Tag>
               <Typography.Text type="secondary" style={{ fontWeight: 'normal' }}>
                 {GROUP_HINTS[group.key]}
               </Typography.Text>
@@ -540,7 +596,10 @@ export default function RepurchaseRadar() {
           {loading ? (
             <Skeleton active paragraph={{ rows: 4 }} />
           ) : group.creators.length === 0 ? (
-            <Empty description="当前分组暂无达人" style={{ padding: 24 }} />
+            <Empty
+              description={filterActive ? '暂无符合条件的达人' : '当前分组暂无达人'}
+              style={{ padding: 24 }}
+            />
           ) : (
             <Table
               size="small"

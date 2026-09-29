@@ -829,6 +829,241 @@ async function main() {
         fs.readFileSync(path.join(REPO_ROOT, 'backend/routes/records.js'), 'utf8').split("/repurchase-radar'")[1]?.slice(0, 1200) || ''
       )
   )
+
+  console.log('\n===== 17. Alpha.2 B2：雷达检索（前端纯视图过滤）=====')
+  const filterLib = await import(
+    pathToFileURL(path.join(REPO_ROOT, 'frontend/src/utils/radarFilters.js')).href
+  )
+  const radarGroupsBefore = JSON.stringify(b1.data.groups)
+  const allCreatorsB1 = b1.data.groups.flatMap((group) => group.creators)
+  const filterOver = (filters) => filterLib.filterRadarGroups(b1.data.groups, filters)
+  const radarPageB2 = fs.readFileSync(
+    path.join(REPO_ROOT, 'frontend/src/pages/RepurchaseRadar/index.jsx'),
+    'utf8'
+  )
+  const filterSource = fs.readFileSync(
+    path.join(REPO_ROOT, 'frontend/src/utils/radarFilters.js'),
+    'utf8'
+  )
+  // 只检查可执行代码，注释里出现业务词（historical_status / CPM）不算重算
+  const filterCode = filterSource
+    .split('\n')
+    .filter((line) => !/^\s*(\*|\/\/|\/\*)/.test(line))
+    .join('\n')
+
+  check(
+    'B2-1 空搜索 / 全部筛选 → 达人全量（12 位，等于 API summary.creator_count）',
+    (() => {
+      const { groups, visibleCount } = filterOver({})
+      return (
+        visibleCount === allCreatorsB1.length &&
+        visibleCount === b1.data.summary.creator_count &&
+        groups.length === 3
+      )
+    })(),
+    String(filterOver({}).visibleCount)
+  )
+  check(
+    'B2-2 中文 substring「优先级」→ 命中该前缀达人；「巴」类匹配按原字符串包含',
+    (() => {
+      const { visibleCount } = filterOver({ keyword: '优先级' })
+      const names = filterOver({ keyword: '优先级' }).groups.flatMap((g) => g.creators.map((c) => c.creator))
+      return visibleCount === 9 && names.every((name) => name.includes('优先级')) && filterLib.matchesKeyword('巴博斯', '巴')
+    })(),
+    JSON.stringify(filterOver({ keyword: '优先级' }).groups.flatMap((g) => g.creators.map((c) => c.creator)))
+  )
+  check(
+    'B2-3 英文大小写不敏感 + 首尾空格忽略',
+    filterLib.matchesKeyword('B1突出达人', 'b1') &&
+      filterLib.matchesKeyword('B1突出达人', '  B1  ') &&
+      !filterLib.matchesKeyword('B1突出达人', 'b2') &&
+      filterLib.normalizeKeyword('  AbC ') === 'abc' &&
+      filterLib.normalizeKeyword(null) === ''
+  )
+  check(
+    'B2-4 group=watch → 只剩需要观察组（且组内顺序不变）',
+    (() => {
+      const { groups, visibleCount } = filterOver({ groupKey: 'watch' })
+      const originalWatch = b1.data.groups[1].creators.map((item) => item.creator)
+      return (
+        groups.length === 1 &&
+        groups[0].key === 'watch' &&
+        visibleCount === b1.data.groups[1].count &&
+        JSON.stringify(groups[0].creators.map((item) => item.creator)) === JSON.stringify(originalWatch)
+      )
+    })()
+  )
+  check(
+    'B2-5 group=low_priority → 只剩暂不优先组',
+    (() => {
+      const { groups, visibleCount } = filterOver({ groupKey: 'low_priority' })
+      return groups.length === 1 && groups[0].key === 'low_priority' && visibleCount === b1.data.groups[2].count
+    })()
+  )
+  check(
+    'B2-6 work_priority=high_attention → 只保留后端标记为高注意力的达人（前端不重算阈值）',
+    (() => {
+      const { groups, visibleCount } = filterOver({ workPriority: 'high_attention' })
+      const kept = groups.flatMap((g) => g.creators)
+      return (
+        visibleCount === 3 &&
+        kept.every((item) => item.work_priority === 'high_attention') &&
+        JSON.stringify(kept.map((item) => item.creator)) ===
+          JSON.stringify(['多样本甲', '优先级甲', '优先级乙'])
+      )
+    })(),
+    JSON.stringify(filterOver({ workPriority: 'high_attention' }).groups.flatMap((g) => g.creators.map((c) => c.creator)))
+  )
+  check(
+    'B2-6b 筛选器文案表达「等级」而不是某一 reason（高注意力 / 中注意力 / 普通 / 低优先）',
+    JSON.stringify(filterLib.WORK_PRIORITY_FILTER_OPTIONS) ===
+      JSON.stringify([
+        { value: 'all', label: '全部优先级' },
+        { value: 'high_attention', label: '高注意力' },
+        { value: 'medium_attention', label: '中注意力' },
+        { value: 'normal_attention', label: '普通' },
+        { value: 'low_priority', label: '低优先' }
+      ]) &&
+      // 行内具体原因文案必须保持独立，不被筛选器复用（只看可执行代码，注释说明不算）
+      !filterCode.includes('单次表现突出') &&
+      !filterCode.includes('优先补数据') &&
+      !filterCode.includes('单次合作明显低效') &&
+      !filterLib.WORK_PRIORITY_FILTER_OPTIONS.some((option) => /单次|优先补数据|明显低效/.test(option.label))
+  )
+  check(
+    'B2-6c 全部分组 + 高注意力 → 同时包含多样本 passed 与单样本 high_attention',
+    (() => {
+      const kept = filterOver({ workPriority: 'high_attention' }).groups.flatMap((g) => g.creators)
+      const passedHigh = kept.filter((item) => item.historical_status === 'passed')
+      const singleSampleHigh = kept.filter((item) => item.valid_cpm_count === 1)
+      return (
+        passedHigh.length === 1 &&
+        passedHigh[0].creator === '多样本甲' &&
+        passedHigh[0].work_priority_reason === 'multi_sample_passed' &&
+        singleSampleHigh.length === 2 &&
+        singleSampleHigh.every((item) => item.work_priority_reason === 'single_sample_cpm_le_10')
+      )
+    })(),
+    JSON.stringify(filterOver({ workPriority: 'high_attention' }).groups.flatMap((g) => g.creators.map((c) => `${c.creator}:${c.work_priority_reason}`)))
+  )
+  check(
+    'B2-6d 需要观察 + 高注意力 → 不含 priority 组的多样本 passed；优先关注 + 高注意力 → 正常出现',
+    (() => {
+      const watchOnly = filterOver({ groupKey: 'watch', workPriority: 'high_attention' })
+      const watchKept = watchOnly.groups.flatMap((g) => g.creators)
+      const priorityOnly = filterOver({ groupKey: 'priority', workPriority: 'high_attention' })
+      const priorityKept = priorityOnly.groups.flatMap((g) => g.creators)
+      return (
+        watchOnly.groups.length === 1 &&
+        watchOnly.groups[0].key === 'watch' &&
+        watchKept.length === 2 &&
+        watchKept.every((item) => item.historical_status === 'insufficient') &&
+        !watchKept.some((item) => item.creator === '多样本甲') &&
+        priorityOnly.groups.length === 1 &&
+        priorityKept.length === 1 &&
+        priorityKept[0].creator === '多样本甲' &&
+        priorityKept[0].work_priority === 'high_attention'
+      )
+    })(),
+    JSON.stringify({
+      watch: filterOver({ groupKey: 'watch', workPriority: 'high_attention' }).groups.flatMap((g) => g.creators.map((c) => c.creator)),
+      priority: filterOver({ groupKey: 'priority', workPriority: 'high_attention' }).groups.flatMap((g) => g.creators.map((c) => c.creator))
+    })
+  )
+  check(
+    'B2-7 group + work_priority 组合（AND）',
+    (() => {
+      const { groups, visibleCount } = filterOver({ groupKey: 'low_priority', workPriority: 'high_attention' })
+      return groups.length === 1 && visibleCount === 0 && groups[0].creators.length === 0
+    })()
+  )
+  check(
+    'B2-8 keyword + group + priority 三者组合（AND）',
+    (() => {
+      const { groups, visibleCount } = filterOver({
+        keyword: '优先级',
+        groupKey: 'watch',
+        workPriority: 'high_attention'
+      })
+      const kept = groups.flatMap((g) => g.creators).map((item) => item.creator)
+      return visibleCount === 2 && JSON.stringify(kept) === JSON.stringify(['优先级甲', '优先级乙'])
+    })(),
+    JSON.stringify(filterOver({ keyword: '优先级', groupKey: 'watch', workPriority: 'high_attention' }).groups.flatMap((g) => g.creators.map((c) => c.creator)))
+  )
+  check(
+    'B2-9 过滤只缩小范围：保留原分组相对顺序（需要观察组 B1 排序不被打乱）',
+    (() => {
+      const { groups } = filterOver({ groupKey: 'watch', workPriority: 'normal_attention' })
+      const kept = groups[0].creators.map((item) => item.creator)
+      const original = b1.data.groups[1].creators
+        .filter((item) => item.work_priority === 'normal_attention')
+        .map((item) => item.creator)
+      return JSON.stringify(kept) === JSON.stringify(original)
+    })()
+  )
+  check(
+    'B2-10 空结果（不存在的名字）→ 0 且不报错',
+    (() => {
+      const { groups, visibleCount } = filterOver({ keyword: '不存在的达人甲乙丙' })
+      return visibleCount === 0 && groups.length === 3 && groups.every((group) => group.creators.length === 0)
+    })()
+  )
+  check(
+    'B2-11 过滤不修改原始数据（group.count / creators 不被就地改写）',
+    JSON.stringify(b1.data.groups) === radarGroupsBefore &&
+      filterOver({ keyword: '优先级' }).groups[1].count === b1.data.groups[1].count
+  )
+  check(
+    'B2-12 matched_count 反映命中数，count 仍是全量（清空后恢复全部）',
+    (() => {
+      const filtered = filterOver({ keyword: '优先级' })
+      const cleared = filterOver({ ...filterLib.EMPTY_RADAR_FILTERS })
+      return (
+        filtered.groups[1].matched_count === 7 &&
+        filtered.groups[1].count === 8 &&
+        cleared.visibleCount === allCreatorsB1.length &&
+        !filterLib.isRadarFilterActive(filterLib.EMPTY_RADAR_FILTERS) &&
+        filterLib.isRadarFilterActive({ keyword: '巴' }) &&
+        filterLib.isRadarFilterActive({ groupKey: 'watch' }) &&
+        filterLib.isRadarFilterActive({ workPriority: 'low_priority' })
+      )
+    })(),
+    JSON.stringify({
+      matched: filterOver({ keyword: '优先级' }).groups[1].matched_count,
+      total: filterOver({ keyword: '优先级' }).groups[1].count
+    })
+  )
+  check(
+    'B2-13 显示数量 = 命中数 / API 总达人数量（12 位达人）',
+    filterOver({ keyword: '优先级' }).visibleCount === 9 &&
+      b1.data.summary.creator_count === 12 &&
+      allCreatorsB1.length === 12
+  )
+  check(
+    'B2-14 前端不重算 CPM / work_priority（无阈值常量、无 1000 换算、无状态推导）',
+    !/\b(10|20|100)\b/.test(filterCode) &&
+      !/\/\s*1000/.test(filterCode) &&
+      !/historical_status|median|CPM|cpm|pass_count|fail_count/.test(filterCode) &&
+      /item\?\.work_priority === workPriority/.test(filterCode)
+  )
+  check(
+    'B2-15 检索状态是纯视图状态：无写库 / 无网络 / 无 AI；雷达接口本身仍只读',
+    !/fetch\(|axios|localStorage|sessionStorage|deepseek/i.test(filterSource) &&
+      /const \[filters, setFilters\] = useState\(EMPTY_RADAR_FILTERS\)/.test(radarPageB2) &&
+      /filterRadarGroups\(radar\?\.groups \|\| \[\], filters\)/.test(radarPageB2) &&
+      /const RADAR_TABLE_WIDTH = 836/.test(radarPageB2) &&
+      (radarPageB2.match(/title: '/g) || []).length === 9 &&
+      db.prepare('SELECT COUNT(*) AS n FROM creator_records').get().n === B1_SEED.length &&
+      db.prepare('SELECT COUNT(*) AS n FROM creator_negotiation_cases').get().n === 0
+  )
+  check(
+    'B2-16 页面接入检索控件（搜索 / 分组 / 优先级 / 清空筛选 / 结果数量）',
+    /placeholder="搜索达人名称"/.test(radarPageB2) &&
+      /options=\{RADAR_GROUP_OPTIONS\}/.test(radarPageB2) &&
+      /options=\{WORK_PRIORITY_FILTER_OPTIONS\}/.test(radarPageB2) &&
+      /清空筛选/.test(radarPageB2) &&
+      /显示 \{formatInteger\(visibleCount\)\} \/ \{formatInteger\(totalCount\)\} 位达人/.test(radarPageB2)
+  )
 }
 
 main()

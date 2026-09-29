@@ -11,6 +11,7 @@ import {
 } from '../utils/dateCycle.js'
 import { buildXlsx } from '../utils/xlsx.js'
 import { loadLatestSnapshotSummaries } from './recentSnapshots.js'
+import { TARGET_CPM } from '../utils/creatorBusinessRules.js'
 
 const router = Router()
 
@@ -1526,8 +1527,10 @@ router.get('/creator-summary', (req, res) => {
 // 不写库、不调用 AI、不访问外部网络。
 // ============================================================
 
-// 目标 CPM：单次合作累计 CPM <= 目标值视为达标（P1 固定常量，不做可配置、不做综合评分）
-export const REPURCHASE_TARGET_CPM = 30
+// 目标 CPM：单次合作累计 CPM <= 目标值视为达标。
+// P3 起统一取共享业务规则模块的 TARGET_CPM（唯一来源，避免 P1 / P3 两份 30 漂移）；
+// P1 的历史判断行为完全不变，仍然只使用这一个值。
+export const REPURCHASE_TARGET_CPM = TARGET_CPM
 
 // 历史状态（明确业务规则，不用平均值决胜、不用综合评分）
 const RADAR_STATUS = {

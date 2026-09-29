@@ -35,6 +35,7 @@ import {
   needsIdentityConfirmation,
   TREND_LABELS_FULL
 } from '../utils/recentPerformanceSave.js'
+import { buildPricingRows } from '../utils/pricingDisplay.js'
 import {
   IMAGE_ACCEPT_ATTR,
   MAX_IMAGE_BYTES,
@@ -760,6 +761,25 @@ export default function RecentPerformanceAssistantModal({
                         星图价：{savedSnapshot.xingtu_price === null || savedSnapshot.xingtu_price === undefined ? '待确认 / 未识别' : `¥${formatInteger(savedSnapshot.xingtu_price)}`}
                       </Typography.Text>
                       <Typography.Text type="secondary">统计口径：{savedSnapshot.stats_version}</Typography.Text>
+                      <Divider style={{ margin: '6px 0' }} />
+                      <Typography.Text strong>
+                        CPM30 价格核算
+                        <Typography.Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>
+                          按近期中位播放 / 典型区间（P25–P75）换算，仅价格参考
+                        </Typography.Text>
+                      </Typography.Text>
+                      {buildPricingRows(savedSnapshot.pricing).map((row) => (
+                        <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                          <Typography.Text type="secondary">{row.label}</Typography.Text>
+                          <Typography.Text>{row.value}</Typography.Text>
+                        </div>
+                      ))}
+                      <Typography.Text>
+                        价格状态：{savedSnapshot.pricing?.pricing_status_label || '-'}
+                      </Typography.Text>
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        价格规则版本：{savedSnapshot.pricing?.pricing_version || '-'}
+                      </Typography.Text>
                     </Space>
                   }
                 />

@@ -4,6 +4,7 @@ import {
   Button,
   Card,
   Col,
+  Divider,
   Empty,
   Popover,
   Row,
@@ -26,6 +27,7 @@ import {
   formatTrendRatio,
   TREND_LABELS_FULL
 } from '../../utils/recentPerformanceSave.js'
+import { buildPricingRows, formatPrice } from '../../utils/pricingDisplay.js'
 
 // 历史状态 -> 展示文案（文字为主，颜色仅辅助，不依赖颜色理解）
 const STATUS_META = {
@@ -68,11 +70,12 @@ function buildRadarColumns(targetCpm, onOpenAssistant) {
             <Popover
               trigger="click"
               placement="right"
-              title={`${value} · 近期表现`}
+              title={`${value} · 近期表现与价格核算`}
               content={
-                <div style={{ width: 260 }}>
+                <div style={{ width: 288 }}>
                   {snapshot ? (
                     <Space direction="vertical" size={2} style={{ display: 'flex' }}>
+                      <Typography.Text strong>近期表现</Typography.Text>
                       <Typography.Text type="secondary">
                         更新于：{snapshot.created_at || '-'}
                       </Typography.Text>
@@ -104,6 +107,17 @@ function buildRadarColumns(targetCpm, onOpenAssistant) {
                       <Typography.Text type="secondary">
                         统计口径：{snapshot.stats_version}
                       </Typography.Text>
+                      <Divider style={{ margin: '6px 0' }} />
+                      <Typography.Text strong>价格核算</Typography.Text>
+                      {buildPricingRows(snapshot.pricing).map((row) => (
+                        <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                          <Typography.Text type="secondary">{row.label}</Typography.Text>
+                          <Typography.Text>{row.value}</Typography.Text>
+                        </div>
+                      ))}
+                      <Divider style={{ margin: '6px 0' }} />
+                      <Typography.Text strong>价格状态</Typography.Text>
+                      <Typography.Text>{snapshot.pricing?.pricing_status_label || '-'}</Typography.Text>
                     </Space>
                   ) : (
                     <Typography.Text type="secondary">近期表现：尚未更新</Typography.Text>
@@ -117,7 +131,14 @@ function buildRadarColumns(targetCpm, onOpenAssistant) {
               }
             >
               <a style={{ ...SECONDARY_TEXT_STYLE, display: 'inline-block', maxWidth: '100%' }}>
-                {formatSnapshotStatusText(snapshot)}
+                <span style={{ display: 'block', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {formatSnapshotStatusText(snapshot)}
+                </span>
+                {snapshot?.pricing?.target_price !== null && snapshot?.pricing?.target_price !== undefined && (
+                  <span style={{ display: 'block', whiteSpace: 'nowrap' }}>
+                    目标价 {formatPrice(snapshot.pricing.target_price)}
+                  </span>
+                )}
               </a>
             </Popover>
           </div>
@@ -186,7 +207,7 @@ function buildRadarColumns(targetCpm, onOpenAssistant) {
       render: (_, record) =>
         record.recent_risk ? (
           <Tooltip
-            title={`最近连续 2 次有效累计 CPM 都大于 ${targetCpm}；该提示不改变历史状态`}
+            title={`最近连续 2 次有效累计 CPM 都大于 ${formatInteger(targetCpm)}；该提示不改变历史状态`}
           >
             <span style={{ color: '#d4380d' }}>⚠ 最近2次未达标</span>
           </Tooltip>
@@ -237,7 +258,8 @@ export default function RepurchaseRadar() {
     setAssistantCreator(creatorName || null)
     setAssistantOpen(true)
   }
-  const columns = buildRadarColumns(targetCpm ?? 30, openAssistant)
+  // 目标 CPM 一律取后端返回值（唯一来源在 backend/utils/creatorBusinessRules.js），前端不持有字面量
+  const columns = buildRadarColumns(targetCpm, openAssistant)
   const statisticCardStyle = { height: '100%', minHeight: 96 }
 
   return (
@@ -320,7 +342,7 @@ export default function RepurchaseRadar() {
         description={
           <Space direction="vertical" size={2}>
             <Typography.Text>
-              单次达标：累计 CPM（总花费 ÷ 累计播放量 × 1000）≤ {targetCpm ?? 30} 为达标。
+              单次达标：累计 CPM（总花费 ÷ 累计播放量 × 1000）≤ {formatInteger(targetCpm)} 为达标。
             </Typography.Text>
             <Typography.Text>
               有效 CPM 样本：累计播放量已填写、未出现「累计播放量 &lt; 7日播放量」异常且大于 0；
@@ -387,7 +409,7 @@ export default function RepurchaseRadar() {
               <Skeleton active paragraph={{ rows: 1 }} />
             ) : (
               <Tooltip title="单次合作累计 CPM 达标线（V3-alpha P1 固定值）">
-                <Statistic title="当前目标 CPM" value={targetCpm ?? 30} />
+                <Statistic title="当前目标 CPM" value={targetCpm === null || targetCpm === undefined ? '-' : formatInteger(targetCpm)} />
               </Tooltip>
             )}
           </Card>

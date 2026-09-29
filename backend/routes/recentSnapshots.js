@@ -6,6 +6,7 @@ import {
   STATS_VERSION,
   computeRecentPerformanceStats
 } from '../utils/recentPerformanceStats.js'
+import { computeCreatorPricing } from '../utils/creatorPricing.js'
 
 const router = Router()
 
@@ -196,7 +197,15 @@ export function toPublicSnapshot(row) {
     trend_label: row.trend_label ?? null,
     stats_status: row.stats_status ?? null,
     stats_version: row.stats_version,
-    created_at: row.created_at
+    created_at: row.created_at,
+    // P3 价格判断层：只消费本快照的统计字段，确定性派生（不写库）
+    pricing: computeCreatorPricing({
+      stats_status: row.stats_status,
+      median_play: row.median_play,
+      p25_play: row.p25_play,
+      p75_play: row.p75_play,
+      xingtu_price: row.xingtu_price
+    })
   }
 }
 
@@ -214,7 +223,15 @@ export function toSnapshotSummary(row) {
     trend_label: row.trend_label ?? null,
     xingtu_price: row.xingtu_price ?? null,
     stats_status: row.stats_status ?? null,
-    stats_version: row.stats_version
+    stats_version: row.stats_version,
+    // P3：radar 一次请求即带价格判断，避免前端 N+1（同一行数据派生，无需额外查询）
+    pricing: computeCreatorPricing({
+      stats_status: row.stats_status,
+      median_play: row.median_play,
+      p25_play: row.p25_play,
+      p75_play: row.p75_play,
+      xingtu_price: row.xingtu_price
+    })
   }
 }
 

@@ -275,7 +275,7 @@ export default function CreatorDecisionDrawer({
             <Typography.Text type="secondary">星图刊例价</Typography.Text>
             <Typography.Text>
               {snapshot.xingtu_price === null || snapshot.xingtu_price === undefined
-                ? '待确认 / 未识别'
+                ? '暂无'
                 : formatPrice(snapshot.xingtu_price)}
             </Typography.Text>
           </div>

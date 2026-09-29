@@ -115,7 +115,7 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
                       <Typography.Text>
                         星图价：
                         {snapshot.xingtu_price === null || snapshot.xingtu_price === undefined
-                          ? '待确认 / 未识别'
+                          ? '暂无'
                           : `¥${formatInteger(snapshot.xingtu_price)}`}
                       </Typography.Text>
                       <Typography.Text type="secondary">

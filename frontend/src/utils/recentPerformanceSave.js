@@ -178,7 +178,7 @@ export const PRICE_FIELD_STATUS = {
 export const PRICE_FIELD_STATUS_LABELS = {
   identified: '已识别',
   confirmed: '已确认',
-  missing: '需补充',
+  missing: '暂无', // A3：星图刊例价是可选事实，缺失是合法状态，不是「待补充的错误」
   invalid: '请检查'
 }
 
@@ -190,18 +190,17 @@ export function getPriceFieldStatus({ rawText, price, needsReview = false, manua
 }
 
 /**
- * 「需要确认 X 项」计数（Alpha.2 Sprint A2）：
- * 只统计真正需要用户处理的事项 —— 星图价未识别/解析失败（1 项）、无法解析的播放量条目（每条 1 项）、
+ * 「需要确认 X 项」计数（Alpha.2 Sprint A3）：
+ * 只统计真正需要用户处理的事项 —— 无法解析的播放量条目（每条 1 项）、
  * 以及 AI 识别昵称与当前达人不一致（1 项）。
+ * 星图刊例价是可选事实字段，缺失不再计入（A2 曾计入，A3 起取消）。
  * 解释性说明（均值线、参考线、日期轴、昵称未识别等）不计入。
  */
 export function countRequiredConfirmations({
-  priceNeedsConfirmation = false,
   unresolvedCount = 0,
   identityStatus = IDENTITY_STATUS.matched
 } = {}) {
   let count = 0
-  if (priceNeedsConfirmation) count += 1
   const unresolved = Number(unresolvedCount)
   if (Number.isFinite(unresolved) && unresolved > 0) count += Math.floor(unresolved)
   if (identityStatus === IDENTITY_STATUS.mismatch) count += 1

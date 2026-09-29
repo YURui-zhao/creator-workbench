@@ -212,17 +212,31 @@ async function main() {
       display.formatEntryDiscount(base)
     )
     check(
-      'quote_missing 时价格行仍包含目标价与区间、星图价写「待确认 / 未识别」',
+      'A3: quote_missing 时价格行仍包含目标价与区间、星图价写「暂无」',
       (() => {
         const rows = display.buildPricingRows(missing)
         const labels = rows.map((row) => row.label)
         return (
           rows.some((row) => row.label === 'CPM30目标价' && row.value === '¥1,560') &&
           rows.some((row) => row.label === 'CPM30参考区间' && row.value.includes('1,290')) &&
-          rows.some((row) => row.label === '星图刊例价' && row.value.includes('待确认')) &&
+          rows.some((row) => row.label === '星图刊例价' && row.value === '暂无') &&
           !labels.includes('进入参考区间')
         )
       })()
+    )
+    check(
+      'A3: 无星图价时折扣相关字段全部为 null（不伪造折扣）',
+      missing.entry_discount_rate === null &&
+        missing.entry_discount_zhe === null &&
+        missing.target_discount_rate === null &&
+        missing.target_discount_zhe === null &&
+        missing.negotiation_max_price === null &&
+        missing.negotiation_min_price === null &&
+        missing.pricing_status === 'quote_missing'
+    )
+    check(
+      'A3: 无星图价不影响 median → target/range（仅砍掉星图锚定折扣）',
+      missing.target_price === 1560 && missing.reference_low === 1290 && missing.reference_high === 1830
     )
     check(
       'insufficient 时不出现目标价与区间',

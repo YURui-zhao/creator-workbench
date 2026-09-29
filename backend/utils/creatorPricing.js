@@ -41,7 +41,8 @@ export const PRICING_STATUS = {
 
 export const PRICING_STATUS_LABELS = {
   [PRICING_STATUS.insufficient]: '近期有效样本不足，暂无法计算 CPM30目标价',
-  [PRICING_STATUS.quoteMissing]: '星图刊例价未识别，暂无法进行折扣比较',
+  // A3：星图刊例价是可选事实，没有它只影响「星图锚定的折扣」，不影响目标价/参考区间
+  [PRICING_STATUS.quoteMissing]: '暂无星图刊例价，暂不计算星图折扣',
   [PRICING_STATUS.quoteZero]: '星图价为0，当前价格低于CPM30目标价',
   [PRICING_STATUS.atOrBelowTarget]: '当前刊例价已不高于 CPM30目标价',
   [PRICING_STATUS.withinReferenceRange]: '当前刊例价高于目标价，但仍处于 CPM30参考区间内',

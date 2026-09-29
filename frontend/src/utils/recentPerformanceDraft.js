@@ -57,6 +57,60 @@ export function updateCreatorName(draft, value) {
   return { ...draft, creator_name: String(value ?? '') }
 }
 
+/**
+ * 手工录入（Alpha.2 Sprint A3）：把用户粘贴/输入的多行文本拆成播放量原文列表。
+ * 支持换行、中文逗号、英文逗号、分号、制表符分隔；不排序、不去重、不猜日期。
+ * 顺序 = 用户输入顺序（约定：最近 → 更早）。
+ */
+export function splitManualPlayLines(text) {
+  return String(text ?? '')
+    .split(/[\n\r,，;；\t]+/)
+    .map((item) => item.trim())
+    .filter((item) => item !== '')
+}
+
+/**
+ * 手工录入 → 与 AI 识别完全相同的草稿结构（不新增第二套解析逻辑）。
+ * - 每条复用 parsePlayText（确定性解析，无法解析的保留 raw_text + needs_review）
+ * - position_index 按用户输入顺序生成（最近 → 更早），不按数值大小排序
+ * - 手工模式没有 AI 识别昵称：creator_name 置空（身份核对为 unknown，不阻塞）
+ * - 星图价仍可选：可在确认区填写，缺省为 null（合法）
+ */
+export function buildDraftFromManualPlays(rawLines = [], { priceRaw = '' } = {}) {
+  const lines = (Array.isArray(rawLines) ? rawLines : splitManualPlayLines(rawLines))
+    .map((item) => toRawText(item))
+    .filter((item) => item !== null && item !== '')
+    .slice(0, MAX_DRAFT_PLAYS)
+
+  const plays = lines.map((rawText, index) => {
+    const parsed = parsePlayText(rawText)
+    return {
+      id: `play-${index + 1}`,
+      raw_text: parsed.raw_text,
+      normalized_play: parsed.value,
+      needs_review: parsed.needs_review,
+      reason: parsed.reason,
+      excluded: false,
+      source_image_index: null,
+      position_index: index + 1
+    }
+  })
+
+  const price = parsePriceText(toRawText(priceRaw))
+
+  return {
+    provider: null,
+    model: null,
+    creator_name: '',
+    xingtu_price_raw: price.raw_text || '',
+    xingtu_price: price.value,
+    xingtu_price_needs_review: price.needs_review,
+    xingtu_price_reason: price.reason,
+    plays,
+    warnings: []
+  }
+}
+
 /** 人工修改星图刊例价原文 -> 立即按确定性规则重新换算 */
 export function updatePriceRawText(draft, rawText) {
   const text = String(rawText ?? '')

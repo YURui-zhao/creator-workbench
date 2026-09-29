@@ -480,9 +480,9 @@ async function main() {
         /warningsExpanded &&[\s\S]{0,200}draft\.warnings\.map/.test(modalSource)
     )
     check(
-      'A2-20 待确认项计数只由「星图价 / 无法解析播放量 / 身份不一致」决定',
+      'A2-20 待确认项计数只由「无法解析播放量 / 身份不一致」决定（A3 起星图价不计入）',
       /countRequiredConfirmations\(\{/.test(modalSource) &&
-        /priceNeedsConfirmation,/.test(modalSource) &&
+        !/priceNeedsConfirmation,/.test(modalSource) &&
         /unresolvedCount: summary\?\.unresolved_count \?\? 0,/.test(modalSource) &&
         /identityStatus: identityState\.status/.test(modalSource) &&
         /需要确认 \$\{requiredConfirmations\} 项/.test(modalSource)
@@ -493,15 +493,15 @@ async function main() {
     )
     check(
       'A2-22 星图刊例价只保留一个字段 + 一个状态文案（不再重复「需人工确认」）',
-      /星图刊例价<\/Typography\.Text>/.test(modalSource) &&
+      /星图刊例价（选填）<\/Typography\.Text>/.test(modalSource) &&
         /PRICE_FIELD_STATUS_LABELS\[priceFieldStatus\]/.test(modalSource) &&
         (modalSource.match(/PRICE_FIELD_STATUS_LABELS\[priceFieldStatus\]/g) || []).length === 1 &&
         !/draft\.xingtu_price === null \? '需人工确认'/.test(modalSource) &&
         !/xingtu_price_needs_review && \(/.test(modalSource)
     )
     check(
-      'A2-23 星图价输入框文案为「请输入刊例价」（未识别时不伪装成已识别）',
-      /请输入刊例价，例如 ¥3,000/.test(modalSource)
+      'A3 星图价输入框文案为「可不填」（可选事实，不伪装成已识别）',
+      /可不填，例如 ¥3,000/.test(modalSource)
     )
     check(
       'A2-24 snapshot owner 仍是雷达达人（payload creator = boundCreator）',
@@ -513,7 +513,54 @@ async function main() {
       /observedAt\n?\s*\}\)/.test(modalSource) && /observed_at: String\(observedAt/.test(saveLibSourceForA2)
     )
 
-    console.log('\n===== 10. 网络重定向边界（3xx 绝不跟随）=====')
+    console.log('\n===== 10. Alpha.2 A3：手工录入入口（源码契约）=====')
+    check(
+      'A3-1 两个入口主动可见（上传截图识别 / 手工录入），不需要先失败一次 AI',
+      /<Radio\.Button value="screenshot">上传截图识别<\/Radio\.Button>/.test(modalSource) &&
+        /<Radio\.Button value="manual">手工录入<\/Radio\.Button>/.test(modalSource) &&
+        /近期作品数据/.test(modalSource)
+    )
+    check(
+      'A3-2 手工录入面板存在（多行输入 + 解析按钮）',
+      /Input\.TextArea/.test(modalSource) &&
+        /解析并进入确认/.test(modalSource) &&
+        /handleParseManualPlays/.test(modalSource)
+    )
+    check(
+      'A3-3 手工录入复用既有确定性 parser（不新增第二套解析）',
+      /buildDraftFromManualPlays\(/.test(modalSource) &&
+        /splitManualPlayLines\(/.test(modalSource) &&
+        !/parsePlayText\(/.test(modalSource)
+    )
+    check(
+      'A3-4 手工录入明确「最近 → 更早」顺序与数量建议',
+      /最近 → 更早/.test(modalSource) &&
+        /至少 5 条才能计算中位播放与典型区间/.test(modalSource) &&
+        /不强制凑满 15 条/.test(modalSource)
+    )
+    check(
+      'A3-5 手工模式不渲染截图上传区与「发送范围」（不向 AI 发送任何内容）',
+      /entryMode === 'screenshot' && \([\s\S]{0,80}发送范围/.test(modalSource) &&
+        /entryMode === 'screenshot' && \([\s\S]{0,2000}上传后不会自动发送/.test(modalSource) &&
+        /entryMode === 'manual' && \(/.test(modalSource)
+    )
+    check(
+      'A3-6 手工模式不显示「未识别到达人昵称」提示（身份不适用，不是 mismatch）',
+      /identityUnknown && entryMode === 'screenshot'/.test(modalSource)
+    )
+    check(
+      'A3-7 AI 仍是唯一显式触发（手工录入不调用识别接口）',
+      (modalSource.match(/extractCreatorScreenshot\(/g) || []).length === 1 &&
+        !/handleParseManualPlays[\s\S]{0,400}extractCreatorScreenshot\(/.test(modalSource)
+    )
+    check(
+      'A3-8 手工与截图汇入同一条保存链（同一个 buildSnapshotPayload + 保存按钮）',
+      (modalSource.match(/buildSnapshotPayload\(/g) || []).length === 1 &&
+        /onClick=\{handleSave\}/.test(modalSource) &&
+        (modalSource.match(/saveRecentSnapshot\(/g) || []).length === 1
+    )
+
+    console.log('\n===== 11. 网络重定向边界（3xx 绝不跟随）=====')
     // A. Provider 返回 302 + Location: https://evil.example/collect
     calls.length = 0
     logs.length = 0

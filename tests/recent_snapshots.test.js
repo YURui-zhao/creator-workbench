@@ -105,6 +105,9 @@ async function main() {
     const saveLib = await import(
       pathToFileURL(path.join(frontend, 'utils/recentPerformanceSave.js')).href
     )
+    const draftLib = await import(
+      pathToFileURL(path.join(frontend, 'utils/recentPerformanceDraft.js')).href
+    )
     const db = (await import(pathToFileURL(path.join(root, 'backend/db.js')).href)).default
 
     const snapshotRouter = snapshots.default
@@ -723,13 +726,14 @@ async function main() {
       countOf({ priceNeedsConfirmation: false, unresolvedCount: 0, identityStatus: 'mismatch' }) === 1
     )
     check(
-      'A2-8 星图价未识别/解析失败 +1',
-      countOf({ priceNeedsConfirmation: true, unresolvedCount: 0, identityStatus: 'matched' }) === 1
+      'A3 起：星图价缺失 / 解析失败都不计入待确认项（可选事实字段）',
+      countOf({ priceNeedsConfirmation: true, unresolvedCount: 0, identityStatus: 'matched' }) === 0 &&
+        countOf({ unresolvedCount: 0, identityStatus: 'matched' }) === 0
     )
     check(
       'A2-9 无法解析的播放量每条 +1',
       countOf({ priceNeedsConfirmation: false, unresolvedCount: 3, identityStatus: 'matched' }) === 3 &&
-        countOf({ priceNeedsConfirmation: true, unresolvedCount: 2, identityStatus: 'mismatch' }) === 4
+        countOf({ unresolvedCount: 2, identityStatus: 'mismatch' }) === 3
     )
     check(
       'A2-10 解释性说明（无这些字段）不增加计数',
@@ -739,17 +743,17 @@ async function main() {
 
     const priceStatusOf = saveLib.getPriceFieldStatus
     check(
-      'A2-11 星图价字段四态：已识别 / 已确认 / 需补充 / 请检查',
+      'A2-11 星图价字段四态：已识别 / 已确认 / 暂无 / 请检查',
       priceStatusOf({ rawText: '4100', price: 4100, needsReview: false, manuallyEdited: false }) === 'identified' &&
         priceStatusOf({ rawText: '4100', price: 4100, needsReview: false, manuallyEdited: true }) === 'confirmed' &&
         priceStatusOf({ rawText: '', price: null, needsReview: false }) === 'missing' &&
         priceStatusOf({ rawText: '面议', price: null, needsReview: true }) === 'invalid'
     )
     check(
-      'A2-12 状态文案唯一来源（已识别 / 已确认 / 需补充 / 请检查）',
+      'A2-12 状态文案唯一来源（已识别 / 已确认 / 暂无 / 请检查）',
       saveLib.PRICE_FIELD_STATUS_LABELS.identified === '已识别' &&
         saveLib.PRICE_FIELD_STATUS_LABELS.confirmed === '已确认' &&
-        saveLib.PRICE_FIELD_STATUS_LABELS.missing === '需补充' &&
+        saveLib.PRICE_FIELD_STATUS_LABELS.missing === '暂无' &&
         saveLib.PRICE_FIELD_STATUS_LABELS.invalid === '请检查'
     )
 
@@ -769,7 +773,176 @@ async function main() {
       saveLib.buildSnapshotPayload({ creator_name: '巴博斯', plays: [] }, { creator: '巴博斯', observedAt: '2026-09-25' }).observed_at === '2026-09-25'
     )
 
-    console.log('\n===== 12. 无 AI / 无网络 / 只读实现 =====')
+    console.log('\n===== 12. Alpha.2 A3：星图价可选 + 手工录入播放量 =====')
+    // A3 用例使用独立达人，避免与前序小节的快照相互干扰
+    db.transaction(() => {
+      for (const nickname of ['A3无价达人', 'A3清空价达人', 'A3四条达人', 'A3八条达人', 'A3对照达人']) {
+        insertRecord.run('2026-W36', nickname, '数码', 1200, '2026-09-05', 10000, 50000)
+      }
+    })()
+    // ---- 星图价可选：无价仍可保存，且不进入「需要确认」----
+    const noPriceSnapshot = await save({
+      creator: 'A3无价达人',
+      observed_at: '2026-09-29',
+      plays: ['5.2万', '4.8万', '3.9万', '6.1万', '12000', '8.3w', '4.1万', '5.5万'].map((text) => play(text))
+    })
+    check(
+      'A3-1 无星图价 → snapshot 仍可保存（xingtu_price = null）',
+      noPriceSnapshot.status === 200 && noPriceSnapshot.data.xingtu_price === null && noPriceSnapshot.data.median_play === 50000,
+      JSON.stringify({ status: noPriceSnapshot.status, price: noPriceSnapshot.data?.xingtu_price, median: noPriceSnapshot.data?.median_play })
+    )
+    check(
+      'A3-2 无星图价时 pricing 为 quote_missing，但目标价 / 参考区间照常计算',
+      noPriceSnapshot.data.pricing.pricing_status === 'quote_missing' &&
+        noPriceSnapshot.data.pricing.target_price === 1500 &&
+        noPriceSnapshot.data.pricing.reference_low === 1282.5 &&
+        noPriceSnapshot.data.pricing.reference_high === 1627.5,
+      JSON.stringify({
+        target: noPriceSnapshot.data.pricing.target_price,
+        low: noPriceSnapshot.data.pricing.reference_low,
+        high: noPriceSnapshot.data.pricing.reference_high
+      })
+    )
+    check(
+      'A3-3 无星图价：折扣相关字段全部不可用（不伪造 1 折 / 5 折）',
+      ['entry_discount_rate', 'entry_discount_zhe', 'target_discount_rate', 'target_discount_zhe', 'negotiation_max_price', 'negotiation_min_price'].every(
+        (key) => noPriceSnapshot.data.pricing[key] === null
+      )
+    )
+    check(
+      'A3-4 quote_missing 文案为「暂无星图刊例价，暂不计算星图折扣」',
+      /暂无星图刊例价/.test(noPriceSnapshot.data.pricing.pricing_status_label) &&
+        /暂不计算星图折扣/.test(noPriceSnapshot.data.pricing.pricing_status_label),
+      noPriceSnapshot.data.pricing.pricing_status_label
+    )
+    const priceCleared = await save({
+      creator: 'A3清空价达人',
+      observed_at: '2026-09-29',
+      xingtu_price_raw: '面议',
+      plays: ['5.2万', '4.8万', '3.9万', '6.1万', '12000', '8.3w', '4.1万', '5.5万'].map((text) => play(text))
+    })
+    check('A3-5 有原文但解析不了 → 仍可保存（价格 null，状态请检查）', priceCleared.status === 200 && priceCleared.data.xingtu_price === null)
+
+    // ---- 手工录入：复用同一套 parser，顺序 = 输入顺序 ----
+    const { splitManualPlayLines, buildDraftFromManualPlays } = draftLib
+    check('A3-6 导出手工录入相关纯函数', typeof splitManualPlayLines === 'function' && typeof buildDraftFromManualPlays === 'function')
+    check(
+      'A3-7 换行 / 中文逗号 / 英文逗号 / 分号混合输入都能拆分',
+      JSON.stringify(splitManualPlayLines('5.2万\n4.8万，3.9万, 6.1万；12000')) ===
+        JSON.stringify(['5.2万', '4.8万', '3.9万', '6.1万', '12000'])
+    )
+    const manualDraft = buildDraftFromManualPlays(splitManualPlayLines('5.2万\n4.8万\n39000\n8.3w\n面议'))
+    check(
+      'A3-8 手工录入复用确定性 parser（5.2万→52000 / 4.8万→48000 / 39000 / 8.3w→83000）',
+      manualDraft.plays[0].normalized_play === 52000 &&
+        manualDraft.plays[1].normalized_play === 48000 &&
+        manualDraft.plays[2].normalized_play === 39000 &&
+        manualDraft.plays[3].normalized_play === 83000
+    )
+    check(
+      'A3-9 顺序保持输入顺序（newest→oldest），position_index 按输入生成，不排序',
+      manualDraft.plays.map((play) => play.position_index).join(',') === '1,2,3,4,5' &&
+        manualDraft.plays[0].raw_text === '5.2万' &&
+        manualDraft.plays[4].raw_text === '面议'
+    )
+    check(
+      'A3-10 无法解析的条目保留为 unresolved（需人工处理，不丢弃）',
+      manualDraft.plays[4].normalized_play === null && manualDraft.plays[4].needs_review === true
+    )
+    check(
+      'A3-11 手工草稿结构与会话链一致（无 AI 昵称 / 价格可选 / 无 warnings）',
+      manualDraft.creator_name === '' &&
+        manualDraft.xingtu_price === null &&
+        manualDraft.xingtu_price_raw === '' &&
+        Array.isArray(manualDraft.warnings) &&
+        manualDraft.warnings.length === 0 &&
+        manualDraft.plays.every((play) => play.source_image_index === null)
+    )
+    check(
+      'A3-12 手工模式身份态为 unknown（不阻塞、不出现 mismatch）',
+      saveLib.getIdentityCheckState({ currentCreator: '巴博斯', recognizedCreatorName: manualDraft.creator_name }).status === 'unknown' &&
+        saveLib.getIdentityCheckState({ currentCreator: '巴博斯', recognizedCreatorName: manualDraft.creator_name }).requiresConfirmation === false
+    )
+    check(
+      'A3-13 手工录入不触发 AI / 网络（模块不引用 AI 能力）',
+      !/extractCreatorScreenshot|axios|fetch\(|deepseek/i.test(
+        fs.readFileSync(path.join(frontend, 'utils/recentPerformanceDraft.js'), 'utf8')
+      )
+    )
+
+    // ---- 与 AI 路径共用同一条保存链：统计完全一致 ----
+    const manualFour = ['5.2万', '4.8万', '3.9万', '6.1万']
+    const manualFourDraft = buildDraftFromManualPlays(manualFour)
+    const manualFourStats = stats.computeRecentPerformanceStats(
+      manualFourDraft.plays.filter((play) => play.normalized_play !== null).map((play) => play.normalized_play)
+    )
+    check(
+      'A3-14 手工输入 < 5 条 → stats insufficient（但仍可保存，不禁止）',
+      manualFourStats.stats_status === 'insufficient' &&
+        manualFourStats.median_play === null &&
+        (await save({
+          creator: 'A3四条达人',
+          observed_at: '2026-09-29',
+          plays: manualFour.map((text) => play(text))
+        })).status === 200
+    )
+    const manualEight = ['5.2万', '4.8万', '3.9万', '6.1万', '12000', '8.3w', '4.1万', '5.5万']
+    const manualEightSave = await save({
+      creator: 'A3八条达人',
+      observed_at: '2026-09-29',
+      plays: manualEight.map((text) => play(text))
+    })
+    const aiPathSave = await save({
+      creator: 'A3对照达人',
+      observed_at: '2026-09-29',
+      xingtu_price_raw: '4100',
+      plays: manualEight.map((text) => play(text))
+    })
+    check(
+      'A3-15 手工路径与 AI 路径的统计完全一致（median / P25 / P75 / trend / valid_count / analysis_count）',
+      ['median_play', 'p25_play', 'p75_play', 'trend_label', 'trend_ratio', 'valid_count', 'analysis_count', 'stats_status'].every(
+        (key) => manualEightSave.data[key] === aiPathSave.data[key]
+      ),
+      JSON.stringify({ manual: [manualEightSave.data.median_play, manualEightSave.data.trend_label], ai: [aiPathSave.data.median_play, aiPathSave.data.trend_label] })
+    )
+    check(
+      'A3-16 ≥8 条时趋势可计算（与现有算法一致：recent/prior 中位数）',
+      manualEightSave.data.trend_label === 'stable' &&
+        manualEightSave.data.recent_median_play === 48000 &&
+        manualEightSave.data.prior_median_play === 55000,
+      JSON.stringify({ trend: manualEightSave.data.trend_label, recent: manualEightSave.data.recent_median_play, prior: manualEightSave.data.prior_median_play })
+    )
+
+    // ---- P4：无星图价 + current_quote 仍可评估报价 ----
+    const noPriceDecision = await callRoute(createDecisionHandler, {
+      body: {
+        creator: 'A3无价达人',
+        decision_stage: 'post_quote',
+        snapshot_id: noPriceSnapshot.data.id,
+        current_quote_raw: '3000',
+        human_decision: 'negotiate'
+      }
+    })
+    const assessment = noPriceDecision.data?.pricing_evidence?.current_quote_assessment
+    check(
+      'A3-17 无星图价 + 达人报价 3000：仍算 current_quote_status / gap_to_target / gap_to_reference_high',
+      noPriceDecision.status === 200 &&
+        assessment.current_quote === 3000 &&
+        assessment.current_quote_status === 'above_reference_range' &&
+        assessment.gap_to_reference_high === 1372.5 &&
+        assessment.gap_to_target === 1500,
+      JSON.stringify(assessment)
+    )
+    check(
+      'A3-18 无星图价：星图折扣 / 2～7折区间一律 unavailable（不显示虚假折扣）',
+      assessment.actual_vs_xingtu_rate === null &&
+        assessment.actual_vs_xingtu_zhe === null &&
+        assessment.negotiation_range_status === 'unavailable' &&
+        /无法判断实际报价对应的折扣区间/.test(assessment.negotiation_range_status_label),
+      JSON.stringify({ rate: assessment.actual_vs_xingtu_rate, range: assessment.negotiation_range_status })
+    )
+
+    console.log('\n===== 13. 无 AI / 无网络 / 只读实现 =====')
     const routeSource = fs.readFileSync(path.join(root, 'backend/routes/recentSnapshots.js'), 'utf8')
     check('P2B 路由不引用任何 AI 服务', !/deepseek|callProviderVision|extract-creator-screenshot/i.test(routeSource))
     check('P2B 路由只注册 POST / 与 GET /latest', snapshotRouter.stack.filter((l) => l.route).map((l) => `${Object.keys(l.route.methods)[0].toUpperCase()} ${l.route.path}`).sort().join(' | ') === 'GET /latest | POST /', snapshotRouter.stack.filter((l) => l.route).map((l) => `${Object.keys(l.route.methods)[0].toUpperCase()} ${l.route.path}`).join(' | '))

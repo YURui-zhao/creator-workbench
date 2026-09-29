@@ -105,7 +105,7 @@ export function buildPricingRows(pricing) {
     label: '星图刊例价',
     value:
       pricing.xingtu_price === null || pricing.xingtu_price === undefined
-        ? '待确认 / 未识别'
+        ? '暂无'
         : formatPrice(pricing.xingtu_price)
   })
   if (pricing.pricing_status !== 'quote_missing') {

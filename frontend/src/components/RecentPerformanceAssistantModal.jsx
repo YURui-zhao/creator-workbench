@@ -8,6 +8,7 @@ import {
   Empty,
   Input,
   Modal,
+  Radio,
   Select,
   Space,
   Spin,
@@ -56,8 +57,10 @@ import {
   validateTotalBytes
 } from '../utils/screenshotImage.js'
 import {
+  buildDraftFromManualPlays,
   buildConfirmedDraft,
   buildDraftFromExtraction,
+  splitManualPlayLines,
   summarizeDraft,
   togglePlayExcluded,
   updatePlayRawText,
@@ -101,6 +104,10 @@ export default function RecentPerformanceAssistantModal({
   const [identityFlash, setIdentityFlash] = useState(false)
   const [warningsExpanded, setWarningsExpanded] = useState(false)
   const [priceManuallyEdited, setPriceManuallyEdited] = useState(false)
+  // Alpha.2 A3：入口模式（截图 AI 识别 / 手工录入），手工模式不依赖 AI
+  const [entryMode, setEntryMode] = useState('screenshot')
+  const [manualText, setManualText] = useState('')
+  const [manualError, setManualError] = useState('')
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
   const [savedSnapshot, setSavedSnapshot] = useState(null)
@@ -160,6 +167,8 @@ export default function RecentPerformanceAssistantModal({
     setIdentityFlash(false)
     setWarningsExpanded(false)
     setPriceManuallyEdited(false)
+    setManualText('')
+    setManualError('')
     setSaveError('')
     setSavedSnapshot(null)
     aiInFlightRef.current = false
@@ -329,6 +338,28 @@ export default function RecentPerformanceAssistantModal({
     message.success('已确认识别结果（P2A 暂不写入数据库）')
   }
 
+  /**
+   * Alpha.2 A3：手工录入播放量（不调用 AI、不访问网络）
+   * 复用同一套确定性解析与同一份草稿结构，最终与截图路径汇入同一条保存链。
+   */
+  const handleParseManualPlays = () => {
+    const lines = splitManualPlayLines(manualText)
+    if (lines.length === 0) {
+      setManualError('请输入至少一条播放量，例如「5.2万」或「12000」')
+      return
+    }
+    const nextDraft = buildDraftFromManualPlays(lines)
+    setManualError('')
+    setDraft(nextDraft)
+    setConfirmed(null)
+    setIdentityConfirmed(false)
+    setIdentityFlash(false)
+    setWarningsExpanded(false)
+    setPriceManuallyEdited(false)
+    setSavedSnapshot(null)
+    setSaveError('')
+  }
+
   // P2B：显式保存（不静默写库）；失败保留 confirmed draft 与全部人工修改
   const handleSave = async () => {
     if (saving) return
@@ -390,12 +421,10 @@ export default function RecentPerformanceAssistantModal({
         manuallyEdited: priceManuallyEdited
       })
     : PRICE_FIELD_STATUS.missing
-  const priceNeedsConfirmation =
-    priceFieldStatus === PRICE_FIELD_STATUS.missing || priceFieldStatus === PRICE_FIELD_STATUS.invalid
-  // 只统计真正需要用户处理的事项（星图价 / 无法解析的播放量 / 身份不一致）
+  // 只统计真正需要用户处理的事项（无法解析的播放量 / 身份不一致）
+  // A3：星图刊例价是可选事实，缺失不再计入「需要确认 X 项」
   const requiredConfirmations = draft
     ? countRequiredConfirmations({
-        priceNeedsConfirmation,
         unresolvedCount: summary?.unresolved_count ?? 0,
         identityStatus: identityState.status
       })
@@ -441,11 +470,15 @@ export default function RecentPerformanceAssistantModal({
     >
       <Space direction="vertical" size="middle" style={{ display: 'flex' }}>
         <Typography.Text type="secondary">
-          粘贴 / 上传达人主页或星图截图，AI 只负责识别截图上的可见信息（昵称、星图刊例价、作品播放量），
-          数值换算与判断由系统确定性地完成，识别结果必须经你确认；在你点击「保存近期表现」之前不会写入数据库。
+          可以上传截图让 AI 识别，也可以直接手工录入播放量（无需 AI）。
+          AI 只负责识别截图上的可见信息（昵称、星图刊例价、作品播放量），数值换算与判断由系统确定性地完成，
+          结果必须经你确认；在你点击「保存近期表现」之前不会写入数据库。
         </Typography.Text>
 
-        <Alert type="info" showIcon message="发送范围" description={SEND_NOTICE} />
+        {/* 发送范围只与截图识别有关；手工录入不会向 AI 发送任何内容 */}
+        {entryMode === 'screenshot' && (
+          <Alert type="info" showIcon message="发送范围" description={SEND_NOTICE} />
+        )}
 
         {/* Alpha.2 A2：canonical creator 来自雷达（静态展示，不再让用户重选）；仅全局入口需要先选择达人 */}
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -487,6 +520,22 @@ export default function RecentPerformanceAssistantModal({
         </div>
 
         {/* 上传区：点击 / 拖拽 / 粘贴 */}
+        {/* Alpha.2 A3：AI 是加速器而不是入口门槛 —— 两个入口主动可见，不必先失败一次 AI */}
+        <Space size={12} wrap>
+          <Typography.Text strong>近期作品数据</Typography.Text>
+          <Radio.Group
+            value={entryMode}
+            onChange={(event) => setEntryMode(event.target.value)}
+            optionType="button"
+            buttonStyle="solid"
+          >
+            <Radio.Button value="screenshot">上传截图识别</Radio.Button>
+            <Radio.Button value="manual">手工录入</Radio.Button>
+          </Radio.Group>
+        </Space>
+
+        {entryMode === 'screenshot' && (
+          <>
         <div
           onDragOver={(event) => {
             event.preventDefault()
@@ -632,6 +681,39 @@ export default function RecentPerformanceAssistantModal({
         </Space>
 
         {aiError && <Alert type="error" showIcon message={aiError} description="已保留当前截图与人工修改内容，可直接重试。" />}
+          </>
+        )}
+
+        {/* Alpha.2 A3：手工录入（完全不依赖 AI / 截图 / Key） */}
+        {entryMode === 'manual' && (
+          <Space direction="vertical" size={8} style={{ display: 'flex' }}>
+            <Typography.Text type="secondary">
+              请按「最近 → 更早」的顺序输入每条作品的播放量，一行一个（也支持中文 / 英文逗号分隔）。
+              数值换算由系统确定性地完成，不会调用 AI。
+            </Typography.Text>
+            <Input.TextArea
+              value={manualText}
+              rows={6}
+              placeholder={'例如：\n5.2万\n4.8万\n39000\n8.3w'}
+              onChange={(event) => {
+                setManualText(event.target.value)
+                setManualError('')
+              }}
+            />
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              建议录入最近约 15 条作品；至少 5 条才能计算中位播放与典型区间，8 条以上才能计算趋势。不强制凑满 15 条。
+            </Typography.Text>
+            <Space size={12} wrap>
+              <Button type="primary" onClick={handleParseManualPlays}>
+                解析并进入确认
+              </Button>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                已输入 {splitManualPlayLines(manualText).length} 条
+              </Typography.Text>
+            </Space>
+            {manualError && <Alert type="error" showIcon message={manualError} />}
+          </Space>
+        )}
 
         {draft && (
           <>
@@ -650,7 +732,8 @@ export default function RecentPerformanceAssistantModal({
                 ✓ 达人身份已核对
               </Typography.Text>
             )}
-            {identityUnknown && (
+            {/* A3：手工录入没有 AI 昵称，不属于「截图是否传错」，因此不显示该提示 */}
+            {identityUnknown && entryMode === 'screenshot' && (
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                 未识别到达人昵称，请自行确认截图
               </Typography.Text>
@@ -681,7 +764,6 @@ export default function RecentPerformanceAssistantModal({
                 description={
                   <Space direction="vertical" size={4} style={{ display: 'flex' }}>
                     <Typography.Text>
-                      {priceNeedsConfirmation ? '星图刊例价需补充/检查；' : ''}
                       {(summary?.unresolved_count ?? 0) > 0
                         ? `${summary.unresolved_count} 条播放量无法确定性解析；`
                         : ''}
@@ -741,10 +823,10 @@ export default function RecentPerformanceAssistantModal({
 
             {/* Alpha.2 A2：星图刊例价只保留一个字段 + 一个状态文案 */}
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-              <Typography.Text type="secondary">星图刊例价</Typography.Text>
+              <Typography.Text type="secondary">星图刊例价（选填）</Typography.Text>
               <Input
                 value={draft.xingtu_price_raw}
-                placeholder="请输入刊例价，例如 ¥3,000"
+                placeholder="可不填，例如 ¥3,000"
                 style={{ width: 200 }}
                 onChange={(event) => {
                   setPriceManuallyEdited(true)
@@ -918,7 +1000,7 @@ export default function RecentPerformanceAssistantModal({
                         <Typography.Text>样本不足：本次不展示中位播放与典型区间，建议补充更多近期作品截图。</Typography.Text>
                       )}
                       <Typography.Text>
-                        星图价：{savedSnapshot.xingtu_price === null || savedSnapshot.xingtu_price === undefined ? '待确认 / 未识别' : `¥${formatInteger(savedSnapshot.xingtu_price)}`}
+                        星图价：{savedSnapshot.xingtu_price === null || savedSnapshot.xingtu_price === undefined ? '暂无（选填，未提供）' : `¥${formatInteger(savedSnapshot.xingtu_price)}`}
                       </Typography.Text>
                       <Typography.Text type="secondary">统计口径：{savedSnapshot.stats_version}</Typography.Text>
                       <Divider style={{ margin: '6px 0' }} />

@@ -164,6 +164,36 @@ db.exec(`
     ON creator_decision_outcomes(decision_id);
   CREATE INDEX IF NOT EXISTS idx_decision_outcomes_record
     ON creator_decision_outcomes(record_id);
+
+  -- V3-alpha.2 A4：谈判结果沉淀（append-only，冻结「当时」的谈判上下文）
+  -- 说明：
+  --   · negotiated_price（最终谈成价）与 xingtu_price（星图刊例价）、current_quote（达人报价）、
+  --     actual_cost（真实投放花费，来自 creator_records / Outcome）永久分开，互不同步
+  --   · 创建时把当时看到的星图价 / 当前报价 / CPM30 目标价 / 参考区间各冻结一份快照，
+  --     之后 snapshot / record 更新都不会改写旧案例
+  --   · 一个 decision 最多一个谈判案例（UNIQUE(decision_id)）；decision_id 允许为空以便未来扩展
+  CREATE TABLE IF NOT EXISTS creator_negotiation_cases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    creator TEXT NOT NULL,
+    decision_id INTEGER,
+    snapshot_id INTEGER,
+    xingtu_price_snapshot REAL,
+    current_quote_snapshot REAL,
+    negotiated_price REAL NOT NULL,
+    negotiated_at TEXT NOT NULL,
+    reason_tags_json TEXT NOT NULL DEFAULT '[]',
+    reason_note TEXT,
+    strategy_note TEXT,
+    target_cpm REAL,
+    target_price_snapshot REAL,
+    reference_low_snapshot REAL,
+    reference_high_snapshot REAL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(decision_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_negotiation_cases_creator_created
+    ON creator_negotiation_cases(creator, created_at);
 `)
 
 // V3-alpha.2 Sprint A1：为既有数据库安全补充 observed_at（数据观察日期）

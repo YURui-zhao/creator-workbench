@@ -5,6 +5,7 @@ import { parsePriceText } from '../utils/screenshotValues.js'
 import { computeCreatorPricing } from '../utils/creatorPricing.js'
 import { assessCurrentQuote } from '../utils/currentQuoteAssessment.js'
 import { loadOutcomeSummaries } from './creatorDecisionOutcomes.js'
+import { loadNegotiationCaseSummaries } from './creatorNegotiationCases.js'
 import { PRICING_VERSION, TARGET_CPM } from '../utils/creatorBusinessRules.js'
 
 const router = Router()
@@ -285,8 +286,9 @@ export function validateDecisionPayload(body) {
  * 数据库行 -> 对外 decision（evidence 为创建时固化的 JSON）
  * @param {Object} row
  * @param {Object|null} [outcome] P5 关联的真实投放结果（live 事实；无关联为 null）
+ * @param {Object|null} [negotiationCase] A4 谈价结果（append-only 事实；无记录为 null）
  */
-export function toPublicDecision(row, outcome = null) {
+export function toPublicDecision(row, outcome = null, negotiationCase = null) {
   if (!row) return null
   const parseJson = (text) => {
     if (!text) return null
@@ -315,7 +317,9 @@ export function toPublicDecision(row, outcome = null) {
     system_context_version: row.system_context_version,
     created_at: row.created_at,
     // P5：真实投放结果（live，不固化）；evidence 仍为创建时的 frozen 快照
-    outcome: outcome ?? null
+    outcome: outcome ?? null,
+    // A4：谈价结果（append-only，创建时冻结当时的谈判上下文）
+    negotiation_case: negotiationCase ?? null
   }
 }
 
@@ -456,9 +460,13 @@ router.get('/', (req, res) => {
     )
     .all(creator)
   const outcomeMap = loadOutcomeSummaries(rows)
+  // A4：同一次请求附带谈价结果（单条 SQL，避免前端 N+1）
+  const negotiationMap = loadNegotiationCaseSummaries(rows)
   ok(res, {
     creator,
-    decisions: rows.map((row) => toPublicDecision(row, outcomeMap.get(row.id) || null))
+    decisions: rows.map((row) =>
+      toPublicDecision(row, outcomeMap.get(row.id) || null, negotiationMap.get(row.id) || null)
+    )
   })
 })
 

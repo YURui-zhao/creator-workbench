@@ -27,6 +27,11 @@ import { getErrorMessage } from '../utils/request'
 import { formatCpm, formatInteger, formatMoney, formatPlays } from '../utils/format'
 import { formatPrice, formatZhe } from '../utils/pricingDisplay.js'
 import OutcomeLinkModal from './OutcomeLinkModal.jsx'
+import NegotiationCaseModal from './NegotiationCaseModal.jsx'
+import {
+  buildNegotiationPriceRows,
+  NEGOTIATION_REASON_TAG_LABELS
+} from '../utils/negotiationCaseDisplay.js'
 import {
   SIMULATOR_DEFAULT_RATE,
   SIMULATOR_MAX_RATE,
@@ -103,6 +108,8 @@ export default function CreatorDecisionDrawer({
   const [historyLoading, setHistoryLoading] = useState(false)
   // P5：关联投放结果
   const [linkModalDecision, setLinkModalDecision] = useState(null)
+  // A4：谈价结果记录弹窗
+  const [negotiationModalDecision, setNegotiationModalDecision] = useState(null)
   const [unlinkingId, setUnlinkingId] = useState(null)
   const navigate = useNavigate()
 
@@ -542,6 +549,62 @@ export default function CreatorDecisionDrawer({
     )
   }
 
+  // A4：只有「已拿到报价 + 继续议价 / 复投 / 小额测试」的决策才记录谈价结果
+  const isNegotiationEligible = (item) =>
+    item?.decision_stage === 'post_quote' && ['negotiate', 'repurchase', 'small_test'].includes(item?.human_decision)
+
+  /** 谈价结果区块：只展示事实（谈成价 / 日期 / 相对星图 / 相对报价 / 原因 / 备注），不评价谈判质量 */
+  const renderNegotiationSection = (item) => {
+    if (!isNegotiationEligible(item)) return null
+    const negotiationCase = item.negotiation_case
+    if (!negotiationCase) {
+      return (
+        <div style={{ marginTop: 8 }}>
+          <Space size={8} wrap>
+            <Typography.Text type="secondary">谈价结果</Typography.Text>
+            <Typography.Text type="secondary">尚未记录</Typography.Text>
+            <Button size="small" onClick={() => setNegotiationModalDecision(item)}>
+              记录谈价结果
+            </Button>
+          </Space>
+        </div>
+      )
+    }
+    const rows = buildNegotiationPriceRows(negotiationCase)
+    const tags = (negotiationCase.reason_tags || []).map(
+      (tag) => NEGOTIATION_REASON_TAG_LABELS[tag] || tag
+    )
+    return (
+      <div style={{ marginTop: 8, borderTop: '1px dashed #f0f0f0', paddingTop: 8 }}>
+        <Typography.Text strong style={{ fontSize: 12 }}>谈价结果</Typography.Text>
+        <Space direction="vertical" size={2} style={{ display: 'flex', marginTop: 4 }}>
+          {rows.map((row) => (
+            <div key={row.label} style={factRowStyle}>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>{row.label}</Typography.Text>
+              <Typography.Text style={{ fontSize: 12 }}>{row.value}</Typography.Text>
+            </div>
+          ))}
+          {tags.length > 0 && (
+            <div style={factRowStyle}>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>原因</Typography.Text>
+              <Typography.Text style={{ fontSize: 12 }}>{tags.join(' · ')}</Typography.Text>
+            </div>
+          )}
+          {negotiationCase.reason_note && (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              备注：{negotiationCase.reason_note}
+            </Typography.Text>
+          )}
+          {negotiationCase.strategy_note && (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              谈价依据：{negotiationCase.strategy_note}
+            </Typography.Text>
+          )}
+        </Space>
+      </div>
+    )
+  }
+
   const renderHistory = () => (
     <Spin spinning={historyLoading}>
       {history.length === 0 ? (
@@ -570,6 +633,7 @@ export default function CreatorDecisionDrawer({
                 </div>
               )}
               {renderOutcomeSection(item)}
+              {renderNegotiationSection(item)}
             </div>
           ))}
         </Space>
@@ -706,6 +770,16 @@ export default function CreatorDecisionDrawer({
         decision={linkModalDecision}
         onClose={() => setLinkModalDecision(null)}
         onLinked={async () => {
+          await loadHistory()
+          onSaved?.(null)
+        }}
+      />
+
+      <NegotiationCaseModal
+        open={Boolean(negotiationModalDecision)}
+        decision={negotiationModalDecision}
+        onClose={() => setNegotiationModalDecision(null)}
+        onSaved={async () => {
           await loadHistory()
           onSaved?.(null)
         }}

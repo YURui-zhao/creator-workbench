@@ -115,14 +115,18 @@ async function main() {
     const base = compute({ ...standard, xingtu_price: 3000 })
     check('CPM30目标价 = 1560', base.target_price === 1560, String(base.target_price))
     check('参考区间 = 1290 ~ 1830', base.reference_low === 1290 && base.reference_high === 1830, `${base.reference_low}/${base.reference_high}`)
-    check('常规7折 = 2100', base.regular_70_price === 2100, String(base.regular_70_price))
-    check('最低2折 = 600', base.min_20_price === 600, String(base.min_20_price))
+    check('可谈折扣区间（2～7折）对应价格上限 = 2100', base.negotiation_max_price === 2100, String(base.negotiation_max_price))
+    check('可谈折扣区间（2～7折）对应价格下限 = 600', base.negotiation_min_price === 600, String(base.negotiation_min_price))
     check('进入区间折扣 = 6.1折', base.entry_discount_zhe === 6.1, String(base.entry_discount_zhe))
     check('目标成交折扣 = 5.2折', base.target_discount_zhe === 5.2, String(base.target_discount_zhe))
-    check('pricing_status = needs_deeper_negotiation', base.pricing_status === 'needs_deeper_negotiation', base.pricing_status)
+    check('pricing_status = deeper_negotiation_within_range', base.pricing_status === 'deeper_negotiation_within_range', base.pricing_status)
+    check('状态文案以 2～7折谈价区间表述', /2～7折谈价区间内继续向下议价/.test(base.pricing_status_label), base.pricing_status_label)
     check('pricing_version 正确', base.pricing_version === 'creator-pricing-v1', base.pricing_version)
     check('target_cpm 来自共享业务规则 = 30', base.target_cpm === 30 && base.target_cpm === rules.TARGET_CPM)
-    check('7折 / 2折常量来自共享规则', rules.REGULAR_XINGTU_DISCOUNT_RATE === 0.7 && rules.MIN_REFERENCE_DISCOUNT_RATE === 0.2)
+    check(
+      '谈价区间常量来自共享规则（NEGOTIATION_DISCOUNT_MIN/MAX = 0.2/0.7）',
+      rules.NEGOTIATION_DISCOUNT_MIN === 0.2 && rules.NEGOTIATION_DISCOUNT_MAX === 0.7
+    )
 
     console.log('\n===== 2. pricing_status 八种状态 =====')
     const atOrBelow = compute({ ...standard, xingtu_price: 1560 })
@@ -138,21 +142,22 @@ async function main() {
       compute({ ...standard, xingtu_price: 1800 }).pricing_status === 'within_reference_range'
     )
     check(
-      '7折可进入区间 → regular_discount_enters_range',
-      compute({ stats_status: 'ok', median_play: 52000, p25_play: 43000, p75_play: 70000, xingtu_price: 3000 }).pricing_status === 'regular_discount_enters_range'
+      '7折可进入区间 → negotiation_max_enters_range',
+      compute({ stats_status: 'ok', median_play: 52000, p25_play: 43000, p75_play: 70000, xingtu_price: 3000 }).pricing_status === 'negotiation_max_enters_range'
     )
     check(
-      '7折仍偏高但2折可进入 → needs_deeper_negotiation',
-      compute({ stats_status: 'ok', median_play: 52000, p25_play: 43000, p75_play: 20000, xingtu_price: 3000 }).pricing_status === 'needs_deeper_negotiation'
+      '7折仍偏高但2折可进入 → deeper_negotiation_within_range',
+      compute({ stats_status: 'ok', median_play: 52000, p25_play: 43000, p75_play: 20000, xingtu_price: 3000 }).pricing_status === 'deeper_negotiation_within_range'
     )
     const evenMin = compute({ stats_status: 'ok', median_play: 52000, p25_play: 43000, p75_play: 20000, xingtu_price: 4000 })
-    check('连2折都偏高 → even_min_reference_high', evenMin.pricing_status === 'even_min_reference_high', evenMin.pricing_status)
-    check('even_min 文案不出现「建议放弃/不值得」', !/放弃|不值得|建议复投/.test(evenMin.pricing_status_label), evenMin.pricing_status_label)
+    check('连2折都偏高 → below_negotiation_min_needed', evenMin.pricing_status === 'below_negotiation_min_needed', evenMin.pricing_status)
+    check('该状态文案明确「即使谈至2折仍高于区间上限」', /即使谈至2折，仍高于/.test(evenMin.pricing_status_label), evenMin.pricing_status_label)
+    check('状态文案不出现「建议放弃/不值得/建议复投」', !/放弃|不值得|建议复投/.test(evenMin.pricing_status_label), evenMin.pricing_status_label)
 
     const missing = compute({ ...standard, xingtu_price: null })
     check('xingtu = null → quote_missing', missing.pricing_status === 'quote_missing')
     check('quote_missing 仍返回目标价与区间', missing.target_price === 1560 && missing.reference_low === 1290 && missing.reference_high === 1830)
-    check('quote_missing 折扣全部为 null', missing.entry_discount_rate === null && missing.target_discount_rate === null && missing.entry_discount_zhe === null && missing.target_discount_zhe === null && missing.regular_70_price === null && missing.min_20_price === null)
+    check('quote_missing 折扣与区间价全部为 null', missing.entry_discount_rate === null && missing.target_discount_rate === null && missing.entry_discount_zhe === null && missing.target_discount_zhe === null && missing.negotiation_max_price === null && missing.negotiation_min_price === null)
     const zero = compute({ ...standard, xingtu_price: 0 })
     check('xingtu = 0 → quote_zero（不除零）', zero.pricing_status === 'quote_zero' && zero.entry_discount_rate === null && zero.target_discount_rate === null)
     check('quote_zero 标记为已低于目标价', zero.quote_at_or_below_target === true)
@@ -171,15 +176,15 @@ async function main() {
     // 7折恰好等于 reference_high（high=2100 ← p75=70000；quote=3000）
     const sevenBoundary = compute({ stats_status: 'ok', median_play: 52000, p25_play: 43000, p75_play: 70000, xingtu_price: 3000 })
     check(
-      'xingtu*0.7 恰好等于 reference_high → 稳定进入 regular_discount_enters_range',
-      sevenBoundary.pricing_status === 'regular_discount_enters_range' && sevenBoundary.regular_70_price === sevenBoundary.reference_high,
+      'xingtu*0.7 恰好等于 reference_high → 稳定进入 negotiation_max_enters_range',
+      sevenBoundary.pricing_status === 'negotiation_max_enters_range' && sevenBoundary.negotiation_max_price === sevenBoundary.reference_high,
       `${sevenBoundary.pricing_status} (7折=${sevenBoundary.regular_70_price}, high=${sevenBoundary.reference_high})`
     )
     // 2折恰好等于 reference_high（high=600 ← p75=20000；quote=3000）
     const twoBoundary = compute({ stats_status: 'ok', median_play: 52000, p25_play: 43000, p75_play: 20000, xingtu_price: 3000 })
     check(
-      ' xingtu*0.2 恰好等于 reference_high → 不得判为 even_min_reference_high',
-      twoBoundary.pricing_status === 'needs_deeper_negotiation' && twoBoundary.min_20_price === twoBoundary.reference_high,
+      'xingtu*0.2 恰好等于 reference_high → 不得判为 below_negotiation_min_needed',
+      twoBoundary.pricing_status === 'deeper_negotiation_within_range' && twoBoundary.negotiation_min_price === twoBoundary.reference_high,
       `${twoBoundary.pricing_status} (2折=${twoBoundary.min_20_price}, high=${twoBoundary.reference_high})`
     )
     check('xingtu 恰好等于 target → 稳定 at_or_below_target', compute({ ...standard, xingtu_price: 1560 }).pricing_status === 'at_or_below_target')
@@ -193,9 +198,9 @@ async function main() {
     console.log('\n===== 4. 2折不是硬下限（不 clamp）=====')
     const deepDiscount = compute({ stats_status: 'ok', median_play: 50000, p25_play: 40000, p75_play: 60000, xingtu_price: 10000 })
     check('目标成交 1.5折：不被 clamp 到 2折', deepDiscount.target_discount_zhe === 1.5 && deepDiscount.target_price === 1500, `${deepDiscount.target_discount_zhe}/${deepDiscount.target_price}`)
-    check('低于2折参考边界时标记 true', deepDiscount.target_discount_below_min_reference === true)
-    check('UI 文案如实提示「低于当前2折参考边界」', display.formatTargetDiscount(deepDiscount).includes('低于当前2折参考边界'), display.formatTargetDiscount(deepDiscount))
-    check('reference_high 也低于2折价时 → even_min_reference_high', deepDiscount.pricing_status === 'even_min_reference_high', deepDiscount.pricing_status)
+    check('低于2折谈价区间下限时标记 true', deepDiscount.target_discount_below_negotiation_min === true)
+    check('UI 文案如实提示「低于当前2折谈价区间下限」', display.formatTargetDiscount(deepDiscount).includes('低于当前2折谈价区间下限'), display.formatTargetDiscount(deepDiscount))
+    check('reference_high 也低于2折价时 → below_negotiation_min_needed', deepDiscount.pricing_status === 'below_negotiation_min_needed', deepDiscount.pricing_status)
 
     console.log('\n===== 5. 展示层格式（前端只格式化，不判断）=====')
     check('金额整数不带小数：¥1,560', display.formatPrice(1560) === '¥1,560', display.formatPrice(1560))

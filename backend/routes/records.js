@@ -10,6 +10,7 @@ import {
   parseTimeCycleToWeekCode
 } from '../utils/dateCycle.js'
 import { buildXlsx } from '../utils/xlsx.js'
+import { loadLatestDecisionSummaries } from './creatorDecisions.js'
 import { loadLatestSnapshotSummaries } from './recentSnapshots.js'
 import { TARGET_CPM } from '../utils/creatorBusinessRules.js'
 
@@ -1802,10 +1803,15 @@ router.get('/repurchase-radar', (req, res) => {
   const snapshotMap = loadLatestSnapshotSummaries(
     radar.groups.flatMap((group) => group.creators.map((creator) => creator.creator))
   )
+  // P4：同样以单条 SQL 批量带上「最近一次决策」轻量 summary（只读展示，不参与 P1 规则）
+  const decisionMap = loadLatestDecisionSummaries(
+    radar.groups.flatMap((group) => group.creators.map((creator) => creator.creator))
+  )
   for (const group of radar.groups) {
     group.creators = group.creators.map((creator) => ({
       ...creator,
-      recent_snapshot: snapshotMap.get(creator.creator) || null
+      recent_snapshot: snapshotMap.get(creator.creator) || null,
+      recent_decision: decisionMap.get(creator.creator) || null
     }))
   }
 

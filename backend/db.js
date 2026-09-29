@@ -112,6 +112,34 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_recent_snapshots_creator_created
     ON creator_recent_snapshots(creator, created_at);
+
+  -- V3-alpha P4：决策记录（append-only，固化「当时看到了什么」）
+  -- 说明：
+  --   · 证据（historical / recent / pricing）、target_cpm、pricing_version 在创建时固化，
+  --     未来数据变化不得回写或重算旧记录
+  --   · 只记录人的决定；不保存截图 / base64 / API Key / provider 原始响应 / AI prompt
+  --   · current_quote（实际商务报价）与 snapshot.xingtu_price（星图刊例价）永久分开
+  CREATE TABLE IF NOT EXISTS creator_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    creator TEXT NOT NULL,
+    decision_stage TEXT NOT NULL,
+    snapshot_id INTEGER,
+    current_quote_raw TEXT,
+    current_quote REAL,
+    ip_judgement TEXT,
+    human_decision TEXT NOT NULL,
+    decision_note TEXT,
+    historical_evidence_json TEXT NOT NULL,
+    recent_evidence_json TEXT,
+    pricing_evidence_json TEXT,
+    target_cpm REAL NOT NULL,
+    pricing_version TEXT NOT NULL,
+    system_context_version TEXT NOT NULL DEFAULT 'decision-context-v1',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_creator_decisions_creator_created
+    ON creator_decisions(creator, created_at);
 `)
 
 // 首次启动写入示例项目（前端工作台展示用）

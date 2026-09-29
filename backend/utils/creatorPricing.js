@@ -18,9 +18,9 @@
  */
 
 import {
-  MIN_REFERENCE_DISCOUNT_RATE,
+  NEGOTIATION_DISCOUNT_MAX,
+  NEGOTIATION_DISCOUNT_MIN,
   PRICING_VERSION,
-  REGULAR_XINGTU_DISCOUNT_RATE,
   TARGET_CPM
 } from './creatorBusinessRules.js'
 
@@ -33,9 +33,10 @@ export const PRICING_STATUS = {
   quoteZero: 'quote_zero',
   atOrBelowTarget: 'at_or_below_target',
   withinReferenceRange: 'within_reference_range',
-  regularDiscountEntersRange: 'regular_discount_enters_range',
-  needsDeeperNegotiation: 'needs_deeper_negotiation',
-  evenMinReferenceHigh: 'even_min_reference_high'
+  // 以下三个状态以「2～7折可谈区间」表述，不再暗示「7折是固定策略」
+  negotiationMaxEntersRange: 'negotiation_max_enters_range',
+  deeperNegotiationWithinRange: 'deeper_negotiation_within_range',
+  belowNegotiationMinNeeded: 'below_negotiation_min_needed'
 }
 
 export const PRICING_STATUS_LABELS = {
@@ -44,9 +45,9 @@ export const PRICING_STATUS_LABELS = {
   [PRICING_STATUS.quoteZero]: '星图价为0，当前价格低于CPM30目标价',
   [PRICING_STATUS.atOrBelowTarget]: '当前刊例价已不高于 CPM30目标价',
   [PRICING_STATUS.withinReferenceRange]: '当前刊例价高于目标价，但仍处于 CPM30参考区间内',
-  [PRICING_STATUS.regularDiscountEntersRange]: '按常规7折后可进入 CPM30参考区间',
-  [PRICING_STATUS.needsDeeperNegotiation]: '常规7折仍高于参考区间，需进一步议价',
-  [PRICING_STATUS.evenMinReferenceHigh]: '即使按2折参考，仍高于当前 CPM30参考区间上限'
+  [PRICING_STATUS.negotiationMaxEntersRange]: '在当前2～7折谈价区间内，7折已可进入 CPM30参考区间。',
+  [PRICING_STATUS.deeperNegotiationWithinRange]: '需要在2～7折谈价区间内继续向下议价，才能进入 CPM30参考区间。',
+  [PRICING_STATUS.belowNegotiationMinNeeded]: '即使谈至2折，仍高于 CPM30参考区间上限。'
 }
 
 const isFiniteNumber = (value) => typeof value === 'number' && Number.isFinite(value)
@@ -63,6 +64,9 @@ const isGt = (a, b) => a > b + COMPARE_EPSILON
  * 计算 CPM30 价格判断结果
  * @param {{stats_status?: string, median_play?: number|null, p25_play?: number|null,
  *          p75_play?: number|null, xingtu_price?: number|null}} input latest snapshot 的统计字段
+ *
+ * 注意：本函数**只以星图刊例价（xingtu_price）为折扣锚点**。
+ * P4 的实际报价（current_quote）是事实记录，不再跑完整 pricing，见 backend/utils/currentQuoteAssessment.js。
  */
 export function computeCreatorPricing(input = {}) {
   const statsStatus = input?.stats_status
@@ -78,8 +82,9 @@ export function computeCreatorPricing(input = {}) {
     reference_low: null,
     reference_high: null,
     xingtu_price: isFiniteNumber(xingtuPrice) ? xingtuPrice : null,
-    regular_70_price: null,
-    min_20_price: null,
+    // 可谈折扣区间（2～7折）对应的价格边界（锚定星图刊例价）
+    negotiation_max_price: null,
+    negotiation_min_price: null,
     entry_discount_rate: null,
     entry_discount_zhe: null,
     target_discount_rate: null,
@@ -87,7 +92,7 @@ export function computeCreatorPricing(input = {}) {
     pricing_status: PRICING_STATUS.insufficient,
     pricing_status_label: PRICING_STATUS_LABELS[PRICING_STATUS.insufficient],
     needs_negotiation: false,
-    target_discount_below_min_reference: false,
+    target_discount_below_negotiation_min: false,
     quote_at_or_below_target: false,
     quote_at_or_below_reference_high: false
   }
@@ -115,10 +120,10 @@ export function computeCreatorPricing(input = {}) {
   }
 
   const quote = xingtuPrice
-  const regularPrice = quote * REGULAR_XINGTU_DISCOUNT_RATE
-  const minPrice = quote * MIN_REFERENCE_DISCOUNT_RATE
-  result.regular_70_price = round2(regularPrice)
-  result.min_20_price = round2(minPrice)
+  const negotiationMaxPrice = quote * NEGOTIATION_DISCOUNT_MAX
+  const negotiationMinPrice = quote * NEGOTIATION_DISCOUNT_MIN
+  result.negotiation_max_price = round2(negotiationMaxPrice)
+  result.negotiation_min_price = round2(negotiationMinPrice)
 
   // ---------- 3. 星图价为 0：不除零 ----------
   if (quote === 0) {
@@ -139,7 +144,7 @@ export function computeCreatorPricing(input = {}) {
 
   result.quote_at_or_below_target = isLte(quote, rawTargetPrice)
   result.quote_at_or_below_reference_high = isLte(quote, rawReferenceHigh)
-  result.target_discount_below_min_reference = isGt(MIN_REFERENCE_DISCOUNT_RATE, rawTargetRate)
+  result.target_discount_below_negotiation_min = isGt(NEGOTIATION_DISCOUNT_MIN, rawTargetRate)
 
   // ---------- 4. 价格状态（只看价格，不判断达人是否值得合作） ----------
   let status
@@ -147,12 +152,12 @@ export function computeCreatorPricing(input = {}) {
     status = PRICING_STATUS.atOrBelowTarget
   } else if (isLte(quote, rawReferenceHigh)) {
     status = PRICING_STATUS.withinReferenceRange
-  } else if (isLte(regularPrice, rawReferenceHigh)) {
-    status = PRICING_STATUS.regularDiscountEntersRange
-  } else if (isLte(minPrice, rawReferenceHigh)) {
-    status = PRICING_STATUS.needsDeeperNegotiation
+  } else if (isLte(negotiationMaxPrice, rawReferenceHigh)) {
+    status = PRICING_STATUS.negotiationMaxEntersRange
+  } else if (isLte(negotiationMinPrice, rawReferenceHigh)) {
+    status = PRICING_STATUS.deeperNegotiationWithinRange
   } else {
-    status = PRICING_STATUS.evenMinReferenceHigh
+    status = PRICING_STATUS.belowNegotiationMinNeeded
   }
   result.pricing_status = status
   result.pricing_status_label = PRICING_STATUS_LABELS[status]

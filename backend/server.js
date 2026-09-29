@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import db from './db.js'
 import aiRouter from './routes/ai.js'
 import cyclesRouter from './routes/cycles.js'
+import creatorDecisionsRouter from './routes/creatorDecisions.js'
 import importBatchesRouter from './routes/importBatches.js'
 import recentSnapshotsRouter from './routes/recentSnapshots.js'
 import recordsRouter from './routes/records.js'
@@ -55,6 +56,7 @@ app.get('/api/health', (req, res) => {
 // 业务路由
 app.use('/api/ai', aiRouter)
 app.use('/api/cycles', cyclesRouter)
+app.use('/api/creator-decisions', creatorDecisionsRouter)
 app.use('/api/import', importBatchesRouter)
 app.use('/api/recent-snapshots', recentSnapshotsRouter)
 app.use('/api/records', recordsRouter)

@@ -21,6 +21,7 @@ import { getRepurchaseRadar } from '../../api/records'
 import { getErrorMessage } from '../../utils/request'
 import { formatCpm, formatInteger } from '../../utils/format'
 import RecentPerformanceAssistantModal from '../../components/RecentPerformanceAssistantModal'
+import CreatorDecisionDrawer from '../../components/CreatorDecisionDrawer'
 import {
   formatPlayRange,
   formatSnapshotStatusText,
@@ -54,7 +55,7 @@ const PLACEHOLDER = <Typography.Text type="secondary">-</Typography.Text>
  * @param {number} targetCpm 目标 CPM
  * @param {(creator: string) => void} onOpenAssistant 打开某位达人的「近期表现助手」
  */
-function buildRadarColumns(targetCpm, onOpenAssistant) {
+function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
   return [
     {
       title: '达人名称 / 近期表现',
@@ -118,6 +119,19 @@ function buildRadarColumns(targetCpm, onOpenAssistant) {
                       <Divider style={{ margin: '6px 0' }} />
                       <Typography.Text strong>价格状态</Typography.Text>
                       <Typography.Text>{snapshot.pricing?.pricing_status_label || '-'}</Typography.Text>
+                      <Divider style={{ margin: '6px 0' }} />
+                      <Typography.Text strong>最近决策</Typography.Text>
+                      {record.recent_decision ? (
+                        <Typography.Text type="secondary">
+                          {String(record.recent_decision.created_at || '').slice(5, 10)} ·{' '}
+                          {record.recent_decision.human_decision_label}
+                          {record.recent_decision.current_quote === null
+                            ? ''
+                            : ` · 实际报价 ${formatPrice(record.recent_decision.current_quote)}`}
+                        </Typography.Text>
+                      ) : (
+                        <Typography.Text type="secondary">暂无决策记录</Typography.Text>
+                      )}
                     </Space>
                   ) : (
                     <Typography.Text type="secondary">近期表现：尚未更新</Typography.Text>
@@ -126,6 +140,16 @@ function buildRadarColumns(targetCpm, onOpenAssistant) {
                     <Button size="small" type="primary" onClick={() => onOpenAssistant?.(value)}>
                       {snapshot ? '重新更新' : '更新近期表现'}
                     </Button>
+                  </div>
+                  <div style={{ marginTop: 6 }}>
+                    <Space size={8} wrap>
+                      <Button size="small" onClick={() => onOpenDecision?.(record, 'record')}>
+                        记录决策
+                      </Button>
+                      <Button size="small" type="link" onClick={() => onOpenDecision?.(record, 'history')}>
+                        查看决策记录
+                      </Button>
+                    </Space>
                   </div>
                 </div>
               }
@@ -231,6 +255,10 @@ export default function RepurchaseRadar() {
   // P2B：助手绑定的雷达达人（从行内入口进入时固定；header 入口为空需用户选择）
   const [assistantCreator, setAssistantCreator] = useState(null)
   const [confirmedDraft, setConfirmedDraft] = useState(null)
+  // P4：决策记录抽屉状态
+  const [decisionOpen, setDecisionOpen] = useState(false)
+  const [decisionCreatorItem, setDecisionCreatorItem] = useState(null)
+  const [decisionView, setDecisionView] = useState('record')
 
   const loadRadar = useCallback(async () => {
     setLoading(true)
@@ -258,8 +286,14 @@ export default function RepurchaseRadar() {
     setAssistantCreator(creatorName || null)
     setAssistantOpen(true)
   }
+  // P4：决策记录抽屉（「记录决策」/「查看决策记录」都从行内 Popover 进入）
+  const openDecision = (creatorItem, view = 'record') => {
+    setDecisionCreatorItem(creatorItem)
+    setDecisionView(view)
+    setDecisionOpen(true)
+  }
   // 目标 CPM 一律取后端返回值（唯一来源在 backend/utils/creatorBusinessRules.js），前端不持有字面量
-  const columns = buildRadarColumns(targetCpm, openAssistant)
+  const columns = buildRadarColumns(targetCpm, openAssistant, openDecision)
   const statisticCardStyle = { height: '100%', minHeight: 96 }
 
   return (
@@ -316,6 +350,17 @@ export default function RepurchaseRadar() {
         onConfirmed={(draft) => setConfirmedDraft(draft)}
         onSaved={() => {
           // 保存成功后单次重拉雷达，让对应达人立即显示最新快照（含 recent_snapshot summary）
+          loadRadar()
+        }}
+      />
+
+      <CreatorDecisionDrawer
+        open={decisionOpen}
+        creatorItem={decisionCreatorItem}
+        initialView={decisionView}
+        onClose={() => setDecisionOpen(false)}
+        onSaved={() => {
+          // 保存决策后单次重拉雷达，让 Popover 的「最近决策」立即更新（不改变 P1 任何字段）
           loadRadar()
         }}
       />

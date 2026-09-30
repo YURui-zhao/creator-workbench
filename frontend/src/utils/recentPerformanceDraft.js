@@ -9,6 +9,7 @@
  */
 
 import { parsePlayText, parsePriceText, normalizeRawText } from './screenshotValues.js'
+import { CONTENT_TYPES, normalizeContentType } from './contentType.js'
 
 export const MAX_DRAFT_PLAYS = 60
 
@@ -30,6 +31,8 @@ export function buildDraftFromExtraction(data = {}) {
       needs_review: parsed.needs_review,
       reason: parsed.reason,
       excluded: false,
+      // Alpha.3-04：AI 只按可见颜色标识给出商单 / 日常，无法确认即 unknown
+      content_type: normalizeContentType(item?.content_type),
       source_image_index: Number.isInteger(item?.source_image_index) ? item.source_image_index : null,
       position_index: Number.isInteger(item?.position_index) ? item.position_index : index + 1
     }
@@ -91,6 +94,8 @@ export function buildDraftFromManualPlays(rawLines = [], { priceRaw = '' } = {})
       needs_review: parsed.needs_review,
       reason: parsed.reason,
       excluded: false,
+      // 手工录入没有 AI 颜色判断：默认未识别，由用户在逐条列表里选择
+      content_type: CONTENT_TYPES.unknown,
       source_image_index: null,
       position_index: index + 1
     }
@@ -153,6 +158,21 @@ export function togglePlayExcluded(draft, playId) {
   }
 }
 
+/**
+ * Alpha.3-04：人工修改单条内容类型（商单 / 日常 / 未识别）
+ * 只改这一条的 content_type：不重新识别、不重新请求 AI、不影响播放量与其他条目。
+ * 非法值一律归一为 unknown。
+ */
+export function updatePlayContentType(draft, playId, contentType) {
+  const normalized = normalizeContentType(contentType)
+  return {
+    ...draft,
+    plays: draft.plays.map((play) =>
+      play.id === playId ? { ...play, content_type: normalized } : play
+    )
+  }
+}
+
 export function setPlayExcluded(draft, playId, excluded) {
   return {
     ...draft,
@@ -168,13 +188,22 @@ export function summarizeDraft(draft) {
   const unresolvedCount = plays.filter(
     (play) => !play.excluded && (play.normalized_play === null || play.normalized_play === undefined)
   ).length
+  // Alpha.3-04：内容类型计数（仅按有效样本计数，供保存前确认，与后端统计口径一致）
+  const validPlays = plays.filter(
+    (play) => !play.excluded && Number.isFinite(play.normalized_play) && play.normalized_play >= 0
+  )
+  const contentCounts = { sponsored: 0, organic: 0, unknown: 0 }
+  for (const play of validPlays) {
+    contentCounts[normalizeContentType(play.content_type)] += 1
+  }
   return {
     identified_count: plays.length,
     excluded_count: excludedCount,
     unresolved_count: unresolvedCount,
     valid_count: plays.length - excludedCount - unresolvedCount,
     needs_review_count: plays.filter((play) => play.needs_review && !play.excluded).length,
-    xingtu_price: draft?.xingtu_price ?? null
+    xingtu_price: draft?.xingtu_price ?? null,
+    content_type_counts: contentCounts
   }
 }
 

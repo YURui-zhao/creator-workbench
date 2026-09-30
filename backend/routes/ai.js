@@ -13,6 +13,7 @@ import {
   weekToDateRange
 } from '../utils/dateCycle.js'
 import { parsePlayText, parsePriceText } from '../utils/screenshotValues.js'
+import { normalizeContentType } from '../utils/recentPerformanceStats.js'
 
 const router = Router()
 
@@ -752,7 +753,7 @@ export function buildScreenshotSystemPrompt() {
 必须遵守：
 1. 只输出一个严格 JSON 对象，不要输出任何解释、Markdown 代码块或多余文字。
 2. 输出结构固定为：
-{"creator_name_raw": string|null, "xingtu_price_raw": string|null, "plays": [{"source_image_index": number, "position_index": number, "raw_text": string}], "warnings": [string]}
+{"creator_name_raw": string|null, "xingtu_price_raw": string|null, "plays": [{"source_image_index": number, "position_index": number, "raw_text": string, "content_type": "sponsored"|"organic"|"unknown"}], "warnings": [string]}
 3. raw_text 必须逐字保留截图上的原始写法（例如 "5.2万"、"1.3w"、"12K"），绝对不要换算成数字，也不要补充单位或格式化。
 4. 不允许猜测：看不清、被遮挡、无法确定的字段输出 null，并在 warnings 里说明。
 5. plays 按「图片顺序 + 图片内从上到下的视觉顺序」逐条输出：
@@ -760,11 +761,16 @@ export function buildScreenshotSystemPrompt() {
    - position_index 为该条目在该张截图内的 1-based 顺序；
    - 不要跨图片去重（多张截图可能包含同一作品，也要分别保留）；
    - 不要为了凑数量补足任何条目（识别到多少就输出多少）。
-6. 不要输出发布日期、播放时间、点赞数、粉丝数等本次没有要求的内容；不要推测任何日期。
-7. 如果整张截图都无法识别出有效信息，输出空的 plays 数组并在 warnings 中说明。
+6. 每条作品额外输出 content_type，只依据该条目在截图中的可见颜色标识判断：
+   - 带红色标识（红色标签 / 红框 / 红色角标）→ "sponsored"（商单）
+   - 带蓝色标识（蓝色标签 / 蓝框 / 蓝色角标）→ "organic"（日常）
+   - 颜色标识不存在、看不清、颜色不明确或无法可靠判断 → "unknown"
+   禁止根据标题文案、字数、语气等语义线索猜测是否为广告；禁止为了凑成二选一而强行分类；无法确认时必须返回 "unknown"。
+7. 不要输出发布日期、播放时间、点赞数、粉丝数等本次没有要求的内容；不要推测任何日期。
+8. 如果整张截图都无法识别出有效信息，输出空的 plays 数组并在 warnings 中说明。
 
 输出示例：
-{"creator_name_raw":"Gary","xingtu_price_raw":"¥3,000","plays":[{"source_image_index":1,"position_index":1,"raw_text":"5.2万"},{"source_image_index":1,"position_index":2,"raw_text":"12K"}],"warnings":[]}
+{"creator_name_raw":"Gary","xingtu_price_raw":"¥3,000","plays":[{"source_image_index":1,"position_index":1,"raw_text":"5.2万","content_type":"sponsored"},{"source_image_index":1,"position_index":2,"raw_text":"12K","content_type":"unknown"}],"warnings":[]}
 `
 }
 
@@ -812,7 +818,9 @@ export function parseCreatorScreenshotResult(content) {
       raw_text: normalized.raw_text,
       normalized_play: normalized.value,
       needs_review: normalized.needs_review,
-      reason: normalized.reason
+      reason: normalized.reason,
+      // Alpha.3-04：内容类型只按可见颜色标识识别；AI 未给出 / 给了非法值 / 颜色不明确 → unknown
+      content_type: normalizeContentType(item?.content_type)
     }
   })
 

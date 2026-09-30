@@ -22,6 +22,22 @@ export const MIN_VALID_FOR_STATS = 5
 export const MIN_VALID_FOR_TREND = 8
 export const MAX_PLAYS_PER_SNAPSHOT = 60
 
+// Alpha.3-04：内容类型（商单 / 日常 / 未识别）
+// 业务语义与实际投放价格无关：只用于把近期表现拆成两个流量池，不做加权、不做综合分。
+export const CONTENT_TYPES = {
+  sponsored: 'sponsored', // 商单 / 广告合作（截图中的红色标识）
+  organic: 'organic', // 日常 / 普通内容（截图中的蓝色标识）
+  unknown: 'unknown' // 未识别 / 无法确认（含全部旧快照）
+}
+
+/** 归一化内容类型：只接受 allowlist，其余（含 null / 非法值 / 旧数据）一律 unknown */
+export function normalizeContentType(value) {
+  const text = String(value ?? '').trim().toLowerCase()
+  if (text === CONTENT_TYPES.sponsored) return CONTENT_TYPES.sponsored
+  if (text === CONTENT_TYPES.organic) return CONTENT_TYPES.organic
+  return CONTENT_TYPES.unknown
+}
+
 export const TREND_LABELS = {
   up: '上升',
   stable: '基本稳定',
@@ -62,6 +78,53 @@ function roundPlay(value) {
 }
 
 /**
+ * 「典型表现」中位数（与现有整体统计完全同一逻辑，供整体与内容类型分组共用）：
+ *   · 样本 >= MIN_VALID_FOR_STATS(5)：去掉 1 个最高、1 个最低观测后取中位数（现有冻结口径）
+ *   · 样本不足：直接对全部有效样本取中位数（现有整体口径在 <5 时返回 null，由调用方决定是否展示）
+ * 只做分组统计复用，不引入第二套算法。
+ * @param {number[]} values
+ * @param {{ allowSmallSample?: boolean }} [options] allowSmallSample=true 时 <5 也返回中位数（内容类型分组用）
+ */
+export function typicalMedianOf(values = [], { allowSmallSample = false } = {}) {
+  const valid = (Array.isArray(values) ? values : []).filter(
+    (value) => Number.isFinite(value) && value >= 0
+  )
+  if (!valid.length) return null
+  if (valid.length >= MIN_VALID_FOR_STATS) {
+    const sorted = [...valid].sort((a, b) => a - b)
+    // 只移除一个最高观测与一个最低观测（即使存在重复值）
+    const analysis = sorted.slice(1, sorted.length - 1)
+    return roundPlay(quantile(analysis, 0.5))
+  }
+  if (!allowSmallSample) return null
+  return roundPlay(medianOf(valid))
+}
+
+/**
+ * Alpha.3-04：内容类型分组统计（只分组，不做加权 / 综合分）
+ * - 有效样本口径与整体一致：excluded=false、normalized_play 为有限数字且 >= 0
+ * - unknown 不计入 sponsored / organic；旧快照（无 content_type）全部落入 unknown
+ * - 中位数复用上方 typicalMedianOf（>=5 去极值，<5 直接中位数；0 是真实值）
+ * @param {Array<{normalized_play: number|null, excluded: boolean, content_type?: string}>} plays
+ */
+export function computeContentTypeBreakdown(plays = []) {
+  const groups = { sponsored: [], organic: [], unknown: [] }
+  for (const play of Array.isArray(plays) ? plays : []) {
+    if (!play || play.excluded === true) continue
+    const value = play.normalized_play
+    if (!Number.isFinite(value) || value < 0) continue
+    groups[normalizeContentType(play.content_type)].push(value)
+  }
+  return {
+    sponsored_count: groups.sponsored.length,
+    sponsored_median_play: typicalMedianOf(groups.sponsored, { allowSmallSample: true }),
+    organic_count: groups.organic.length,
+    organic_median_play: typicalMedianOf(groups.organic, { allowSmallSample: true }),
+    unknown_count: groups.unknown.length
+  }
+}
+
+/**
  * 由「有效且按人工确认顺序（从新到旧）排列」的播放量数组计算统计结果
  * @param {number[]} validPlaysInOrder
  * @returns {{
@@ -88,7 +151,8 @@ export function computeRecentPerformanceStats(validPlaysInOrder = []) {
   const stats = {
     valid_count: validCount,
     analysis_count: analysisCount,
-    median_play: canComputeTypical ? roundPlay(quantile(analysis, 0.5)) : null,
+    // 与内容类型分组统计共用同一「典型表现中位数」逻辑（>=5 去极值；行为与改动前完全一致）
+    median_play: typicalMedianOf(valid),
     p25_play: canComputeTypical ? roundPlay(quantile(analysis, 0.25)) : null,
     p75_play: canComputeTypical ? roundPlay(quantile(analysis, 0.75)) : null,
     recent_median_play: null,

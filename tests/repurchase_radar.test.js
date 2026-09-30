@@ -635,9 +635,9 @@ async function main() {
       )
   )
   check(
-    'Alpha.3 第一屏列结构：7 列（近期表现独立成列），列宽常量随之更新',
-    /const RADAR_TABLE_WIDTH = 816/.test(radarPageSource) &&
-      (radarPageSource.match(/title: '/g) || []).length === 7,
+    'Alpha.3 第一屏列结构：8 列（近期表现独立成列 + Alpha.3-04 商单/日常列），列宽常量随之更新',
+    /const RADAR_TABLE_WIDTH = 934/.test(radarPageSource) &&
+      (radarPageSource.match(/title: '/g) || []).length === 8,
     `columnTitles=${(radarPageSource.match(/title: '/g) || []).length}`
   )
 
@@ -1288,10 +1288,12 @@ async function main() {
       rowLib.formatLastActualCostLabel(null) === '上次合作价暂无'
   )
   check(
-    'D10 前端接线：最近合作单元格第三行 + Popover 详情层（不新增列）',
+    'D10 前端接线：最近合作单元格第三行 + Popover 详情层（不新增与价格无关的列）',
     /\{formatLastActualCostLabel\(record\.last_actual_cost\)\}/.test(radarPageA3) &&
       /最近一次实际合作价：\{formatLastActualCostValue\(record\.last_actual_cost\)\}/.test(radarPageA3) &&
-      (radarPageA3.match(/title: '/g) || []).length === 7
+      // Alpha.3-04 另外新增了「商单 / 日常」列，这里只校验价格没有新增独立列
+      !/title: '上次合作'/.test(radarPageA3) &&
+      !/title: '实际合作价'/.test(radarPageA3)
   )
   check(
     'D11 实际合作价只来自 creator_records.total_cost（前端展示层不引用 negotiated / 报价 / 目标价）',
@@ -1397,6 +1399,276 @@ async function main() {
       /record\.recent_snapshot/.test(radarPageCollapse) &&
       /record\.last_actual_cost/.test(radarPageCollapse) &&
       !/collapsedGroups\s*[^,)]*=\s*(?!=)/.test(radarPageCollapse)
+  )
+
+  console.log('\n===== 21. Alpha.3-04：商单 / 日常 展示语义 =====')
+  const contentTypeLib = await import(
+    pathToFileURL(path.join(REPO_ROOT, 'frontend/src/utils/contentType.js')).href
+  )
+  const statsLib = await import(
+    pathToFileURL(path.join(REPO_ROOT, 'backend/utils/recentPerformanceStats.js')).href
+  )
+  const radarPageCT = fs.readFileSync(
+    path.join(REPO_ROOT, 'frontend/src/pages/RepurchaseRadar/index.jsx'),
+    'utf8'
+  )
+
+  // ---- 21.1 展示语义（纯函数）----
+  const typedSnapshotLike = {
+    sponsored_count: 3,
+    sponsored_median_play: 38000,
+    organic_count: 10,
+    organic_median_play: 61000,
+    unknown_count: 0
+  }
+  const typedCell = contentTypeLib.buildContentTypeCell(typedSnapshotLike)
+  check(
+    'F1 >=3 条商单 → 「商单中位 3.8万 · 3条」+「日常中位 6.1万 · 10条」（商单优先，明确写中位）',
+    typedCell.hasTypeData === true &&
+      typedCell.sponsored.text === '3.8万' &&
+      typedCell.sponsored.count === 3 &&
+      typedCell.organic.text === '6.1万' &&
+      typedCell.organic.count === 10 &&
+      contentTypeLib.getSponsoredSampleTier(3) === 'sufficient' &&
+      JSON.stringify(contentTypeLib.buildContentPerformanceLines(typedSnapshotLike).lines) ===
+        JSON.stringify([
+          { text: '商单中位 3.8万 · 3条', primary: true },
+          { text: '日常中位 6.1万 · 10条', primary: false }
+        ])
+  )
+  check(
+    'F2 1–2 条商单 → 真实商单中位 + 「商单样本较少」（不包装成稳定水平）',
+    contentTypeLib.getSponsoredSampleTier(1) === 'insufficient' &&
+      contentTypeLib.getSponsoredSampleTier(2) === 'insufficient' &&
+      JSON.stringify(
+        contentTypeLib.buildContentPerformanceLines({
+          sponsored_count: 1,
+          sponsored_median_play: 42000,
+          organic_count: 8,
+          organic_median_play: 81000,
+          unknown_count: 0
+        }).lines
+      ) ===
+        JSON.stringify([
+          { text: '商单中位 4.2万 · 1条', primary: true },
+          { text: '商单样本较少', primary: false },
+          { text: '日常中位 8.1万 · 8条', primary: false }
+        ])
+  )
+  check(
+    'F3 0 条商单 + 有日常 → 「暂无商单数据」+「日常中位 8.1万 · 9条」',
+    contentTypeLib.getSponsoredSampleTier(0) === 'none' &&
+      JSON.stringify(
+        contentTypeLib.buildContentPerformanceLines({
+          sponsored_count: 0,
+          sponsored_median_play: null,
+          organic_count: 9,
+          organic_median_play: 81000,
+          unknown_count: 0
+        }).lines
+      ) ===
+        JSON.stringify([
+          { text: '暂无商单数据', primary: true },
+          { text: '日常中位 8.1万 · 9条', primary: false }
+        ])
+  )
+  check(
+    'F4 商单 / 日常都未确认但有播放数据 → 「X条内容待分类」+「商单 / 日常尚未确认」',
+    contentTypeLib.buildContentTypeCell({
+      sponsored_count: 0,
+      sponsored_median_play: null,
+      organic_count: 0,
+      organic_median_play: null,
+      unknown_count: 15
+    }).hasTypeData === false &&
+      JSON.stringify(
+        contentTypeLib.buildContentPerformanceLines({
+          sponsored_count: 0,
+          sponsored_median_play: null,
+          organic_count: 0,
+          organic_median_play: null,
+          unknown_count: 9
+        })
+      ) ===
+        JSON.stringify({
+          state: 'unknown-only',
+          unknownCount: 9,
+          lines: [
+            { text: '9条内容待分类', primary: true },
+            { text: '商单 / 日常尚未确认', primary: false }
+          ]
+        }) &&
+      // 不再出现「类型未识别」这种只说状态的文案
+      !/类型未识别/.test(
+        fs.readFileSync(path.join(REPO_ROOT, 'frontend/src/utils/contentType.js'), 'utf8')
+      )
+  )
+  check(
+    'F4b 无 snapshot → 占位；有快照但无可用样本 → 也占位（都不伪造文案）',
+    contentTypeLib.buildContentPerformanceLines(null).state === 'no-snapshot' &&
+      contentTypeLib.buildContentPerformanceLines({}).state === 'no-sample' &&
+      contentTypeLib.buildContentPerformanceLines({
+        sponsored_count: 0,
+        organic_count: 0,
+        unknown_count: 0
+      }).lines.length === 0 &&
+      /if \(!snapshot\) return PLACEHOLDER/.test(
+        fs.readFileSync(path.join(REPO_ROOT, 'frontend/src/pages/RepurchaseRadar/index.jsx'), 'utf8')
+      )
+  )
+  check(
+    'F5 Popover 内容构成：商单 / 日常 / 未识别 三行如实展示（未识别不给中位数）',
+    JSON.stringify(
+      contentTypeLib.buildContentBreakdownRows({
+        sponsored_count: 5,
+        sponsored_median_play: 38000,
+        organic_count: 10,
+        organic_median_play: 61000,
+        unknown_count: 2
+      })
+    ) ===
+      JSON.stringify([
+        { label: '商单', value: '5 条，中位 3.8万' },
+        { label: '日常', value: '10 条，中位 6.1万' },
+        { label: '未识别', value: '2 条' }
+      ])
+  )
+  check(
+    'F6 非法 / 缺失类型归一为 unknown（前后端同一 allowlist 口径）',
+    contentTypeLib.normalizeContentType('sponsored') === 'sponsored' &&
+      contentTypeLib.normalizeContentType('ORGANIC') === 'organic' &&
+      contentTypeLib.normalizeContentType('red') === 'unknown' &&
+      contentTypeLib.normalizeContentType('蓝色') === 'unknown' &&
+      contentTypeLib.normalizeContentType(null) === 'unknown' &&
+      statsLib.normalizeContentType('blue') === 'unknown' &&
+      statsLib.normalizeContentType(undefined) === 'unknown'
+  )
+  check(
+    'F7 不存在加权综合分 / 商单评分（工具只做分组计数与格式化）',
+    !/score|weight|blended|composite/i.test(
+      fs.readFileSync(path.join(REPO_ROOT, 'frontend/src/utils/contentType.js'), 'utf8')
+    ) &&
+      !/商单.*\*\s*0\.|0\.\d+\s*\*\s*商单/.test(radarPageCT)
+  )
+
+  // ---- 21.2 Radar API：内容类型统计随 latest snapshot 下发（旧快照 → 全部 unknown）----
+  db.prepare('DELETE FROM creator_recent_snapshots').run()
+  db.prepare('DELETE FROM creator_records').run()
+  const CT_CREATOR = '商单达人'
+  const CT_LEGACY = '旧快照达人'
+  insert.run('2026-W38', CT_CREATOR, '数码', 3000, '2026-09-20', 20000, 100000)
+  insert.run('2026-W38', CT_LEGACY, '数码', 4000, '2026-09-20', 20000, 100000)
+
+  const typedPlayValues = [40000, 50000, 60000, 20000, 30000, 40000]
+  const typedPlayTypes = ['sponsored', 'sponsored', 'sponsored', 'organic', 'organic', 'organic']
+  const typedPlays = typedPlayValues.map((value, index) => ({
+    raw_text: String(value),
+    normalized_play: value,
+    needs_review: false,
+    excluded: false,
+    content_type: typedPlayTypes[index],
+    source_image_index: 1,
+    position_index: index + 1
+  }))
+  const insertSnapshot = (creator, plays, observedAt) => {
+    const values = plays.map((play) => play.normalized_play)
+    const s = statsLib.computeRecentPerformanceStats(values)
+    return Number(
+      db
+        .prepare(
+          `INSERT INTO creator_recent_snapshots (
+             creator, source_type, plays_json, recognized_count, valid_count, excluded_count,
+             unresolved_count, analysis_count, median_play, p25_play, p75_play,
+             recent_median_play, prior_median_play, trend_ratio, trend_label,
+             stats_status, stats_version, created_at, observed_at
+           ) VALUES (?, 'screenshot', ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-09-29 10:00:00', ?)`
+        )
+        .run(
+          creator,
+          JSON.stringify(plays),
+          plays.length,
+          s.valid_count,
+          s.analysis_count,
+          s.median_play,
+          s.p25_play,
+          s.p75_play,
+          s.recent_median_play,
+          s.prior_median_play,
+          s.trend_ratio,
+          s.trend_label,
+          s.stats_status,
+          statsLib.STATS_VERSION,
+          observedAt
+        ).lastInsertRowid
+    )
+  }
+  insertSnapshot(CT_CREATOR, typedPlays, '2026-09-29')
+  // 旧格式快照（条目没有 content_type）
+  insertSnapshot(
+    CT_LEGACY,
+    typedPlayValues.map((value, index) => ({
+      raw_text: String(value),
+      normalized_play: value,
+      needs_review: false,
+      excluded: false,
+      source_image_index: 1,
+      position_index: index + 1
+    })),
+    '2026-09-29'
+  )
+
+  const radarTyped = await call({ current_date: REFERENCE_DATE })
+  const radarFlat = radarTyped.data.groups.flatMap((group) => group.creators)
+  const typedCreatorItem = radarFlat.find((item) => item.creator === CT_CREATOR)
+  const legacyCreatorItem = radarFlat.find((item) => item.creator === CT_LEGACY)
+  check(
+    'F8 Radar latest snapshot 携带五个内容类型字段（商单 3 条中位 5万 / 日常 3 条中位 3万）',
+    typedCreatorItem?.recent_snapshot?.sponsored_count === 3 &&
+      typedCreatorItem?.recent_snapshot?.sponsored_median_play === 50000 &&
+      typedCreatorItem?.recent_snapshot?.organic_count === 3 &&
+      typedCreatorItem?.recent_snapshot?.organic_median_play === 30000 &&
+      typedCreatorItem?.recent_snapshot?.unknown_count === 0,
+    JSON.stringify(typedCreatorItem?.recent_snapshot ?? null)
+  )
+  check(
+    'F9 旧快照在 Radar 上全部落入 unknown（不回填、不猜测）',
+    legacyCreatorItem?.recent_snapshot?.unknown_count === 6 &&
+      legacyCreatorItem?.recent_snapshot?.sponsored_count === 0 &&
+      legacyCreatorItem?.recent_snapshot?.organic_count === 0 &&
+      legacyCreatorItem?.recent_snapshot?.sponsored_median_play === null &&
+      legacyCreatorItem?.recent_snapshot?.organic_median_play === null
+  )
+  check(
+    'F10 新增字段不影响既有业务判断（historical_status / work_priority / 排序说明 / last_actual_cost 均不变）',
+    // 两位达人都只有 1 条历史投放记录（CPM 30 / 40）→ insufficient + normal_attention：
+    // 内容类型只影响「近期表现」的展示拆分，完全不影响历史证据与工作优先级
+    typedCreatorItem?.historical_status === 'insufficient' &&
+      typedCreatorItem?.work_priority === 'normal_attention' &&
+      legacyCreatorItem?.historical_status === 'insufficient' &&
+      legacyCreatorItem?.work_priority === 'normal_attention' &&
+      typedCreatorItem?.last_actual_cost === 3000 &&
+      legacyCreatorItem?.last_actual_cost === 4000 &&
+      !/商单|sponsored|organic/.test(JSON.stringify(radarTyped.data.sort)) &&
+      !/sponsored|organic/.test(radarTyped.data.groups.map((group) => group.key).join(',')),
+    JSON.stringify({
+      typed: [typedCreatorItem?.historical_status, typedCreatorItem?.work_priority],
+      legacy: [legacyCreatorItem?.historical_status, legacyCreatorItem?.work_priority]
+    })
+  )
+  check(
+    'F11 第一屏「近期内容表现」列 + Popover 内容构成 + 轻量「补充分类」入口（近期表现列保留）',
+    /title: '近期内容表现'/.test(radarPageCT) &&
+      /title: '近期表现'/.test(radarPageCT) &&
+      /内容构成/.test(radarPageCT) &&
+      /buildContentPerformanceLines\(snapshot\)/.test(radarPageCT) &&
+      // 「补充分类」复用现有入口，不新增编辑器 / API
+      /补充分类/.test(radarPageCT) &&
+      /onOpenAssistant\?\.\(record\.creator\)/.test(radarPageCT) &&
+      // 文案集中在 useContentType 工具里（页面不自己拼中位/条数）
+      /商单中位/.test(fs.readFileSync(path.join(REPO_ROOT, 'frontend/src/utils/contentType.js'), 'utf8')) &&
+      !/商单中位/.test(radarPageCT) &&
+      // 只用后端下发的字段，前端不重算商单中位数
+      !/sponsored_median_play[\s\S]{0,60}[/*+-]/.test(radarPageCT)
   )
 }
 

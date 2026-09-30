@@ -63,9 +63,11 @@ import {
   splitManualPlayLines,
   summarizeDraft,
   togglePlayExcluded,
+  updatePlayContentType,
   updatePlayRawText,
   updatePriceRawText
 } from '../utils/recentPerformanceDraft.js'
+import { CONTENT_TYPE_OPTIONS, normalizeContentType } from '../utils/contentType.js'
 
 const SEND_NOTICE =
   '将向当前配置的 AI 服务发送所选截图，用于识别：达人昵称、星图刊例价、作品播放量。原图不会作为业务记录长期保存。'
@@ -856,7 +858,8 @@ export default function RecentPerformanceAssistantModal({
               <Space size={8} wrap>
                 <Typography.Text strong>作品播放量</Typography.Text>
                 <Typography.Text type="secondary">
-                  编号 = 上传图片顺序 + 图片内从上到下顺序；修改原文后会立即重新换算
+                  编号 = 上传图片顺序 + 图片内从上到下顺序；修改原文后会立即重新换算。
+                  内容类型：红色标识为商单、蓝色标识为日常，看不清就选未识别（可逐条修改，不需要重新识别）
                 </Typography.Text>
               </Space>
               <div style={{ marginTop: 8 }}>
@@ -894,6 +897,16 @@ export default function RecentPerformanceAssistantModal({
                         {play.normalized_play === null ? '需人工确认' : formatInteger(play.normalized_play)}
                       </Typography.Text>
                       <Tag>{`图 ${play.source_image_index ?? '?'} · 第 ${play.position_index} 条`}</Tag>
+                      {/* Alpha.3-04：逐条内容类型（商单 / 日常 / 未识别）——人工可直接改这一条，不重新识别 */}
+                      <Select
+                        size="small"
+                        value={normalizeContentType(play.content_type)}
+                        options={CONTENT_TYPE_OPTIONS}
+                        style={{ width: 96 }}
+                        onChange={(value) =>
+                          applyDraftChange(updatePlayContentType(draft, play.id, value))
+                        }
+                      />
                       {play.needs_review && (
                         <Tooltip title={play.reason || '无法确定性解析'}>
                           <Tag color="warning">需人工确认</Tag>
@@ -929,6 +942,10 @@ export default function RecentPerformanceAssistantModal({
                 {summary.xingtu_price !== null && (
                   <Typography.Text>{`星图价：¥${formatInteger(summary.xingtu_price)}`}</Typography.Text>
                 )}
+                {/* Alpha.3-04：保存前先让用户看到内容类型构成（商单 / 日常 / 未识别，仅计数不做加权） */}
+                <Typography.Text type="secondary">
+                  {`内容类型：商单 ${summary.content_type_counts.sponsored} · 日常 ${summary.content_type_counts.organic} · 未识别 ${summary.content_type_counts.unknown}`}
+                </Typography.Text>
               </Space>
               <Button type="primary" disabled={aiLoading} onClick={handleConfirm}>
                 确认识别结果

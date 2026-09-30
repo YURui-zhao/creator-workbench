@@ -316,6 +316,58 @@ async function main() {
     check('草稿保留图片来源与顺序', draftFromResult.plays[1].source_image_index === 3 && draftFromResult.plays[1].position_index === 2)
     check('草稿不补足 15 条', draftFromResult.plays.length === 2)
 
+    console.log('\n===== 5b. Alpha.3-04：AI 输出 content_type（只按可见颜色标识）=====')
+    const systemPrompt = ai.buildScreenshotSystemPrompt()
+    check(
+      'G1 提示词要求逐条输出 content_type，并明确红 → sponsored / 蓝 → organic',
+      /content_type/.test(systemPrompt) &&
+        /红色标识/.test(systemPrompt) &&
+        /"sponsored"/.test(systemPrompt) &&
+        /蓝色标识/.test(systemPrompt) &&
+        /"organic"/.test(systemPrompt)
+    )
+    check(
+      'G2 提示词禁止按文案语义猜广告、禁止硬凑二选一，无法确认必须 unknown',
+      /禁止根据标题文案/.test(systemPrompt) &&
+        /强行分类/.test(systemPrompt) &&
+        /"unknown"/.test(systemPrompt) &&
+        /无法确认时必须返回 "unknown"/.test(systemPrompt)
+    )
+    const typedResult = ai.parseCreatorScreenshotResult(
+      JSON.stringify({
+        creator_name_raw: '达人丙',
+        xingtu_price_raw: '3000',
+        plays: [
+          { source_image_index: 1, position_index: 1, raw_text: '5.2万', content_type: 'sponsored' },
+          { source_image_index: 1, position_index: 2, raw_text: '8.1万', content_type: 'organic' },
+          { source_image_index: 1, position_index: 3, raw_text: '3.4万', content_type: 'unknown' },
+          { source_image_index: 1, position_index: 4, raw_text: '4.4万', content_type: 'SPONSORED' },
+          { source_image_index: 1, position_index: 5, raw_text: '6.6万', content_type: 'red' },
+          { source_image_index: 1, position_index: 6, raw_text: '7.7万' },
+          { source_image_index: 1, position_index: 7, raw_text: '8.8万', content_type: 1 }
+        ],
+        warnings: []
+      })
+    )
+    check(
+      'G3 AI 输出归一化：合法值保留、大小写不敏感、red / 缺失 / 数字 → unknown',
+      typedResult.plays.map((play) => play.content_type).join(',') ===
+        'sponsored,organic,unknown,sponsored,unknown,unknown,unknown',
+      JSON.stringify(typedResult.plays.map((play) => play.content_type))
+    )
+    check(
+      'G4 内容类型不影响播放量解析结果（数值与 needs_review 口径不变）',
+      typedResult.plays.map((play) => play.normalized_play).join(',') ===
+        '52000,81000,34000,44000,66000,77000,88000' &&
+        typedResult.plays.every((play) => play.needs_review === false)
+    )
+    const typedDraftFromAi = draftLib.buildDraftFromExtraction(typedResult)
+    check(
+      'G5 草稿逐条继承 AI 类型（人工可改）',
+      typedDraftFromAi.plays.map((play) => play.content_type).join(',') ===
+        'sponsored,organic,unknown,sponsored,unknown,unknown,unknown'
+    )
+
     console.log('\n===== 6. 人工确认：修改 / 排除 / 恢复 =====')
     let draft = draftLib.buildDraftFromExtraction({
       provider: 'deepseek', model: 'deepseek-flash',

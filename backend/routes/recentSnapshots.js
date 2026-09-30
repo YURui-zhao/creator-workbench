@@ -4,7 +4,9 @@ import { parsePlayText, parsePriceText } from '../utils/screenshotValues.js'
 import {
   MAX_PLAYS_PER_SNAPSHOT,
   STATS_VERSION,
-  computeRecentPerformanceStats
+  computeContentTypeBreakdown,
+  computeRecentPerformanceStats,
+  normalizeContentType
 } from '../utils/recentPerformanceStats.js'
 import { computeCreatorPricing } from '../utils/creatorPricing.js'
 
@@ -130,6 +132,9 @@ export function validateSnapshotPayload(body) {
     return {
       raw_text: toOptionalText(row.raw_text, MAX_RAW_TEXT_LENGTH, `第 ${index + 1} 条 raw_text`, errors),
       excluded: row.excluded === true,
+      // Alpha.3-04：内容类型（商单 / 日常 / 未识别）
+      // 非法值 / 缺失一律归一为 unknown（旧前端不传该字段时行为不变）
+      content_type: normalizeContentType(row.content_type),
       source_image_index: toOptionalPositiveInt(
         row.source_image_index,
         `第 ${index + 1} 条 source_image_index`,
@@ -175,6 +180,8 @@ export function normalizeSnapshotPlays(plays = []) {
       normalized_play: parsed.value,
       needs_review: parsed.needs_review,
       excluded: item?.excluded === true,
+      // Alpha.3-04：内容类型随条目持久化（旧数据没有该字段 → 读取时归一为 unknown）
+      content_type: normalizeContentType(item?.content_type),
       source_image_index: item?.source_image_index ?? null,
       position_index: item?.position_index ?? index + 1
     }
@@ -201,7 +208,10 @@ export function toPublicSnapshot(row) {
   let plays = []
   try {
     const parsed = JSON.parse(row.plays_json)
-    plays = Array.isArray(parsed) ? parsed : []
+    // Alpha.3-04：读取时把每条内容类型归一化（旧数据没有该字段 → unknown），不回写数据库
+    plays = Array.isArray(parsed)
+      ? parsed.map((play) => ({ ...play, content_type: normalizeContentType(play?.content_type) }))
+      : []
   } catch {
     plays = []
   }
@@ -227,6 +237,9 @@ export function toPublicSnapshot(row) {
     trend_label: row.trend_label ?? null,
     stats_status: row.stats_status ?? null,
     stats_version: row.stats_version,
+    // Alpha.3-04：内容类型分组统计（由 plays_json 确定性派生，不落库、不迁移旧数据）
+    // 旧快照没有 content_type → 全部计入 unknown_count，sponsored / organic 均为 0 / null
+    ...computeContentTypeBreakdown(plays),
     created_at: row.created_at,
     // Alpha.2：业务观察日期（旧数据为 NULL → 「观察日期未知」）
     observed_at: row.observed_at ?? null,
@@ -244,6 +257,14 @@ export function toPublicSnapshot(row) {
 /** 雷达列表用的轻量 summary（不返回 plays_json，避免响应膨胀） */
 export function toSnapshotSummary(row) {
   if (!row) return null
+  // Alpha.3-04：Radar / latest 只带内容类型分组统计；旧快照（无类型）→ 全部 unknown
+  let playsForBreakdown = []
+  try {
+    const parsed = JSON.parse(row.plays_json)
+    playsForBreakdown = Array.isArray(parsed) ? parsed : []
+  } catch {
+    playsForBreakdown = []
+  }
   return {
     id: row.id,
     created_at: row.created_at,
@@ -257,6 +278,7 @@ export function toSnapshotSummary(row) {
     xingtu_price: row.xingtu_price ?? null,
     stats_status: row.stats_status ?? null,
     stats_version: row.stats_version,
+    ...computeContentTypeBreakdown(playsForBreakdown),
     // P3：radar 一次请求即带价格判断，避免前端 N+1（同一行数据派生，无需额外查询）
     pricing: computeCreatorPricing({
       stats_status: row.stats_status,
@@ -269,7 +291,7 @@ export function toSnapshotSummary(row) {
 }
 
 const MAKE_SUMMARY_COLUMNS =
-  'id, creator, created_at, observed_at, valid_count, analysis_count, median_play, p25_play, p75_play, trend_label, xingtu_price, stats_status, stats_version'
+  'id, creator, created_at, observed_at, valid_count, analysis_count, median_play, p25_play, p75_play, trend_label, xingtu_price, stats_status, stats_version, plays_json'
 
 /**
  * 「latest snapshot」排序（Alpha.2 起为唯一口径，GET /latest 与 radar 批量合并共用）：

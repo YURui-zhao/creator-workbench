@@ -40,6 +40,10 @@ import {
   isGroupCollapsed,
   toggleGroupCollapsed
 } from '../../utils/radarRowDisplay.js'
+import {
+  buildContentBreakdownRows,
+  buildContentPerformanceLines
+} from '../../utils/contentType.js'
 import { buildPricingRows, formatPrice } from '../../utils/pricingDisplay.js'
 import {
   EMPTY_RADAR_FILTERS,
@@ -84,7 +88,7 @@ const OUTCOME_CPM_SHORT_LABELS = {
 
 // Alpha.3 信息架构：近期表现独立成列（高视觉权重），有效样本 / 达标次数降级为历史 CPM 的辅助行，
 // 达人类型降级为达人名称下的次级文字；列宽合计控制在 1024 宽度下不产生页面级 / 表内横向滚动。
-const RADAR_TABLE_WIDTH = 816
+const RADAR_TABLE_WIDTH = 934
 const SECONDARY_TEXT_STYLE = { fontSize: 12, color: 'rgba(0, 0, 0, 0.45)', lineHeight: '18px' }
 const PLACEHOLDER = <Typography.Text type="secondary">-</Typography.Text>
 
@@ -98,7 +102,7 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
     {
       title: '达人',
       dataIndex: 'creator',
-      width: 116,
+      width: 112,
       render: (value, record) => {
         const snapshot = record.recent_snapshot
         return (
@@ -144,6 +148,15 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
                       <Typography.Text type="secondary">
                         统计口径：{snapshot.stats_version}
                       </Typography.Text>
+                      <Divider style={{ margin: '6px 0' }} />
+                      {/* Alpha.3-04：内容构成（商单 / 日常 / 未识别），只做事实展示 */}
+                      <Typography.Text strong>内容构成</Typography.Text>
+                      {buildContentBreakdownRows(snapshot).map((row) => (
+                        <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                          <Typography.Text type="secondary">{row.label}</Typography.Text>
+                          <Typography.Text>{row.value}</Typography.Text>
+                        </div>
+                      ))}
                       <Divider style={{ margin: '6px 0' }} />
                       <Typography.Text strong>价格核算</Typography.Text>
                       {buildPricingRows(snapshot.pricing).map((row) => (
@@ -255,9 +268,43 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
       }
     },
     {
+      // Alpha.3-04A：近期内容表现（商单 / 日常），只做展示，不参与任何业务判断
+      title: '近期内容表现',
+      key: 'contentType',
+      width: 138,
+      render: (_, record) => {
+        const snapshot = record.recent_snapshot
+        if (!snapshot) return PLACEHOLDER
+        const cell = buildContentPerformanceLines(snapshot)
+        if (cell.lines.length === 0) return PLACEHOLDER
+        return (
+          <div>
+            {cell.lines.map((line) => (
+              <div
+                key={line.text}
+                style={
+                  line.primary
+                    ? { whiteSpace: 'nowrap', fontWeight: 600, lineHeight: '20px' }
+                    : { ...SECONDARY_TEXT_STYLE, whiteSpace: 'nowrap' }
+                }
+              >
+                {line.text}
+              </div>
+            ))}
+            {/* 还有未确认类型的内容时，给一个轻量入口（复用现有「更新近期表现」，不新增编辑器） */}
+            {cell.unknownCount > 0 && (
+              <a style={SECONDARY_TEXT_STYLE} onClick={() => onOpenAssistant?.(record.creator)}>
+                补充分类
+              </a>
+            )}
+          </div>
+        )
+      }
+    },
+    {
       title: '历史投放',
       dataIndex: 'record_count',
-      width: 80,
+      width: 76,
       align: 'right',
       render: (value) => `${formatInteger(value)} 次`
     },
@@ -289,7 +336,7 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
     {
       title: '最近合作 / 距今',
       dataIndex: 'last_collaboration_date',
-      width: 112,
+      width: 108,
       render: (value, record) => (
         <div>
           <div>{value || PLACEHOLDER}</div>
@@ -307,7 +354,7 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
     {
       title: '历史状态',
       dataIndex: 'historical_status',
-      width: 108,
+      width: 104,
       render: (value, record) => {
         const meta = STATUS_META[value] || { label: value, color: 'default' }
         // 工作优先级标记（仅单样本突出 / 优先补数据 / 单次明显低效时出现，文案由后端给出）
@@ -329,7 +376,7 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
     {
       title: '风险提示',
       key: 'recentRisk',
-      width: 88,
+      width: 84,
       render: (_, record) =>
         record.recent_risk ? (
           <Tooltip

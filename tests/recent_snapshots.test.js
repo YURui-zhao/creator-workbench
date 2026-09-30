@@ -942,6 +942,398 @@ async function main() {
       JSON.stringify({ rate: assessment.actual_vs_xingtu_rate, range: assessment.negotiation_range_status })
     )
 
+    console.log('\n===== 14. Alpha.3-04：内容类型（商单 / 日常 / 未识别）=====')
+    // ---- 14.1 旧格式 plays_json（条目没有 content_type）直接插库，模拟历史快照 ----
+    const legacyValues = [58000, 62000, 61000, 55000, 47000, 52000, 70000, 45000]
+    const legacyPlaysV1 = legacyValues.map((value, index) => ({
+      raw_text: String(value),
+      normalized_play: value,
+      needs_review: false,
+      excluded: false,
+      source_image_index: 1,
+      position_index: index + 1
+    }))
+    const legacyStats = stats.computeRecentPerformanceStats(legacyValues)
+    const LEGACY_TYPED_CREATOR = '内容类型旧达人'
+    insertRecord.run('2026-W33', LEGACY_TYPED_CREATOR, '历史类', 3000, '2026-08-21', 20000, 100000)
+    const legacyTypedId = Number(
+      db
+        .prepare(
+          `INSERT INTO creator_recent_snapshots (
+             creator, source_type, plays_json, recognized_count, valid_count, excluded_count,
+             unresolved_count, analysis_count, median_play, p25_play, p75_play,
+             recent_median_play, prior_median_play, trend_ratio, trend_label,
+             stats_status, stats_version, created_at, observed_at
+           ) VALUES (?, 'screenshot', ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-09-28 09:00:00', '2026-09-28')`
+        )
+        .run(
+          LEGACY_TYPED_CREATOR,
+          JSON.stringify(legacyPlaysV1),
+          legacyPlaysV1.length,
+          legacyStats.valid_count,
+          legacyStats.analysis_count,
+          legacyStats.median_play,
+          legacyStats.p25_play,
+          legacyStats.p75_play,
+          legacyStats.recent_median_play,
+          legacyStats.prior_median_play,
+          legacyStats.trend_ratio,
+          legacyStats.trend_label,
+          legacyStats.stats_status,
+          stats.STATS_VERSION
+        ).lastInsertRowid
+    )
+    const legacyTypedRow = db
+      .prepare('SELECT * FROM creator_recent_snapshots WHERE id = ?')
+      .get(legacyTypedId)
+    const legacyPublic = snapshots.toPublicSnapshot(legacyTypedRow)
+    const legacySummary = snapshots.toSnapshotSummary(legacyTypedRow)
+    check(
+      'A1 旧快照（无内容类型）仍能正常读取，条目不丢失',
+      legacyPublic.plays.length === legacyValues.length &&
+        legacyPublic.valid_count === legacyValues.length &&
+        legacyPublic.plays.every((play) => play.normalized_play !== undefined)
+    )
+    check(
+      'A2 旧快照整体统计不变（median / P25 / P75 / trend 与既有统计函数完全一致）',
+      legacyPublic.median_play === legacyStats.median_play &&
+        legacyPublic.p25_play === legacyStats.p25_play &&
+        legacyPublic.p75_play === legacyStats.p75_play &&
+        legacyPublic.trend_label === legacyStats.trend_label &&
+        legacyPublic.trend_ratio === legacyStats.trend_ratio &&
+        legacyStats.stats_status === 'ok',
+      JSON.stringify({ median: legacyPublic.median_play, trend: legacyPublic.trend_label })
+    )
+    check(
+      'A3 旧快照内容类型一律 unknown（sponsored/organic 均为 0），且不回填、不回写数据库',
+      legacyPublic.plays.every((play) => play.content_type === 'unknown') &&
+        legacyPublic.sponsored_count === 0 &&
+        legacyPublic.organic_count === 0 &&
+        legacyPublic.unknown_count === legacyValues.length &&
+        legacyPublic.sponsored_median_play === null &&
+        legacyPublic.organic_median_play === null &&
+        db.prepare('SELECT plays_json FROM creator_recent_snapshots WHERE id = ?').get(legacyTypedId)
+          .plays_json === JSON.stringify(legacyPlaysV1)
+    )
+    check(
+      'A4 Radar / latest summary 对旧快照给出「类型未识别」语义（unknown_count = 有效样本数）',
+      legacySummary.unknown_count === legacyValues.length &&
+        legacySummary.sponsored_count === 0 &&
+        legacySummary.organic_count === 0 &&
+        legacySummary.median_play === legacyStats.median_play
+    )
+
+    // ---- 14.2 新快照：商单 / 日常 / 未识别 保存 + 读取 + 分组统计 ----
+    const typedValues = {
+      sponsored: [60000, 50000, 40000],
+      organic: [20000, 30000, 40000],
+      unknown: [90000, 95000]
+    }
+    const typedSave = await save({
+      creator: 'Gary',
+      recognized_creator_name_raw: 'Gary',
+      plays: [
+        { raw_text: '6万', content_type: 'sponsored' },
+        { raw_text: '5万', content_type: 'sponsored' },
+        { raw_text: '4万', content_type: 'sponsored' },
+        { raw_text: '2万', content_type: 'organic' },
+        { raw_text: '3万', content_type: 'organic' },
+        { raw_text: '4万', content_type: 'organic' },
+        { raw_text: '9万', content_type: null },
+        { raw_text: '95000', content_type: 'red' }
+      ]
+    })
+    check(
+      'B5/B6/B7 商单 / 日常 / 未识别 均可保存并原样读回（非法值归一为 unknown）',
+      typedSave.status === 200 &&
+        typedSave.data.plays.map((play) => play.content_type).join(',') ===
+          'sponsored,sponsored,sponsored,organic,organic,organic,unknown,unknown',
+      JSON.stringify(typedSave.data?.plays?.map((play) => play.content_type))
+    )
+    check(
+      'B8 AI / 前端传来的非法内容类型（red、null、数字）不会写入库，一律 unknown',
+      (() => {
+        const stored = JSON.parse(
+          db.prepare('SELECT plays_json FROM creator_recent_snapshots WHERE id = ?').get(typedSave.data.id)
+            .plays_json
+        )
+        return (
+          stored[6].content_type === 'unknown' &&
+          stored[7].content_type === 'unknown' &&
+          stored.every((play) => ['sponsored', 'organic', 'unknown'].includes(play.content_type))
+        )
+      })()
+    )
+    check(
+      'C11–C15 分组统计正确（商单 3 条中位 5万 / 日常 3 条中位 3万 / 未识别 2 条）',
+      typedSave.data.sponsored_count === 3 &&
+        typedSave.data.sponsored_median_play === 50000 &&
+        typedSave.data.organic_count === 3 &&
+        typedSave.data.organic_median_play === 30000 &&
+        typedSave.data.unknown_count === 2,
+      JSON.stringify({
+        s: [typedSave.data.sponsored_count, typedSave.data.sponsored_median_play],
+        o: [typedSave.data.organic_count, typedSave.data.organic_median_play],
+        u: typedSave.data.unknown_count
+      })
+    )
+    check(
+      'C16 unknown 不计入商单 / 日常（三个分组之和 = 有效样本数）',
+      typedSave.data.sponsored_count + typedSave.data.organic_count + typedSave.data.unknown_count ===
+        typedSave.data.valid_count
+    )
+    check(
+      'C17 整体统计仍包含全部有效样本（含 unknown），与改动前口径一致',
+      typedSave.data.valid_count === 8 &&
+        typedSave.data.median_play ===
+          stats.computeRecentPerformanceStats([
+            ...typedValues.sponsored,
+            ...typedValues.organic,
+            ...typedValues.unknown
+          ]).median_play
+    )
+    check(
+      'C18 内容类型中位数复用现有 median 逻辑（与整体典型表现同一函数；>=5 去极值不影响中位数，<5 直接中位数）',
+      // 默认（与整体统计同口径）：< 5 条不产出典型值
+      stats.typicalMedianOf([10000, 20000]) === null &&
+        // 内容类型分组允许小样本：1–2 条直接取中位数
+        stats.typicalMedianOf([10000, 20000], { allowSmallSample: true }) === 15000 &&
+        stats.typicalMedianOf([42000], { allowSmallSample: true }) === 42000 &&
+        // >= 5 与整体口径一致（去极值；中位数本身与不去极值相同）
+        stats.typicalMedianOf([1000, 20000, 30000, 40000, 50000, 60000, 70000, 80000]) === 45000 &&
+        [1, 2, 3, 4, 5, 6, 7, 8].every((size) => {
+          const values = Array.from({ length: size }, (_, i) => 10000 + i * 5000)
+          return (
+            stats.typicalMedianOf(values, { allowSmallSample: true }) === stats.medianOf(values) &&
+            (size < 5 || stats.typicalMedianOf(values) === stats.medianOf(values))
+          )
+        })
+    )
+    const typedSnapshotSummary = snapshots.toSnapshotSummary(
+      db.prepare('SELECT * FROM creator_recent_snapshots WHERE id = ?').get(typedSave.data.id)
+    )
+    check(
+      'C19 Radar summary 同样携带五个内容类型统计字段',
+      typedSnapshotSummary.sponsored_count === 3 &&
+        typedSnapshotSummary.sponsored_median_play === 50000 &&
+        typedSnapshotSummary.organic_count === 3 &&
+        typedSnapshotSummary.organic_median_play === 30000 &&
+        typedSnapshotSummary.unknown_count === 2
+    )
+    check(
+      'C20 不存在加权综合分 / 综合商单评分（只有分组计数与各自中位数）',
+      !Object.keys(typedSave.data).some((key) => /score|weight|blended|composite/i.test(key)) &&
+        !Object.keys(typedSnapshotSummary).some((key) => /score|weight|blended|composite/i.test(key))
+    )
+
+    // ---- 14.3 人工校准（前端草稿层：不重新识别、不重新调用 AI） ----
+    const typedDraft = draftLib.buildDraftFromExtraction({
+      plays: [
+        { source_image_index: 1, position_index: 1, raw_text: '5.2万', content_type: 'sponsored' },
+        { source_image_index: 1, position_index: 2, raw_text: '8.1万', content_type: 'organic' },
+        { source_image_index: 1, position_index: 3, raw_text: '3.4万', content_type: 'blue' }
+      ]
+    })
+    check(
+      'B8/D 前端草稿：AI 非法类型归一为 unknown，合法类型保留',
+      typedDraft.plays.map((play) => play.content_type).join(',') === 'sponsored,organic,unknown'
+    )
+    const manualTypedDraft = draftLib.buildDraftFromManualPlays(['5万', '4万'])
+    check(
+      '手工录入：默认全部未识别，可逐条选择类型（不影响播放量解析）',
+      manualTypedDraft.plays.every((play) => play.content_type === 'unknown') &&
+        manualTypedDraft.plays.map((play) => play.normalized_play).join(',') === '50000,40000'
+    )
+    const editedDraft = draftLib.updatePlayContentType(typedDraft, typedDraft.plays[0].id, 'organic')
+    check(
+      'B9/B10 人工把商单改成日常：只改这一条，其他条目与播放量不变（不需要重新识别）',
+      editedDraft.plays[0].content_type === 'organic' &&
+        editedDraft.plays[0].normalized_play === 52000 &&
+        editedDraft.plays[1].content_type === 'organic' &&
+        editedDraft.plays[2].content_type === 'unknown' &&
+        typedDraft.plays[0].content_type === 'sponsored' &&
+        !/extractCreatorScreenshot|axios|fetch\(/.test(
+          fs.readFileSync(path.join(frontend, 'utils/recentPerformanceDraft.js'), 'utf8')
+        )
+    )
+    check(
+      '保存 payload 携带逐条 content_type，且草稿摘要按有效样本计数',
+      (() => {
+        const payload = saveLib.buildSnapshotPayload(editedDraft, {
+          creator: 'Gary',
+          observedAt: '2026-09-28'
+        })
+        const summary = draftLib.summarizeDraft(editedDraft)
+        return (
+          payload.plays.map((play) => play.content_type).join(',') === 'organic,organic,unknown' &&
+          summary.content_type_counts.sponsored === 0 &&
+          summary.content_type_counts.organic === 2 &&
+          summary.content_type_counts.unknown === 1
+        )
+      })()
+    )
+    check(
+      '人工改类型不产生网络请求（全程 0 次外部调用）',
+      networkGuard.blocked.length === 0,
+      JSON.stringify(networkGuard.blocked)
+    )
+
+    console.log('\n===== 15. Alpha.3-04A：人工校准 → 保存 → Radar 闭环 =====')
+    // 造一个「最新快照全部未分类」的达人，模拟用户看到「X条内容待分类」
+    const LOOP_CREATOR = '闭环达人'
+    insertRecord.run('2026-W38', LOOP_CREATOR, '数码', 3000, '2026-09-15', 20000, 100000)
+    const legacyLoopValues = [30000, 40000, 50000, 60000, 70000, 80000]
+    const legacyLoopPlays = legacyLoopValues.map((value, index) => ({
+      raw_text: String(value),
+      normalized_play: value,
+      needs_review: false,
+      excluded: false,
+      source_image_index: 1,
+      position_index: index + 1
+    }))
+    const legacyLoopStats = stats.computeRecentPerformanceStats(legacyLoopValues)
+    const legacyLoopId = Number(
+      db
+        .prepare(
+          `INSERT INTO creator_recent_snapshots (
+             creator, source_type, plays_json, recognized_count, valid_count, excluded_count,
+             unresolved_count, analysis_count, median_play, p25_play, p75_play,
+             recent_median_play, prior_median_play, trend_ratio, trend_label,
+             stats_status, stats_version, created_at, observed_at
+           ) VALUES (?, 'screenshot', ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-09-28 09:00:00', '2026-09-28')`
+        )
+        .run(
+          LOOP_CREATOR,
+          JSON.stringify(legacyLoopPlays),
+          legacyLoopPlays.length,
+          legacyLoopStats.valid_count,
+          legacyLoopStats.analysis_count,
+          legacyLoopStats.median_play,
+          legacyLoopStats.p25_play,
+          legacyLoopStats.p75_play,
+          legacyLoopStats.recent_median_play,
+          legacyLoopStats.prior_median_play,
+          legacyLoopStats.trend_ratio,
+          legacyLoopStats.trend_label,
+          legacyLoopStats.stats_status,
+          stats.STATS_VERSION
+        ).lastInsertRowid
+    )
+    const legacyLoopRowBefore = db
+      .prepare('SELECT plays_json FROM creator_recent_snapshots WHERE id = ?')
+      .get(legacyLoopId).plays_json
+    const radarBeforeLoop = await radar()
+    const loopBefore = radarBeforeLoop.data.groups
+      .flatMap((group) => group.creators)
+      .find((item) => item.creator === LOOP_CREATOR)?.recent_snapshot
+    check(
+      'H1 保存前：Radar latest = 未分类快照（sponsored/organic 为 0，unknown = 有效样本数）',
+      loopBefore?.id === legacyLoopId &&
+        loopBefore.sponsored_count === 0 &&
+        loopBefore.organic_count === 0 &&
+        loopBefore.unknown_count === legacyLoopValues.length
+    )
+
+    // ---- 模拟用户在「更新近期表现」里逐条校准内容类型 ----
+    const loopDraft0 = draftLib.buildDraftFromManualPlays(legacyLoopValues.map(String))
+    check(
+      'H2 草稿初始全部未识别（手工录入没有颜色依据，不猜）',
+      loopDraft0.plays.every((play) => play.content_type === 'unknown')
+    )
+    let loopDraft = loopDraft0
+    // 后 3 条 → 商单（6万 / 7万 / 8万 → 中位 7万）
+    loopDraft = draftLib.updatePlayContentType(loopDraft, loopDraft.plays[3].id, 'sponsored')
+    loopDraft = draftLib.updatePlayContentType(loopDraft, loopDraft.plays[4].id, 'sponsored')
+    loopDraft = draftLib.updatePlayContentType(loopDraft, loopDraft.plays[5].id, 'sponsored')
+    // 前 3 条 → 日常（3万 / 4万 / 5万 → 中位 4万）；其中一条刻意改两次，验证保存的是最新状态
+    loopDraft = draftLib.updatePlayContentType(loopDraft, loopDraft.plays[0].id, 'sponsored')
+    loopDraft = draftLib.updatePlayContentType(loopDraft, loopDraft.plays[0].id, 'organic')
+    loopDraft = draftLib.updatePlayContentType(loopDraft, loopDraft.plays[1].id, 'organic')
+    loopDraft = draftLib.updatePlayContentType(loopDraft, loopDraft.plays[2].id, 'organic')
+    const loopPayload = saveLib.buildSnapshotPayload(loopDraft, {
+      creator: LOOP_CREATOR,
+      observedAt: '2026-09-30'
+    })
+    check(
+      'H3 payload 携带的是草稿最新状态（改两次的那条以最后一次为准）',
+      loopPayload.plays.map((play) => play.content_type).join(',') ===
+        'organic,organic,organic,sponsored,sponsored,sponsored',
+      JSON.stringify(loopPayload.plays.map((play) => play.content_type))
+    )
+
+    const loopSaved = await save(loopPayload)
+    check(
+      'H4 保存成功，返回的统计与 payload 类型一致（商单 3 条中位 7万 / 日常 3 条中位 4万）',
+      loopSaved.status === 200 &&
+        loopSaved.data.sponsored_count === 3 &&
+        loopSaved.data.sponsored_median_play === 70000 &&
+        loopSaved.data.organic_count === 3 &&
+        loopSaved.data.organic_median_play === 40000 &&
+        loopSaved.data.unknown_count === 0,
+      JSON.stringify({
+        s: [loopSaved.data?.sponsored_count, loopSaved.data?.sponsored_median_play],
+        o: [loopSaved.data?.organic_count, loopSaved.data?.organic_median_play]
+      })
+    )
+    check(
+      'H5 payload 伪造的派生值不会覆盖后端重算结果（只认 raw_text + content_type）',
+      (() => {
+        const stored = JSON.parse(
+          db.prepare('SELECT plays_json FROM creator_recent_snapshots WHERE id = ?').get(loopSaved.data.id)
+            .plays_json
+        )
+        return (
+          stored.map((play) => play.content_type).join(',') ===
+            'organic,organic,organic,sponsored,sponsored,sponsored' &&
+          stored.every((play) => play.normalized_play !== null)
+        )
+      })()
+    )
+    const loopLatest = await latest(LOOP_CREATOR)
+    check(
+      'H6 latest snapshot 选中新保存的快照（旧未分类快照不覆盖新快照）',
+      loopLatest.data.snapshot.id === loopSaved.data.id &&
+        loopLatest.data.snapshot.sponsored_count === 3 &&
+        loopLatest.data.snapshot.organic_count === 3
+    )
+    const radarAfterLoop = await radar()
+    const loopAfter = radarAfterLoop.data.groups
+      .flatMap((group) => group.creators)
+      .find((item) => item.creator === LOOP_CREATOR)?.recent_snapshot
+    check(
+      'H7 Radar 刷新后展示新快照的分类统计（不再是「待分类」）',
+      loopAfter?.id === loopSaved.data.id &&
+        loopAfter.sponsored_count === 3 &&
+        loopAfter.sponsored_median_play === 70000 &&
+        loopAfter.organic_count === 3 &&
+        loopAfter.organic_median_play === 40000 &&
+        loopAfter.unknown_count === 0
+    )
+    check(
+      'H8 旧快照未被修改、未被回填（plays_json 与保存前逐字节一致，仍可读取）',
+      db.prepare('SELECT plays_json FROM creator_recent_snapshots WHERE id = ?').get(legacyLoopId)
+        .plays_json === legacyLoopRowBefore &&
+        snapshots.toPublicSnapshot(
+          db.prepare('SELECT * FROM creator_recent_snapshots WHERE id = ?').get(legacyLoopId)
+        ).unknown_count === legacyLoopValues.length
+    )
+    check(
+      'H9 整体 median / trend 口径不变（新快照仍按全部有效样本计算）',
+      loopSaved.data.valid_count === legacyLoopValues.length &&
+        loopSaved.data.median_play ===
+          stats.computeRecentPerformanceStats(legacyLoopValues).median_play &&
+        loopSaved.data.trend_label === 'insufficient' // 6 条 < 8，trend 仍为 insufficient
+    )
+    check(
+      'H10 前端保存后会重新拉取 Radar（使用最新 API 结果，不靠前端伪造计数）',
+      /onSaved=\{\(\) => \{[\s\S]{0,200}loadRadar\(\)/.test(
+        fs.readFileSync(path.join(frontend, 'pages/RepurchaseRadar/index.jsx'), 'utf8')
+      ) &&
+        !/sponsored_count\s*[:=]\s*\d/.test(
+          fs.readFileSync(path.join(frontend, 'utils/contentType.js'), 'utf8')
+        )
+    )
+
     console.log('\n===== 13. 无 AI / 无网络 / 只读实现 =====')
     const routeSource = fs.readFileSync(path.join(root, 'backend/routes/recentSnapshots.js'), 'utf8')
     check('P2B 路由不引用任何 AI 服务', !/deepseek|callProviderVision|extract-creator-screenshot/i.test(routeSource))

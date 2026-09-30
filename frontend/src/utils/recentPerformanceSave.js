@@ -12,6 +12,7 @@
 
 import { normalizeRawText } from './screenshotValues.js'
 import { formatPlays } from './format.js'
+import { normalizeContentType } from './contentType.js'
 
 // 与后端 trend_label 一一对应（仅展示用）
 export const TREND_LABELS = {
@@ -90,6 +91,8 @@ export function buildSnapshotPayload(
     plays: (draft?.plays || []).map((play) => ({
       raw_text: normalizeRawText(play.raw_text),
       excluded: Boolean(play.excluded),
+      // Alpha.3-04：内容类型随条目提交（后端仍会重新归一化，非法值一律 unknown）
+      content_type: normalizeContentType(play.content_type),
       source_image_index: Number.isInteger(play.source_image_index) ? play.source_image_index : null,
       position_index: Number.isInteger(play.position_index) ? play.position_index : null
     }))

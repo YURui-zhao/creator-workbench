@@ -4,10 +4,8 @@ import {
   Button,
   Card,
   Col,
-  Divider,
   Empty,
   Input,
-  Popover,
   Row,
   Select,
   Skeleton,
@@ -24,12 +22,7 @@ import { getErrorMessage } from '../../utils/request'
 import { formatInteger } from '../../utils/format'
 import RecentPerformanceAssistantModal from '../../components/RecentPerformanceAssistantModal'
 import CreatorDecisionDrawer from '../../components/CreatorDecisionDrawer'
-import {
-  formatPlayRange,
-  formatSnapshotStatusText,
-  formatTrendRatio,
-  TREND_LABELS_FULL
-} from '../../utils/recentPerformanceSave.js'
+import CreatorWorkspaceDrawer from '../../components/CreatorWorkspaceDrawer'
 import {
   buildRecentPerformanceCell,
   DEFAULT_COLLAPSED_GROUPS,
@@ -40,11 +33,8 @@ import {
   isGroupCollapsed,
   toggleGroupCollapsed
 } from '../../utils/radarRowDisplay.js'
-import {
-  buildContentBreakdownRows,
-  buildContentPerformanceLines
-} from '../../utils/contentType.js'
-import { buildPricingRows, formatPrice } from '../../utils/pricingDisplay.js'
+import { buildContentPerformanceLines } from '../../utils/contentType.js'
+import { formatPrice } from '../../utils/pricingDisplay.js'
 import {
   EMPTY_RADAR_FILTERS,
   RADAR_GROUP_OPTIONS,
@@ -77,15 +67,6 @@ const WORK_PRIORITY_TAG_COLORS = {
 
 const WORK_PRIORITY_TOOLTIP = '工作优先级只表示「今天先看谁」，不改变历史证据结论'
 
-// P5：雷达 Popover 里「投放结果」只做轻量事实展示（状态码 -> 短文案），不使用长句
-const OUTCOME_CPM_SHORT_LABELS = {
-  pending: '待更新',
-  anomaly: '异常',
-  zero_play: '累计播放为0',
-  met: '已达标',
-  not_met: '未达标'
-}
-
 // Alpha.3 信息架构：近期表现独立成列（高视觉权重），有效样本 / 达标次数降级为历史 CPM 的辅助行，
 // 达人类型降级为达人名称下的次级文字；列宽合计控制在 1024 宽度下不产生页面级 / 表内横向滚动。
 const RADAR_TABLE_WIDTH = 934
@@ -97,147 +78,40 @@ const PLACEHOLDER = <Typography.Text type="secondary">-</Typography.Text>
  * @param {number} targetCpm 目标 CPM
  * @param {(creator: string) => void} onOpenAssistant 打开某位达人的「近期表现助手」
  */
-function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
+function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision, onOpenWorkspace) {
   return [
     {
       title: '达人',
       dataIndex: 'creator',
       width: 112,
-      render: (value, record) => {
-        const snapshot = record.recent_snapshot
-        return (
-          <div style={{ minWidth: 0 }}>
-            <Popover
-              trigger="click"
-              placement="right"
-              title={`${value} · 近期表现与价格核算`}
-              content={
-                <div style={{ width: 288 }}>
-                  {snapshot ? (
-                    <Space direction="vertical" size={2} style={{ display: 'flex' }}>
-                      <Typography.Text strong>近期表现</Typography.Text>
-                      <Typography.Text type="secondary">
-                        数据截至：{snapshot.observed_at || '观察日期未知'}
-                        {snapshot.created_at ? `　保存于：${snapshot.created_at}` : ''}
-                      </Typography.Text>
-                      <Typography.Text>有效样本：{formatInteger(snapshot.valid_count)}</Typography.Text>
-                      {snapshot.stats_status === 'ok' ? (
-                        <>
-                          <Typography.Text>中位播放：{formatSnapshotStatusText(snapshot).split(' · ')[0]}</Typography.Text>
-                          <Typography.Text>
-                            典型区间（P25–P75）：{formatPlayRange(snapshot.p25_play, snapshot.p75_play)}
-                          </Typography.Text>
-                          <Typography.Text>
-                            趋势：{TREND_LABELS_FULL[snapshot.trend_label] || '样本不足'}
-                            {formatTrendRatio(snapshot.trend_ratio)
-                              ? `（${formatTrendRatio(snapshot.trend_ratio)}）`
-                              : ''}
-                          </Typography.Text>
-                        </>
-                      ) : (
-                        <Typography.Text type="warning">
-                          样本不足：建议补充更多近期作品截图
-                        </Typography.Text>
-                      )}
-                      <Typography.Text>
-                        星图价：
-                        {snapshot.xingtu_price === null || snapshot.xingtu_price === undefined
-                          ? '暂无'
-                          : `¥${formatInteger(snapshot.xingtu_price)}`}
-                      </Typography.Text>
-                      <Typography.Text type="secondary">
-                        统计口径：{snapshot.stats_version}
-                      </Typography.Text>
-                      <Divider style={{ margin: '6px 0' }} />
-                      {/* Alpha.3-04：内容构成（商单 / 日常 / 未识别），只做事实展示 */}
-                      <Typography.Text strong>内容构成</Typography.Text>
-                      {buildContentBreakdownRows(snapshot).map((row) => (
-                        <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
-                          <Typography.Text type="secondary">{row.label}</Typography.Text>
-                          <Typography.Text>{row.value}</Typography.Text>
-                        </div>
-                      ))}
-                      <Divider style={{ margin: '6px 0' }} />
-                      <Typography.Text strong>价格核算</Typography.Text>
-                      {buildPricingRows(snapshot.pricing).map((row) => (
-                        <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
-                          <Typography.Text type="secondary">{row.label}</Typography.Text>
-                          <Typography.Text>{row.value}</Typography.Text>
-                        </div>
-                      ))}
-                      <Divider style={{ margin: '6px 0' }} />
-                      <Typography.Text strong>价格状态</Typography.Text>
-                      <Typography.Text>{snapshot.pricing?.pricing_status_label || '-'}</Typography.Text>
-                      <Divider style={{ margin: '6px 0' }} />
-                      <Typography.Text strong>最近决策</Typography.Text>
-                      {record.recent_decision ? (
-                        <>
-                          <Typography.Text type="secondary">
-                            {String(record.recent_decision.created_at || '').slice(5, 10)} ·{' '}
-                            {record.recent_decision.human_decision_label}
-                            {record.recent_decision.current_quote === null
-                              ? ''
-                              : ` · 实际报价 ${formatPrice(record.recent_decision.current_quote)}`}
-                          </Typography.Text>
-                          {/* P5：轻量事实展示（是否已关联投放结果 / CPM30 状态），不参与 P1 分组与排序 */}
-                          <Typography.Text type="secondary">
-                            结果：
-                            {record.recent_decision.outcome
-                              ? `已关联 · CPM30${OUTCOME_CPM_SHORT_LABELS[record.recent_decision.outcome.target_cpm_status] || ''}`
-                              : '尚未关联'}
-                          </Typography.Text>
-                        </>
-                      ) : (
-                        <Typography.Text type="secondary">暂无决策记录</Typography.Text>
-                      )}
-                    </Space>
-                  ) : (
-                    <Typography.Text type="secondary">近期表现：尚未更新</Typography.Text>
-                  )}
-                  {/* Alpha.3-02：详情层轻量展示最近一次实际合作价（不做价格分析） */}
-                  <div style={{ marginTop: 6 }}>
-                    <Typography.Text type="secondary">
-                      最近一次实际合作价：{formatLastActualCostValue(record.last_actual_cost)}
-                    </Typography.Text>
-                  </div>
-                  <div style={{ marginTop: 8 }}>
-                    <Button size="small" type="primary" onClick={() => onOpenAssistant?.(value)}>
-                      {snapshot ? '重新更新' : '更新近期表现'}
-                    </Button>
-                  </div>
-                  <div style={{ marginTop: 6 }}>
-                    <Space size={8} wrap>
-                      <Button size="small" onClick={() => onOpenDecision?.(record, 'record')}>
-                        记录决策
-                      </Button>
-                      <Button size="small" type="link" onClick={() => onOpenDecision?.(record, 'history')}>
-                        查看决策记录
-                      </Button>
-                    </Space>
-                  </div>
-                </div>
-              }
-            >
-              <a style={{ display: 'inline-block', maxWidth: '100%', fontWeight: 600 }}>
-                <span style={{ display: 'block', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                  {value}
-                </span>
-              </a>
-            </Popover>
-            {/* 达人类型：保留数据能力，降级为次级文字 */}
-            <div
-              style={{
-                ...SECONDARY_TEXT_STYLE,
-                whiteSpace: 'nowrap',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis'
-              }}
-            >
-              {record.creator_type || '未分类'}
-            </div>
+      render: (value, record) => (
+        <div style={{ minWidth: 0 }}>
+          {/* Alpha.3-05：点击达人昵称打开「达人判断工作区」大 Drawer（原窄 Popover 已移除） */}
+          <a
+            style={{
+              fontWeight: 600,
+              display: 'block',
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis'
+            }}
+            onClick={() => onOpenWorkspace?.(value)}
+          >
+            {value}
+          </a>
+          {/* 达人类型：保留数据能力，降级为次级文字 */}
+          <div
+            style={{
+              ...SECONDARY_TEXT_STYLE,
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis'
+            }}
+          >
+            {record.creator_type || '未分类'}
           </div>
-        )
-      }
+        </div>
+      )
     },
     {
       title: '近期表现',
@@ -293,7 +167,10 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
             ))}
             {/* 还有未确认类型的内容时，给一个轻量入口（复用现有「更新近期表现」，不新增编辑器） */}
             {cell.unknownCount > 0 && (
-              <a style={SECONDARY_TEXT_STYLE} onClick={() => onOpenAssistant?.(record.creator)}>
+              <a
+                style={SECONDARY_TEXT_STYLE}
+                onClick={() => onOpenAssistant?.(record.creator, 'classify_existing')}
+              >
                 补充分类
               </a>
             )}
@@ -456,6 +333,8 @@ export default function RepurchaseRadar() {
   const [assistantOpen, setAssistantOpen] = useState(false)
   // P2B：助手绑定的雷达达人（从行内入口进入时固定；header 入口为空需用户选择）
   const [assistantCreator, setAssistantCreator] = useState(null)
+  // Alpha.3-04B：助手模式（update = 更新近期表现 / classify_existing = 只补内容分类）
+  const [assistantMode, setAssistantMode] = useState('update')
   const [confirmedDraft, setConfirmedDraft] = useState(null)
   // P4：决策记录抽屉状态
   const [decisionOpen, setDecisionOpen] = useState(false)
@@ -465,6 +344,8 @@ export default function RepurchaseRadar() {
   const [filters, setFilters] = useState(EMPTY_RADAR_FILTERS)
   // Alpha.3-03：分组折叠状态（纯组件内状态，刷新即回到「全部展开」；不写库 / 不写存储）
   const [collapsedGroups, setCollapsedGroups] = useState(DEFAULT_COLLAPSED_GROUPS)
+  // Alpha.3-05：达人判断工作区（记录达人名称，数据始终取最新 Radar 结果，保存后自动同步刷新）
+  const [workspaceCreator, setWorkspaceCreator] = useState(null)
 
   const loadRadar = useCallback(async () => {
     setLoading(true)
@@ -496,18 +377,25 @@ export default function RepurchaseRadar() {
   const totalCount = summary?.creator_count ?? 0
   // 达人选择器（近期表现助手）始终基于全量达人，不受检索影响
   const creatorOptions = groups.flatMap((group) => group.creators.map((item) => item.creator))
-  const openAssistant = (creatorName) => {
+  const openAssistant = (creatorName, mode = 'update') => {
     setAssistantCreator(creatorName || null)
+    setAssistantMode(mode)
     setAssistantOpen(true)
   }
-  // P4：决策记录抽屉（「记录决策」/「查看决策记录」都从行内 Popover 进入）
+  // P4：决策记录抽屉（「记录决策」/「查看决策记录」从达人判断工作区进入）
   const openDecision = (creatorItem, view = 'record') => {
     setDecisionCreatorItem(creatorItem)
     setDecisionView(view)
     setDecisionOpen(true)
   }
+  // Alpha.3-05：达人判断工作区（宽度约 75% 页面宽度）
+  const openWorkspace = (creatorName) => setWorkspaceCreator(creatorName || null)
+  // 工作区数据始终从最新 Radar 结果里解析：保存近期表现 / 决策后 loadRadar() 会自动同步刷新
+  const workspaceItem = workspaceCreator
+    ? groups.flatMap((group) => group.creators).find((item) => item.creator === workspaceCreator) || null
+    : null
   // 目标 CPM 一律取后端返回值（唯一来源在 backend/utils/creatorBusinessRules.js），前端不持有字面量
-  const columns = buildRadarColumns(targetCpm, openAssistant, openDecision)
+  const columns = buildRadarColumns(targetCpm, openAssistant, openDecision, openWorkspace)
   const statisticCardStyle = { height: '100%', minHeight: 96 }
 
   return (
@@ -592,6 +480,7 @@ export default function RepurchaseRadar() {
         open={assistantOpen}
         creator={assistantCreator}
         creatorOptions={creatorOptions}
+        mode={assistantMode}
         onCancel={() => setAssistantOpen(false)}
         onConfirmed={(draft) => setConfirmedDraft(draft)}
         onSaved={() => {
@@ -606,9 +495,18 @@ export default function RepurchaseRadar() {
         initialView={decisionView}
         onClose={() => setDecisionOpen(false)}
         onSaved={() => {
-          // 保存决策后单次重拉雷达，让 Popover 的「最近决策」立即更新（不改变 P1 任何字段）
+          // 保存决策后单次重拉雷达，让工作区 / 主表的「最近决策」立即更新（不改变 P1 任何字段）
           loadRadar()
         }}
+      />
+
+      {/* Alpha.3-05：达人判断工作区（点击达人昵称打开；复用上面两个已有组件做数据更新） */}
+      <CreatorWorkspaceDrawer
+        open={Boolean(workspaceItem)}
+        creatorItem={workspaceItem}
+        onClose={() => setWorkspaceCreator(null)}
+        onOpenAssistant={openAssistant}
+        onOpenDecision={openDecision}
       />
 
       {loadError && (

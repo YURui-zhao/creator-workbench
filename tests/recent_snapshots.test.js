@@ -1334,6 +1334,208 @@ async function main() {
         )
     )
 
+    console.log('\n===== 16. Alpha.3-04B：补充分类（classify_existing）闭环 =====')
+    const CLASSIFY_CREATOR = '分类闭环达人'
+    insertRecord.run('2026-W38', CLASSIFY_CREATOR, '数码', 5000, '2026-09-12', 20000, 100000)
+    // 旧快照：全部未分类（模拟 Radar 上的「N条内容待分类」），含 1 条 unresolved + 1 条 excluded
+    const classifyPlays = [
+      { raw_text: '40000', normalized_play: 40000, needs_review: false, excluded: false, source_image_index: 1, position_index: 1 },
+      { raw_text: '50000', normalized_play: 50000, needs_review: false, excluded: false, source_image_index: 1, position_index: 2 },
+      { raw_text: '60000', normalized_play: 60000, needs_review: false, excluded: false, source_image_index: 1, position_index: 3 },
+      { raw_text: '20000', normalized_play: 20000, needs_review: false, excluded: false, source_image_index: 1, position_index: 4 },
+      { raw_text: '30000', normalized_play: 30000, needs_review: false, excluded: false, source_image_index: 1, position_index: 5 },
+      { raw_text: '面议', normalized_play: null, needs_review: true, excluded: false, source_image_index: 1, position_index: 6 },
+      { raw_text: '70000', normalized_play: 70000, needs_review: false, excluded: true, source_image_index: 1, position_index: 7 }
+    ]
+    const classifyValues = [40000, 50000, 60000, 20000, 30000]
+    const classifyStats = stats.computeRecentPerformanceStats(classifyValues)
+    const classifyOldId = Number(
+      db
+        .prepare(
+          `INSERT INTO creator_recent_snapshots (
+             creator, source_type, plays_json, recognized_count, valid_count, excluded_count,
+             unresolved_count, analysis_count, median_play, p25_play, p75_play,
+             recent_median_play, prior_median_play, trend_ratio, trend_label,
+             stats_status, stats_version, created_at, observed_at
+           ) VALUES (?, 'screenshot', ?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-09-28 09:00:00', '2026-09-28')`
+        )
+        .run(
+          CLASSIFY_CREATOR,
+          JSON.stringify(classifyPlays),
+          classifyPlays.length,
+          classifyStats.valid_count,
+          classifyStats.analysis_count,
+          classifyStats.median_play,
+          classifyStats.p25_play,
+          classifyStats.p75_play,
+          classifyStats.recent_median_play,
+          classifyStats.prior_median_play,
+          classifyStats.trend_ratio,
+          classifyStats.trend_label,
+          classifyStats.stats_status,
+          stats.STATS_VERSION
+        ).lastInsertRowid
+    )
+    const classifyOldPlaysJson = db
+      .prepare('SELECT plays_json FROM creator_recent_snapshots WHERE id = ?')
+      .get(classifyOldId).plays_json
+
+    // ---- 1) 入口读取 latest snapshot（现有 GET /latest 已足够，无需新增 API）----
+    const classifyLatest = await latest(CLASSIFY_CREATOR)
+    const classifySnapshot = classifyLatest.data.snapshot
+    check(
+      'I1 补充分类入口可读到 latest snapshot 的完整已有事实（plays / raw_text / normalized / excluded / needs_review / observed_at / 星图价原文）',
+      classifyLatest.status === 200 &&
+        classifySnapshot.id === classifyOldId &&
+        classifySnapshot.plays.length === classifyPlays.length &&
+        classifySnapshot.plays.every((play) => play.content_type === 'unknown') &&
+        classifySnapshot.observed_at === '2026-09-28' &&
+        'xingtu_price_raw' in classifySnapshot &&
+        classifySnapshot.plays[5].normalized_play === null &&
+        classifySnapshot.plays[6].excluded === true
+    )
+
+    // ---- 2) 预加载草稿：只改 content_type ----
+    const classifyDraft0 = draftLib.buildDraftFromSnapshot(classifySnapshot)
+    check(
+      'I2 草稿继承全部已有事实（顺序 / raw_text / normalized_play / excluded / needs_review / observed_at）',
+      classifyDraft0.mode === 'classify_existing' &&
+        classifyDraft0.source_snapshot_id === classifyOldId &&
+        classifyDraft0.observed_at === '2026-09-28' &&
+        classifyDraft0.plays.length === classifyPlays.length &&
+        JSON.stringify(classifyDraft0.plays.map((play) => play.raw_text)) ===
+          JSON.stringify(classifyPlays.map((play) => play.raw_text)) &&
+        JSON.stringify(classifyDraft0.plays.map((play) => play.normalized_play)) ===
+          JSON.stringify(classifyPlays.map((play) => play.normalized_play)) &&
+        classifyDraft0.plays[6].excluded === true &&
+        classifyDraft0.plays[5].needs_review === true &&
+        classifyDraft0.plays.every((play) => play.content_type === 'unknown')
+    )
+    let classifyDraft = classifyDraft0
+    for (const index of [0, 1, 2]) {
+      classifyDraft = draftLib.updatePlayContentType(
+        classifyDraft,
+        classifyDraft.plays[index].id,
+        'sponsored'
+      )
+    }
+    for (const index of [3, 4]) {
+      classifyDraft = draftLib.updatePlayContentType(
+        classifyDraft,
+        classifyDraft.plays[index].id,
+        'organic'
+      )
+    }
+    const classifyPayload = saveLib.buildSnapshotPayload(classifyDraft, {
+      creator: CLASSIFY_CREATOR,
+      identityConfirmed: true,
+      observedAt: classifyDraft.observed_at
+    })
+    check(
+      'I3 保存 payload 只改了 content_type：播放量与顺序完全一致，observed_at 继承旧快照',
+      classifyPayload.observed_at === '2026-09-28' &&
+        classifyPayload.creator === CLASSIFY_CREATOR &&
+        classifyPayload.identity_confirmed === true &&
+        classifyPayload.plays.length === classifyPlays.length &&
+        JSON.stringify(classifyPayload.plays.map((play) => play.raw_text)) ===
+          JSON.stringify(classifyPlays.map((play) => play.raw_text)) &&
+        JSON.stringify(classifyPayload.plays.map((play) => play.excluded)) ===
+          JSON.stringify(classifyPlays.map((play) => play.excluded)) &&
+        JSON.stringify(classifyPayload.plays.map((play) => play.content_type)) ===
+          JSON.stringify(['sponsored', 'sponsored', 'sponsored', 'organic', 'organic', 'unknown', 'unknown'])
+    )
+
+    // ---- 3) append-only 保存 ----
+    const classifySaved = await save(classifyPayload)
+    const classifyNewRow = db
+      .prepare('SELECT * FROM creator_recent_snapshots WHERE id = ?')
+      .get(classifySaved.data.id)
+    const classifyNewPlays = JSON.parse(classifyNewRow.plays_json)
+    check(
+      'I4 保存创建了 NEW snapshot（旧 snapshot id 不变、内容一字未改）',
+      classifySaved.status === 200 &&
+        classifySaved.data.id !== classifyOldId &&
+        db.prepare('SELECT plays_json FROM creator_recent_snapshots WHERE id = ?').get(classifyOldId)
+          .plays_json === classifyOldPlaysJson &&
+        db.prepare('SELECT COUNT(*) AS n FROM creator_recent_snapshots WHERE creator = ?').get(CLASSIFY_CREATOR).n === 2
+    )
+    check(
+      'I5 新快照的播放事实与旧快照逐条一致（raw_text / normalized_play / excluded / needs_review / 顺序）',
+      classifyNewPlays.length === classifyPlays.length &&
+        classifyNewPlays.every((play, index) => {
+          const old = classifyPlays[index]
+          return (
+            play.raw_text === old.raw_text &&
+            play.normalized_play === old.normalized_play &&
+            play.excluded === old.excluded &&
+            play.needs_review === old.needs_review &&
+            play.source_image_index === old.source_image_index &&
+            play.position_index === old.position_index
+          )
+        }) &&
+        JSON.stringify(classifyNewPlays.map((play) => play.content_type)) ===
+          JSON.stringify(['sponsored', 'sponsored', 'sponsored', 'organic', 'organic', 'unknown', 'unknown'])
+    )
+    check(
+      'I6 observed_at 继承旧快照（不是今天），created_at 为新记录时间',
+      classifyNewRow.observed_at === '2026-09-28' &&
+        classifyNewRow.observed_at ===
+          db.prepare('SELECT observed_at FROM creator_recent_snapshots WHERE id = ?').get(classifyOldId).observed_at &&
+        classifyNewRow.created_at !==
+          db.prepare('SELECT created_at FROM creator_recent_snapshots WHERE id = ?').get(classifyOldId).created_at &&
+        String(classifyNewRow.created_at) >= '2026-09-28 09:00:00'
+    )
+    check(
+      'I7 整体统计不漂移（median / P25 / P75 / trend 与新快照相同口径，逐字段一致）',
+      classifyNewRow.valid_count === classifyStats.valid_count &&
+        classifyNewRow.median_play === classifyStats.median_play &&
+        classifyNewRow.p25_play === classifyStats.p25_play &&
+        classifyNewRow.p75_play === classifyStats.p75_play &&
+        classifyNewRow.trend_label === classifyStats.trend_label &&
+        classifyNewRow.median_play ===
+          db.prepare('SELECT median_play FROM creator_recent_snapshots WHERE id = ?').get(classifyOldId).median_play
+    )
+    check(
+      'I8 内容分类统计立即生效（商单 3 条中位 5万 / 日常 2 条中位 2.5万；余下 2 条是 excluded / unresolved，不计入任何分组）',
+      classifySaved.data.sponsored_count === 3 &&
+        classifySaved.data.sponsored_median_play === 50000 &&
+        classifySaved.data.organic_count === 2 &&
+        classifySaved.data.organic_median_play === 25000 &&
+        classifySaved.data.unknown_count === 0 &&
+        classifySaved.data.sponsored_count +
+          classifySaved.data.organic_count +
+          classifySaved.data.unknown_count ===
+          classifySaved.data.valid_count
+    )
+
+    // ---- 4) latest 与 Radar 立即更新 ----
+    const classifyLatestAfter = await latest(CLASSIFY_CREATOR)
+    const radarClassifyAfter = await radar()
+    const radarClassifyItem = radarClassifyAfter.data.groups
+      .flatMap((group) => group.creators)
+      .find((item) => item.creator === CLASSIFY_CREATOR)
+    check(
+      'I9 latest 选中新快照（同一 observed_at 下 created_at / id 更晚者优先，规则未改）',
+      classifyLatestAfter.data.snapshot.id === classifySaved.data.id &&
+        classifyLatestAfter.data.snapshot.sponsored_count === 3 &&
+        classifyLatestAfter.data.snapshot.organic_count === 2
+    )
+    check(
+      'I10 Radar / Creator Workspace 立即拿到新分类（不再是「待分类」）',
+      radarClassifyItem?.recent_snapshot?.id === classifySaved.data.id &&
+        radarClassifyItem.recent_snapshot.sponsored_count === 3 &&
+        radarClassifyItem.recent_snapshot.sponsored_median_play === 50000 &&
+        radarClassifyItem.recent_snapshot.organic_count === 2 &&
+        radarClassifyItem.recent_snapshot.organic_median_play === 25000 &&
+        radarClassifyItem.recent_snapshot.unknown_count === 0 &&
+        radarClassifyItem.recent_snapshot.median_play === classifyStats.median_play
+    )
+    check(
+      'I11 补充分类全程 0 次 AI / 外部网络调用（只读 latest + 保存快照）',
+      networkGuard.blocked.length === 0,
+      JSON.stringify(networkGuard.blocked)
+    )
+
     console.log('\n===== 13. 无 AI / 无网络 / 只读实现 =====')
     const routeSource = fs.readFileSync(path.join(root, 'backend/routes/recentSnapshots.js'), 'utf8')
     check('P2B 路由不引用任何 AI 服务', !/deepseek|callProviderVision|extract-creator-screenshot/i.test(routeSource))

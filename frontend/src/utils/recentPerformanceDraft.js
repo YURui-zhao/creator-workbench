@@ -116,6 +116,50 @@ export function buildDraftFromManualPlays(rawLines = [], { priceRaw = '' } = {})
   }
 }
 
+/**
+ * Alpha.3-04B「补充分类」：把已保存的 latest snapshot 还原成草稿
+ *
+ * 关键约束（系统已经知道的事实，不要求用户重新输入）：
+ *   · 播放量原文 / 归一化值 / 排除标记 / needs_review / 顺序 全部原样继承
+ *   · observed_at、星图价原文 一并继承（补分类不是一次新的观察）
+ *   · 第一版只允许用户修改 content_type（商单 / 日常 / 未识别）
+ * 数据来源：GET /api/recent-snapshots/latest 返回的 public snapshot（无需新增 API）
+ */
+export function buildDraftFromSnapshot(snapshot) {
+  const rawPlays = Array.isArray(snapshot?.plays) ? snapshot.plays.slice(0, MAX_DRAFT_PLAYS) : []
+  const plays = rawPlays.map((item, index) => {
+    const value = item?.normalized_play
+    return {
+      id: `play-${index + 1}`,
+      raw_text: toRawText(item?.raw_text) ?? '',
+      normalized_play: Number.isFinite(Number(value)) && value !== null ? Number(value) : null,
+      needs_review: item?.needs_review === true,
+      reason: null,
+      excluded: item?.excluded === true,
+      content_type: normalizeContentType(item?.content_type),
+      source_image_index: Number.isInteger(item?.source_image_index) ? item.source_image_index : null,
+      position_index: Number.isInteger(item?.position_index) ? item.position_index : index + 1
+    }
+  })
+  const priceRaw = toRawText(snapshot?.xingtu_price_raw) || ''
+  const price = parsePriceText(priceRaw)
+  return {
+    mode: 'classify_existing',
+    source_snapshot_id: snapshot?.id ?? null,
+    // 观察日期继承旧快照（绝不改成今天）
+    observed_at: snapshot?.observed_at ?? null,
+    provider: null,
+    model: null,
+    creator_name: toRawText(snapshot?.recognized_creator_name_raw) || '',
+    xingtu_price_raw: priceRaw,
+    xingtu_price: snapshot?.xingtu_price ?? price.value,
+    xingtu_price_needs_review: price.needs_review,
+    xingtu_price_reason: price.reason,
+    plays,
+    warnings: []
+  }
+}
+
 /** 人工修改星图刊例价原文 -> 立即按确定性规则重新换算 */
 export function updatePriceRawText(draft, rawText) {
   const text = String(rawText ?? '')

@@ -26,7 +26,7 @@ import {
   SendOutlined
 } from '@ant-design/icons'
 import { extractCreatorScreenshot, getAiStatus } from '../api/ai'
-import { saveRecentSnapshot } from '../api/recentSnapshots'
+import { getLatestRecentSnapshot, saveRecentSnapshot } from '../api/recentSnapshots'
 import { getAiConfig } from '../utils/aiConfig.js'
 import { getErrorMessage } from '../utils/request'
 import { formatInteger, formatPlays } from '../utils/format'
@@ -58,6 +58,7 @@ import {
 } from '../utils/screenshotImage.js'
 import {
   buildDraftFromManualPlays,
+  buildDraftFromSnapshot,
   buildConfirmedDraft,
   buildDraftFromExtraction,
   splitManualPlayLines,
@@ -88,7 +89,9 @@ export default function RecentPerformanceAssistantModal({
   onConfirmed,
   onSaved,
   creator = null,
-  creatorOptions = []
+  creatorOptions = [],
+  // Alpha.3-04B：'update'（更新近期表现，全能力）/ 'classify_existing'（只补内容分类）
+  mode = 'update'
 }) {
   const [images, setImages] = useState([])
   const [preparing, setPreparing] = useState(false)
@@ -115,6 +118,10 @@ export default function RecentPerformanceAssistantModal({
   const [savedSnapshot, setSavedSnapshot] = useState(null)
   const [aiStatus, setAiStatus] = useState({ checked: false, available: false, visionModel: null, visionAvailable: false, providerLabel: '' })
   const [dragging, setDragging] = useState(false)
+  // Alpha.3-04B：补充分类模式（预加载已有快照；只允许改 content_type）
+  const [classifyLoading, setClassifyLoading] = useState(false)
+  const [classifyError, setClassifyError] = useState('')
+  const isClassifyMode = mode === 'classify_existing'
   const inputRef = useRef(null)
   // 并发保护：识别进行中禁止重复点击（同一次请求不会被叠加）
   const aiInFlightRef = useRef(false)
@@ -127,11 +134,48 @@ export default function RecentPerformanceAssistantModal({
     setObservedAt(todayLocalDateOnly())
     setSaveError('')
     setSavedSnapshot(null)
-  }, [open, creator])
+    setClassifyError('')
+    setClassifyLoading(false)
+    setDraft(null)
+    setConfirmed(null)
+    if (mode !== 'classify_existing') return
+    // Alpha.3-04B：补充分类 —— 直接读取该达人 latest snapshot，预加载已有播放数据
+    const targetCreator = String(creator ?? '').trim()
+    if (!targetCreator) {
+      setClassifyError('未找到可补充分类的近期快照')
+      return
+    }
+    let active = true
+    setClassifyLoading(true)
+    getLatestRecentSnapshot(targetCreator)
+      .then((res) => {
+        if (!active) return
+        const snapshot = res?.data?.snapshot || null
+        if (!snapshot || !Array.isArray(snapshot.plays) || snapshot.plays.length === 0) {
+          setClassifyError('未找到可补充分类的近期快照')
+          return
+        }
+        const nextDraft = buildDraftFromSnapshot(snapshot)
+        setDraft(nextDraft)
+        // observation 日期继承旧快照（补分类不是一次新的观察）
+        if (isValidDateOnly(nextDraft.observed_at)) setObservedAt(nextDraft.observed_at)
+      })
+      .catch(() => {
+        if (active) setClassifyError('未找到可补充分类的近期快照')
+      })
+      .finally(() => {
+        if (active) setClassifyLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [open, creator, mode])
 
   // 打开时读取 AI 状态（只查后端环境变量与固定 vision 模型，不发送 Key/图片）
   useEffect(() => {
     if (!open) return
+    // Alpha.3-04B：补充分类模式不需要任何 AI 能力（也不探测 AI 状态）
+    if (isClassifyMode) return
     let active = true
     getAiStatus()
       .then((res) => {
@@ -180,6 +224,46 @@ export default function RecentPerformanceAssistantModal({
     if (aiLoading) return
     resetAll()
     onCancel?.()
+  }
+
+  /**
+   * Alpha.3-04B「补充分类」保存：append-only
+   * - 播放量 / raw_text / excluded / 顺序 全部来自旧快照（只读，用户没改过）
+   * - 只替换用户本次确认的 content_type
+   * - observed_at 继承旧快照（补分类不是一次新的观察）
+   * - 不发 AI、不写旧快照；新增一条 status/price 等事实继承的新快照
+   */
+  const handleClassifySave = async () => {
+    if (saving) return
+    if (!draft || !Array.isArray(draft.plays) || draft.plays.length === 0) {
+      message.warning('未找到可补充分类的近期快照')
+      return
+    }
+    if (!boundCreator) {
+      message.warning('缺少达人信息，无法保存分类')
+      return
+    }
+    setSaving(true)
+    setSaveError('')
+    try {
+      const res = await saveRecentSnapshot(
+        buildSnapshotPayload(draft, {
+          creator: boundCreator,
+          // 快照本来就属于该达人：身份核对沿用原快照事实，不再让用户重复确认
+          identityConfirmed: true,
+          observedAt: isValidDateOnly(draft.observed_at) ? draft.observed_at : ''
+        })
+      )
+      setSavedSnapshot(res?.data || null)
+      onSaved?.(res?.data || null)
+      message.success('内容分类已保存为新的快照')
+      // 补充分类保存成功后关闭该模式（Radar / 工作区由 onSaved → loadRadar 刷新）
+      onCancel?.()
+    } catch (error) {
+      setSaveError(getErrorMessage(error))
+    } finally {
+      setSaving(false)
+    }
   }
 
   const totalBytes = useMemo(
@@ -462,7 +546,7 @@ export default function RecentPerformanceAssistantModal({
 
   return (
     <Modal
-      title="近期表现助手"
+      title={isClassifyMode ? `${boundCreator || '达人'} · 补充内容分类` : '近期表现助手'}
       open={open}
       onCancel={handleClose}
       width={860}
@@ -470,6 +554,91 @@ export default function RecentPerformanceAssistantModal({
       footer={null}
       destroyOnClose
     >
+      {isClassifyMode ? (
+        <Space direction="vertical" size="middle" style={{ display: 'flex' }}>
+          <Alert
+            type="info"
+            showIcon
+            message="正在补充已有快照的内容分类"
+            description="已有播放数据不会被修改；只需确认每条内容属于商单、日常或未识别。保存后会新增一条快照，历史快照不会被改写。"
+          />
+          {classifyError ? (
+            <Alert type="warning" showIcon message={classifyError} />
+          ) : classifyLoading ? (
+            <Spin />
+          ) : (
+            <>
+              <Space size={12} wrap>
+                <Typography.Text type="secondary">达人：{boundCreator}</Typography.Text>
+                <Typography.Text type="secondary">
+                  数据观察日期：{isValidDateOnly(observedAt) ? observedAt : '观察日期未知'}（继承自原快照，不可修改）
+                </Typography.Text>
+                <Typography.Text type="secondary">作品数：{draft?.plays?.length ?? 0} 条</Typography.Text>
+              </Space>
+              <div>
+                {draft?.plays?.length === 0 ? (
+                  <Empty description="该快照没有可分类的作品" />
+                ) : (
+                  draft?.plays?.map((play, index) => (
+                    <div
+                      key={play.id}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 12,
+                        padding: '6px 0',
+                        borderBottom: '1px solid #f5f5f5',
+                        opacity: play.excluded ? 0.55 : 1
+                      }}
+                    >
+                      <Typography.Text type="secondary" style={{ width: 24 }}>
+                        {String(index + 1).padStart(2, '0')}
+                      </Typography.Text>
+                      {/* 播放量：已有事实，只读展示（不做输入框） */}
+                      <Typography.Text
+                        strong
+                        style={{ minWidth: 96, textDecoration: play.excluded ? 'line-through' : 'none' }}
+                      >
+                        {play.normalized_play === null ? play.raw_text || '需人工确认' : formatInteger(play.normalized_play)}
+                      </Typography.Text>
+                      <Typography.Text type="secondary" style={{ flex: 1, minWidth: 120 }}>
+                        {play.raw_text}
+                      </Typography.Text>
+                      {play.excluded && <Tag color="default">已排除</Tag>}
+                      {play.needs_review && <Tag color="warning">需人工确认</Tag>}
+                      <Select
+                        size="small"
+                        value={normalizeContentType(play.content_type)}
+                        options={CONTENT_TYPE_OPTIONS}
+                        style={{ width: 96 }}
+                        onChange={(value) =>
+                          applyDraftChange(updatePlayContentType(draft, play.id, value))
+                        }
+                      />
+                    </div>
+                  ))
+                )}
+              </div>
+              <Divider style={{ margin: '4px 0' }} />
+              <Space size={12} wrap>
+                <Button onClick={handleClose}>取消</Button>
+                <Button
+                  type="primary"
+                  loading={saving}
+                  disabled={!draft || (draft?.plays?.length ?? 0) === 0 || Boolean(classifyError)}
+                  onClick={handleClassifySave}
+                >
+                  保存分类
+                </Button>
+                <Typography.Text type="secondary">
+                  保存后会新增一条快照（append-only），原快照与播放数据保持不变。
+                </Typography.Text>
+              </Space>
+              {saveError && <Alert type="error" showIcon message={saveError} />}
+            </>
+          )}
+        </Space>
+      ) : (
       <Space direction="vertical" size="middle" style={{ display: 'flex' }}>
         <Typography.Text type="secondary">
           可以上传截图让 AI 识别，也可以直接手工录入播放量（无需 AI）。
@@ -1054,6 +1223,7 @@ export default function RecentPerformanceAssistantModal({
           </Button>
         </div>
       </Space>
+      )}
     </Modal>
   )
 }

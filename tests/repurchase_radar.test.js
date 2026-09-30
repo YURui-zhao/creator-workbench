@@ -1169,11 +1169,11 @@ async function main() {
       /比较|有效样本：\{formatInteger\(snapshot\.valid_count\)\}/.test(radarPageA3)
   )
   check(
-    'C11 操作入口与 Alpha.2 一致（Popover 内更新近期表现 / 记录决策 / 查看决策记录，未重构）',
-    /onOpenAssistant\?\.\(value\)/.test(radarPageA3) &&
-      /onOpenDecision\?\.\(record, 'record'\)/.test(radarPageA3) &&
-      /onOpenDecision\?\.\(record, 'history'\)/.test(radarPageA3) &&
-      /trigger="click"/.test(radarPageA3)
+    'C11 操作入口未重构：页面仍把「更新近期表现 / 记录决策」回调接到既有组件（Alpha.3-05 起入口在工作区）',
+      /onOpenAssistant=\{openAssistant\}/.test(radarPageA3) &&
+      /onOpenDecision=\{openDecision\}/.test(radarPageA3) &&
+      /const openAssistant = \(creatorName, mode = 'update'\) => \{/.test(radarPageA3) &&
+      /const openDecision = \(creatorItem, view = 'record'\) => \{/.test(radarPageA3)
   )
   check(
     'C12 未触碰后端：radar 页面与展示工具都不含业务阈值 / 计算（只做展示格式化）',
@@ -1288,9 +1288,14 @@ async function main() {
       rowLib.formatLastActualCostLabel(null) === '上次合作价暂无'
   )
   check(
-    'D10 前端接线：最近合作单元格第三行 + Popover 详情层（不新增与价格无关的列）',
+    'D10 前端接线：最近合作单元格第三行 + 工作区「历史表现」块（不新增与价格无关的列）',
     /\{formatLastActualCostLabel\(record\.last_actual_cost\)\}/.test(radarPageA3) &&
-      /最近一次实际合作价：\{formatLastActualCostValue\(record\.last_actual_cost\)\}/.test(radarPageA3) &&
+      /上次实际合作价/.test(
+        fs.readFileSync(path.join(REPO_ROOT, 'frontend/src/utils/workspaceSummary.js'), 'utf8')
+      ) &&
+      /formatLastActualCostValue\(creatorItem\.last_actual_cost\)/.test(
+        fs.readFileSync(path.join(REPO_ROOT, 'frontend/src/utils/workspaceSummary.js'), 'utf8')
+      ) &&
       // Alpha.3-04 另外新增了「商单 / 日常」列，这里只校验价格没有新增独立列
       !/title: '上次合作'/.test(radarPageA3) &&
       !/title: '实际合作价'/.test(radarPageA3)
@@ -1656,19 +1661,461 @@ async function main() {
     })
   )
   check(
-    'F11 第一屏「近期内容表现」列 + Popover 内容构成 + 轻量「补充分类」入口（近期表现列保留）',
+    'F11 第一屏「近期内容表现」列 + 工作区内容块 + 轻量「补充分类」入口（近期表现列保留）',
     /title: '近期内容表现'/.test(radarPageCT) &&
       /title: '近期表现'/.test(radarPageCT) &&
-      /内容构成/.test(radarPageCT) &&
       /buildContentPerformanceLines\(snapshot\)/.test(radarPageCT) &&
+      // Alpha.3-05：内容构成挪进达人判断工作区（同一文案工具，不重复实现）
+      /近期内容表现/.test(
+        fs.readFileSync(path.join(REPO_ROOT, 'frontend/src/components/CreatorWorkspaceDrawer.jsx'), 'utf8')
+      ) &&
+      /buildContentBlock/.test(
+        fs.readFileSync(path.join(REPO_ROOT, 'frontend/src/utils/workspaceSummary.js'), 'utf8')
+      ) &&
       // 「补充分类」复用现有入口，不新增编辑器 / API
       /补充分类/.test(radarPageCT) &&
-      /onOpenAssistant\?\.\(record\.creator\)/.test(radarPageCT) &&
+      /onOpenAssistant\?\.\(record\.creator, 'classify_existing'\)/.test(radarPageCT) &&
       // 文案集中在 useContentType 工具里（页面不自己拼中位/条数）
       /商单中位/.test(fs.readFileSync(path.join(REPO_ROOT, 'frontend/src/utils/contentType.js'), 'utf8')) &&
       !/商单中位/.test(radarPageCT) &&
       // 只用后端下发的字段，前端不重算商单中位数
       !/sponsored_median_play[\s\S]{0,60}[/*+-]/.test(radarPageCT)
+  )
+
+  console.log('\n===== 22. Alpha.3-05：达人判断工作区（大 Drawer）=====')
+  const workspaceLib = await import(
+    pathToFileURL(path.join(REPO_ROOT, 'frontend/src/utils/workspaceSummary.js')).href
+  )
+  const radarPageWs = fs.readFileSync(
+    path.join(REPO_ROOT, 'frontend/src/pages/RepurchaseRadar/index.jsx'),
+    'utf8'
+  )
+  const workspaceSrc = fs.readFileSync(
+    path.join(REPO_ROOT, 'frontend/src/components/CreatorWorkspaceDrawer.jsx'),
+    'utf8'
+  )
+
+  check(
+    'W1 Drawer 宽度约 70%–75%（1440 → 1080），最大不超过 1280',
+    workspaceLib.WORKSPACE_WIDTH_RATIO >= 0.7 &&
+      workspaceLib.WORKSPACE_WIDTH_RATIO <= 0.75 &&
+      workspaceLib.computeWorkspaceWidth(1440) === 1080 &&
+      workspaceLib.computeWorkspaceWidth(1280) === 960 &&
+      workspaceLib.computeWorkspaceWidth(2000) === workspaceLib.WORKSPACE_MAX_WIDTH,
+    JSON.stringify({
+      ratio: workspaceLib.WORKSPACE_WIDTH_RATIO,
+      w1440: workspaceLib.computeWorkspaceWidth(1440)
+    })
+  )
+  check(
+    'W2 窄屏降级为接近全宽（1024 仍 75%；900 以下退化为全宽）',
+    workspaceLib.computeWorkspaceWidth(1024) === 768 &&
+      workspaceLib.computeWorkspaceWidth(900) === 675 &&
+      workspaceLib.computeWorkspaceWidth(800) === 800 &&
+      workspaceLib.computeWorkspaceWidth(375) === 375
+  )
+  check(
+    'W3 页面不再有 Popover：达人昵称点击改为打开工作区',
+    !/from 'antd'[\s\S]{0,400}Popover/.test(radarPageWs) &&
+      !/<Popover/.test(radarPageWs) &&
+      /onClick=\{\(\) => onOpenWorkspace\?\.\(value\)\}/.test(radarPageWs) &&
+      /const openWorkspace = \(creatorName\) => setWorkspaceCreator\(creatorName \|\| null\)/.test(radarPageWs)
+  )
+  check(
+    'W4 工作区绑定当前达人，并从最新 Radar 结果解析（保存后可自动刷新）',
+    /const workspaceItem = workspaceCreator/.test(radarPageWs) &&
+      /\.find\(\(item\) => item\.creator === workspaceCreator\)/.test(radarPageWs) &&
+      /<CreatorWorkspaceDrawer/.test(radarPageWs) &&
+      /open=\{Boolean\(workspaceItem\)\}/.test(radarPageWs) &&
+      /creatorItem=\{workspaceItem\}/.test(radarPageWs) &&
+      /onOpenAssistant=\{openAssistant\}/.test(radarPageWs) &&
+      /onOpenDecision=\{openDecision\}/.test(radarPageWs)
+  )
+  check(
+    'W5 关闭工作区只清空工作区状态（不动搜索 / 筛选 / 折叠）',
+    /onClose=\{\(\) => setWorkspaceCreator\(null\)\}/.test(radarPageWs) &&
+      (radarPageWs.match(/setCollapsedGroups/g) || []).length === 2 &&
+      (radarPageWs.match(/setFilters\(EMPTY_RADAR_FILTERS\)/g) || []).length === 1
+  )
+
+  // ---- 信息映射（用真实 API 下发的 item 验证）----
+  const liveItem = pricedFlat.find((item) => item.creator === '价甲') || radarFlat[0]
+  const workspaceHistory = workspaceLib.buildHistoryBlock(liveItem)
+  const historyValue = (label) => workspaceHistory.find((row) => row.label === label)?.value
+  check(
+    'W6 历史表现块：历史投放次数 / 历史CPM中位 / 达标情况 / 最近合作 / 上次实际合作价 全部正确',
+    historyValue('历史投放') === `${liveItem.record_count} 次` &&
+      // 与 Radar 主表同一格式：CPM 保留 1 位小数
+      historyValue('历史CPM中位') ===
+        (liveItem.median_cpm === null ? '-' : Number(liveItem.median_cpm).toFixed(1)) &&
+      historyValue('达标情况') === `${liveItem.pass_count}/${liveItem.valid_cpm_count} 达标` &&
+      historyValue('最近合作') === liveItem.last_collaboration_date &&
+      historyValue('上次实际合作价') ===
+        (liveItem.last_actual_cost === null ? '暂无' : `¥${Number(liveItem.last_actual_cost).toLocaleString('zh-CN')}`),
+    JSON.stringify(workspaceHistory)
+  )
+  const typedWsItem = radarFlat.find((item) => item.creator === CT_CREATOR)
+  const workspaceRecent = workspaceLib.buildRecentBlock(typedWsItem)
+  const recentValue = (label) => workspaceRecent.rows.find((row) => row.label === label)?.value
+  check(
+    'W7 近期表现块：整体近期中位播放 / trend / 数据截至（口径与 Radar 列一致）',
+    recentValue('近期中位播放') === '4.0万' &&
+      recentValue('趋势') === '样本不足' &&
+      recentValue('数据截至') === typedWsItem.recent_snapshot.observed_at &&
+      recentValue('有效样本') === `${typedWsItem.recent_snapshot.valid_count} 条`,
+    JSON.stringify(workspaceRecent.rows)
+  )
+  const workspaceContent = workspaceLib.buildContentBlock(typedWsItem)
+  check(
+    'W8 近期内容表现块：商单 / 日常中位与条数、样本语义、待分类计数',
+    workspaceContent.rows.find((row) => row.label === '商单')?.value === '5.0万 · 3条' &&
+      workspaceContent.rows.find((row) => row.label === '日常')?.value === '3.0万 · 3条' &&
+      workspaceContent.rows.find((row) => row.label === '样本')?.value === '商单样本充足' &&
+      workspaceContent.rows.find((row) => row.label === '待分类')?.value === '0 条',
+    JSON.stringify(workspaceContent.rows)
+  )
+  check(
+    'W8b 旧快照 / 未分类：工作区显示「尚未确认」+「N 条待分类」（不是空表）',
+    (() => {
+      const legacyItem = radarFlat.find((item) => item.creator === CT_LEGACY)
+      const block = workspaceLib.buildContentBlock(legacyItem)
+      return (
+        block.rows.find((row) => row.label === '商单')?.value === '尚未确认' &&
+        block.rows.find((row) => row.label === '待分类')?.value === '6 条'
+      )
+    })()
+  )
+  const workspacePrice = workspaceLib.buildPriceBlock(typedWsItem)
+  const priceValue = (label) => workspacePrice.find((row) => row.label === label)?.value
+  check(
+    'W9 价格块：星图价 / 当前报价 / CPM30目标价 / 参考区间 全部复用既有字段',
+    priceValue('星图刊例价') === '暂无' &&
+      priceValue('当前报价') === '暂无' &&
+      priceValue('CPM30目标价') === '¥1,200' &&
+      priceValue('参考区间') === '¥1,125～¥1,275',
+    JSON.stringify(workspacePrice)
+  )
+  check(
+    'W10 最近决策块：无决策 → 轻量空状态「还没有记录决策」（不是错误态）',
+    workspaceLib.buildRecentDecisionBlock({}).empty === true &&
+      workspaceLib.buildRecentDecisionBlock({}).emptyText === '还没有记录决策' &&
+      /还没有记录决策/.test(workspaceSrc) === false // 文案来自工具，组件只渲染
+  )
+  check(
+    'W11 最近决策块：有决策 → 阶段 / 我的决定 / 实际报价 / 记录时间 / 投放结果',
+    (() => {
+      const block = workspaceLib.buildRecentDecisionBlock({
+        recent_decision: {
+          created_at: '2026-09-30 10:44:43',
+          decision_stage: 'post_quote',
+          human_decision: 'repurchase',
+          human_decision_label: '复投',
+          current_quote: 3000,
+          outcome: { target_cpm_status: 'met' }
+        }
+      })
+      const value = (label) => block.rows.find((row) => row.label === label)?.value
+      return (
+        block.empty === false &&
+        value('阶段') === '已拿到报价' &&
+        value('我的决定') === '复投' &&
+        value('实际报价') === '¥3,000' &&
+        value('记录时间') === '2026-09-30 10:44' &&
+        value('投放结果') === '已关联投放结果 · CPM30已达标'
+      )
+    })()
+  )
+  check(
+    'W12 工作区结构：4 个摘要块 + 价格判断 + 最近决策 + 主操作 footer（复用既有组件）',
+    /title="达人判断工作区"/.test(workspaceSrc) === false &&
+      /<Drawer/.test(workspaceSrc) &&
+      /buildHistoryBlock/.test(workspaceSrc) &&
+      /buildRecentBlock/.test(workspaceSrc) &&
+      /buildContentBlock/.test(workspaceSrc) &&
+      /buildPriceBlock/.test(workspaceSrc) &&
+      /buildRecentDecisionBlock/.test(workspaceSrc) &&
+      /buildCorePriceRows\(snapshot\.pricing\)/.test(workspaceSrc) &&
+      /buildNegotiationReferenceRows\(snapshot\?\.pricing\)/.test(workspaceSrc) &&
+      /buildPriceConclusion\(snapshot\?\.pricing\)/.test(workspaceSrc) &&
+      /更新近期表现/.test(workspaceSrc) &&
+      /记录决策/.test(workspaceSrc) &&
+      /查看决策记录/.test(workspaceSrc) &&
+      // 不复制业务逻辑、不新增请求
+      !/\/\s*1000|axios|fetch\(|from '\.\.\/api\//.test(workspaceSrc)
+  )
+  check(
+    'W13 Radar 主表未变：8 列 / 排序 / 分组 / 筛选 / 折叠 逻辑原样',
+    (radarPageWs.match(/title: '/g) || []).length === 8 &&
+      /title: '近期表现'/.test(radarPageWs) &&
+      /title: '近期内容表现'/.test(radarPageWs) &&
+      /title: '历史投放'/.test(radarPageWs) &&
+      /title: '历史CPM'/.test(radarPageWs) &&
+      /title: '最近合作 \/ 距今'/.test(radarPageWs) &&
+      /title: '历史状态'/.test(radarPageWs) &&
+      /title: '风险提示'/.test(radarPageWs) &&
+      /filterRadarGroups\(radar\?\.groups \|\| \[\], filters\)/.test(radarPageWs) &&
+      (radarPageWs.match(/getRepurchaseRadar\(/g) || []).length === 1
+  )
+
+  console.log('\n===== 23. Alpha.3-05A：价格判断区去重与收敛 =====')
+  const pricingLib = await import(
+    pathToFileURL(path.join(REPO_ROOT, 'backend/utils/creatorPricing.js')).href
+  )
+  const workspaceSrcPrice = fs.readFileSync(
+    path.join(REPO_ROOT, 'frontend/src/components/CreatorWorkspaceDrawer.jsx'),
+    'utf8'
+  )
+  const workspaceUtilSrc = fs.readFileSync(
+    path.join(REPO_ROOT, 'frontend/src/utils/workspaceSummary.js'),
+    'utf8'
+  )
+  // 用真实场景构造 pricing：星图 ¥20,000 + 中位播放 122.1万（= 截图里呆瓜小姐那条快照）
+  const samplePricing = pricingLib.computeCreatorPricing({
+    stats_status: 'ok',
+    median_play: 1221000,
+    p25_play: 900000,
+    p75_play: 1600000,
+    xingtu_price: 20000
+  })
+  const coreRows = workspaceLib.buildCorePriceRows(samplePricing)
+  const negotiationRows = workspaceLib.buildNegotiationReferenceRows(samplePricing)
+  const conclusion = workspaceLib.buildPriceConclusion(samplePricing)
+
+  check(
+    'X1 左侧只平铺 3 条核心价格事实（CPM30目标价 / 参考区间 / 星图刊例价）',
+    coreRows.map((row) => row.label).join(',') === 'CPM30目标价,CPM30参考区间,星图刊例价' &&
+      coreRows[0].value === `¥${Number(samplePricing.target_price).toLocaleString('zh-CN')}` &&
+      coreRows[1].value ===
+        `¥${Number(samplePricing.reference_low).toLocaleString('zh-CN')}～¥${Number(samplePricing.reference_high).toLocaleString('zh-CN')}` &&
+      coreRows[2].value === '¥20,000',
+    JSON.stringify(coreRows)
+  )
+  check(
+    'X2 默认不再平铺「进入参考区间」「CPM30目标」两条结论型行',
+    !coreRows.some((row) => row.label === '进入参考区间' || row.label === 'CPM30目标') &&
+      // 业务能力未删除：底层 buildPricingRows 仍产出这两行，只是不再默认展示
+      (() => {
+        const pricingSrc = fs.readFileSync(
+          path.join(REPO_ROOT, 'frontend/src/utils/pricingDisplay.js'),
+          'utf8'
+        )
+        return (
+          /label: '进入参考区间'/.test(pricingSrc) &&
+          /label: 'CPM30目标'/.test(pricingSrc) &&
+          /value: formatEntryDiscount\(pricing\)/.test(pricingSrc) &&
+          /value: formatTargetDiscount\(pricing\)/.test(pricingSrc)
+        )
+      })()
+  )
+  check(
+    'X3 谈价参考默认收起：折叠状态初始为 false，且未展开时不渲染这两行',
+    /const \[showNegotiationReference, setShowNegotiationReference\] = useState\(false\)/.test(
+      workspaceSrcPrice
+    ) &&
+      /showNegotiationReference && \(/.test(workspaceSrcPrice) &&
+      /展开谈价参考/.test(workspaceSrcPrice) &&
+      /收起谈价参考/.test(workspaceSrcPrice)
+  )
+  check(
+    'X4 展开后显示「可谈折扣区间 2～7折」+「对应价格区间」，复用既有结果不重算',
+    negotiationRows.length === 2 &&
+      negotiationRows[0].label === '可谈折扣区间' &&
+      negotiationRows[0].value === '2～7折' &&
+      negotiationRows[1].label === '对应价格区间' &&
+      negotiationRows[1].value ===
+        `¥${Number(samplePricing.negotiation_min_price).toLocaleString('zh-CN')}～¥${Number(samplePricing.negotiation_max_price).toLocaleString('zh-CN')}`,
+    JSON.stringify(negotiationRows)
+  )
+  check(
+    'X5 价格结论只有一条，且直接来自后端 pricing_status_label（前端不重算）',
+    conclusion.text === samplePricing.pricing_status_label &&
+      conclusion.status === samplePricing.pricing_status &&
+      /buildPriceConclusion\(snapshot\?\.pricing\)/.test(workspaceSrcPrice) &&
+      // 组件里只出现一次结论渲染
+      (workspaceSrcPrice.match(/\{conclusion\.text\}/g) || []).length === 1 &&
+      // 不再出现「进入参考区间 / CPM30目标」这类二次判断文案渲染
+      !/进入参考区间|CPM30目标</.test(workspaceSrcPrice)
+  )
+  check(
+    'X6 去掉重复提示：不再有「完整价格核算…在『记录决策』内」这类说明文字',
+    !/完整价格核算/.test(workspaceSrcPrice) &&
+      !/在「记录决策」内/.test(workspaceSrcPrice) &&
+      // 入口由 Drawer 底部主按钮承担（仍在）
+      /记录决策/.test(workspaceSrcPrice)
+  )
+  check(
+    'X7 无星图价（quote_missing）保持既有 unavailable 语义：无谈价参考行、结论用后端文案',
+    (() => {
+      const noPrice = pricingLib.computeCreatorPricing({
+        stats_status: 'ok',
+        median_play: 1221000,
+        p25_play: 900000,
+        p75_play: 1600000,
+        xingtu_price: null
+      })
+      const core = workspaceLib.buildCorePriceRows(noPrice)
+      return (
+        noPrice.pricing_status === 'quote_missing' &&
+        core[2].value === '暂无' &&
+        workspaceLib.buildNegotiationReferenceRows(noPrice).length === 0 &&
+        workspaceLib.buildPriceConclusion(noPrice).text === noPrice.pricing_status_label
+      )
+    })()
+  )
+  check(
+    'X8 样本不足（stats_insufficient）时不伪造区间，结论仍来自后端',
+    (() => {
+      const insufficient = pricingLib.computeCreatorPricing({
+        stats_status: 'insufficient',
+        median_play: null,
+        p25_play: null,
+        p75_play: null,
+        xingtu_price: 20000
+      })
+      return (
+        workspaceLib.buildCorePriceRows(insufficient).length === 2 &&
+        workspaceLib.buildNegotiationReferenceRows(insufficient).length === 0 &&
+        workspaceLib.buildPriceConclusion(insufficient).text === insufficient.pricing_status_label
+      )
+    })()
+  )
+  check(
+    'X9 未修改 pricing 计算逻辑：buildPricingRows 与 creatorPricing 均未改动（仅新增展示筛选）',
+    /export function buildPricingRows/.test(
+      fs.readFileSync(path.join(REPO_ROOT, 'frontend/src/utils/pricingDisplay.js'), 'utf8')
+    ) &&
+      !/pricing_status\s*=/.test(workspaceUtilSrc) &&
+      !/target_price\s*[*/+-]|reference_high\s*[*/+-]/.test(workspaceUtilSrc) &&
+      !/computeCreatorPricing/.test(workspaceUtilSrc)
+  )
+  check(
+    'X10 折叠状态是纯组件内状态：无 localStorage / 无 API / 无 schema 变更',
+    !/localStorage|sessionStorage|indexedDB/.test(workspaceSrcPrice) &&
+      !/axios|fetch\(|from '\.\.\/api\//.test(workspaceSrcPrice) &&
+      db.prepare('PRAGMA table_info(creator_recent_snapshots)').all().length === 23 &&
+      db.prepare('PRAGMA table_info(creator_records)').all().length === 12
+  )
+
+  console.log('\n===== 24. Alpha.3-04B：补充分类入口与模式（classify_existing）=====')
+  const assistantSrc = fs.readFileSync(
+    path.join(REPO_ROOT, 'frontend/src/components/RecentPerformanceAssistantModal.jsx'),
+    'utf8'
+  )
+  const draftLibSrc = fs.readFileSync(
+    path.join(REPO_ROOT, 'frontend/src/utils/recentPerformanceDraft.js'),
+    'utf8'
+  )
+  const radarPageClassify = fs.readFileSync(
+    path.join(REPO_ROOT, 'frontend/src/pages/RepurchaseRadar/index.jsx'),
+    'utf8'
+  )
+  // 取出 classify 分支 JSX，逐项核对「只显示什么 / 不显示什么」
+  const classifyStart = assistantSrc.indexOf('{isClassifyMode ? (')
+  const classifyEnd = assistantSrc.indexOf(') : (\n      <Space direction="vertical" size="middle"')
+  const classifyBlock = assistantSrc.slice(classifyStart, classifyEnd)
+
+  check(
+    'Y1 复用同一个助手组件：新增 mode 参数与 classify_existing 分支（未新建第二套 Modal）',
+    /mode = 'update'/.test(assistantSrc) &&
+      /const isClassifyMode = mode === 'classify_existing'/.test(assistantSrc) &&
+      classifyStart > 0 &&
+      classifyEnd > classifyStart &&
+      // 全项目只有一个近期表现助手组件文件
+      fs
+        .readdirSync(path.join(REPO_ROOT, 'frontend/src/components'))
+        .filter((name) => /RecentPerformance/i.test(name)).length === 1
+  )
+  check(
+    'Y2 预加载已有快照：读 latest snapshot → buildDraftFromSnapshot（无新增 API）',
+    /getLatestRecentSnapshot\(targetCreator\)/.test(assistantSrc) &&
+      /const nextDraft = buildDraftFromSnapshot\(snapshot\)/.test(assistantSrc) &&
+      /export function buildDraftFromSnapshot\(snapshot\)/.test(draftLibSrc) &&
+      // 复用既有 latest 接口，没有新增 http 调用
+      (assistantSrc.match(/getLatestRecentSnapshot\(/g) || []).length === 1
+  )
+  check(
+    'Y3 找不到快照时轻量报错并退出该模式，且不会创建空快照',
+    /setClassifyError\('未找到可补充分类的近期快照'\)/.test(assistantSrc) &&
+      /!snapshot \|\| !Array.isArray\(snapshot\.plays\) \|\| snapshot\.plays\.length === 0/.test(
+        assistantSrc
+      ) &&
+      /disabled=\{!draft \|\| \(draft\?\.plays\?\.length \?\? 0\) === 0 \|\| Boolean\(classifyError\)\}/.test(
+        assistantSrc
+      )
+  )
+  check(
+    'Y4 补充分类模式只渲染只读播放量 + 内容类型下拉（无上传 / 无 AI / 无手工录入 / 无星图价输入 / 无日期选择器）',
+    /· 补充内容分类/.test(assistantSrc) &&
+      /正在补充已有快照的内容分类/.test(classifyBlock) &&
+      /formatInteger\(play\.normalized_play\)/.test(classifyBlock) &&
+      /updatePlayContentType\(draft, play\.id, value\)/.test(classifyBlock) &&
+      /保存分类/.test(classifyBlock) &&
+      // 观察日期只读展示（继承自原快照，且明确标注不可修改）
+      /数据观察日期：/.test(classifyBlock) &&
+      /继承自原快照，不可修改/.test(classifyBlock) &&
+      !/inputRef|开始 AI 识别|entryMode === 'screenshot'|entryMode === 'manual'|handleStartRecognition/.test(
+        classifyBlock
+      ) &&
+      !/<DatePicker|updatePriceRawText/.test(classifyBlock) &&
+      !/排除该条|恢复该条/.test(classifyBlock) &&
+      !/manualText|splitManualPlayLines/.test(classifyBlock)
+  )
+  check(
+    'Y5 补充分类模式不探测 / 不调用 AI（AI 状态 effect 直接跳过）',
+    /if \(isClassifyMode\) return/.test(assistantSrc) &&
+      !/extractCreatorScreenshot/.test(classifyBlock) &&
+      // AI 调用点仍然只有一个（普通更新模式里）
+      (assistantSrc.match(/extractCreatorScreenshot\(/g) || []).length === 1
+  )
+  check(
+    'Y6 保存分类走 append-only：只替换 content_type，observed_at 继承旧快照',
+    /const handleClassifySave = async \(\) => \{/.test(assistantSrc) &&
+      /const res = await saveRecentSnapshot\(\s*buildSnapshotPayload\(draft, \{/.test(assistantSrc) &&
+      /identityConfirmed: true/.test(assistantSrc) &&
+      /observedAt: isValidDateOnly\(draft\.observed_at\) \? draft\.observed_at : ''/.test(assistantSrc) &&
+      // 没有 UPDATE 旧快照的任何前端写法
+      !/UPDATE creator_recent_snapshots|updateRecentSnapshot/.test(assistantSrc)
+  )
+  check(
+    'Y7 Radar 入口条件：有快照且 unknown_count > 0 才出现「补充分类」，点击进入 classify 模式',
+    /if \(!snapshot\) return PLACEHOLDER/.test(radarPageClassify) &&
+      /cell\.unknownCount > 0 && \(/.test(radarPageClassify) &&
+      /onOpenAssistant\?\.\(record\.creator, 'classify_existing'\)/.test(radarPageClassify) &&
+      /const openAssistant = \(creatorName, mode = 'update'\)/.test(radarPageClassify) &&
+      /mode=\{assistantMode\}/.test(radarPageClassify)
+  )
+  check(
+    'Y8 普通「更新近期表现」入口不受影响（仍为默认 update 模式 / 全能力）',
+    /onOpenAssistant\?\.\(value\)\)/u.test(radarPageClassify) === false &&
+      /onClick=\{\(\) => openAssistant\(null\)\}/.test(radarPageClassify) &&
+      /onOpenAssistant=\{openAssistant\}/.test(radarPageClassify) &&
+      // classify 模式复用同一套保存链（buildSnapshotPayload → saveRecentSnapshot）
+      /buildSnapshotPayload\(draft, \{/.test(assistantSrc) &&
+      // 普通模式的能力标记仍在（上传 / AI / 手工 / 观察日期 / 星图价 / 排除）
+      /entryMode === 'screenshot'/.test(assistantSrc) &&
+      /entryMode === 'manual'/.test(assistantSrc) &&
+      /开始 AI 识别/.test(assistantSrc) &&
+      /togglePlayExcluded\(draft, play\.id\)/.test(assistantSrc) &&
+      /数据观察日期/.test(assistantSrc) &&
+      /星图刊例价/.test(assistantSrc)
+  )
+  check(
+    'Y9 未新增 API / schema：路由仍只有 POST / 与 GET /latest，两表列数未变',
+    // 后端本轮零改动：快照表 23 列、投放记录表 12 列，latest 详情仍走既有 GET /latest
+    JSON.stringify(
+      (await import(pathToFileURL(path.join(REPO_ROOT, 'backend/routes/recentSnapshots.js')).href))
+        .default.stack.filter((layer) => layer.route)
+        .map((layer) => `${Object.keys(layer.route.methods)[0].toUpperCase()} ${layer.route.path}`)
+        .sort()
+    ) === JSON.stringify(['GET /latest', 'POST /']) &&
+      db.prepare('PRAGMA table_info(creator_recent_snapshots)').all().length === 23 &&
+      db.prepare('PRAGMA table_info(creator_records)').all().length === 12 &&
+      JSON.stringify(
+        db
+          .prepare('PRAGMA table_info(creator_recent_snapshots)')
+          .all()
+          .map((column) => column.name)
+      ).includes('plays_json')
   )
 }
 

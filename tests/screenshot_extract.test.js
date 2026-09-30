@@ -606,10 +606,14 @@ async function main() {
         !/handleParseManualPlays[\s\S]{0,400}extractCreatorScreenshot\(/.test(modalSource)
     )
     check(
-      'A3-8 手工与截图汇入同一条保存链（同一个 buildSnapshotPayload + 保存按钮）',
-      (modalSource.match(/buildSnapshotPayload\(/g) || []).length === 1 &&
+      'A3-8 手工与截图汇入同一条保存链（同一个 buildSnapshotPayload + 同一个保存接口）',
+      // Alpha.3-04B 起多了一个「补充分类」保存入口，但它同样复用 buildSnapshotPayload → saveRecentSnapshot，
+      // 不存在第二套保存链（不新增 API、不新增 payload 组装方式）。
+      (modalSource.match(/buildSnapshotPayload\(/g) || []).length === 2 &&
         /onClick=\{handleSave\}/.test(modalSource) &&
-        (modalSource.match(/saveRecentSnapshot\(/g) || []).length === 1
+        /onClick=\{handleClassifySave\}/.test(modalSource) &&
+        // 两个入口都只经过同一个 saveRecentSnapshot（无第二套保存渠道）
+        (modalSource.match(/saveRecentSnapshot\(/g) || []).length === 2
     )
 
     console.log('\n===== 11. 网络重定向边界（3xx 绝不跟随）=====')

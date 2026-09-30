@@ -86,6 +86,9 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS creator_recent_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     creator TEXT NOT NULL,
+    -- V3-alpha.3 Playbook Phase 1：候选达人稳定身份（candidate_id = creator_candidates.id）
+    -- NULL = 历史达人快照（身份沿用 creator 名称）；新候选人快照才写入 candidate_id。
+    candidate_id INTEGER,
     recognized_creator_name_raw TEXT,
     source_type TEXT NOT NULL DEFAULT 'screenshot',
     xingtu_price_raw TEXT,
@@ -194,6 +197,25 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_negotiation_cases_creator_created
     ON creator_negotiation_cases(creator, created_at);
+
+  -- V3-alpha.3 Playbook Phase 1：候选达人身份层（最小实现，不引入完整 creator master）
+  -- 说明：
+  --   · 稳定身份是 id，不是 name —— 因此 name 故意不设 UNIQUE（允许重名 / 改名）
+  --   · status 仅 active / archived；V0.1 不做 converted（转化由后续 decision → outcome → record 闭环处理）
+  --   · 不调用 AI、不自动创建 creator_record、不参与 Repurchase Radar（Radar 只读 creator_records）
+  CREATE TABLE IF NOT EXISTS creator_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    creator_type TEXT,
+    profile_url TEXT,
+    description TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_creator_candidates_status
+    ON creator_candidates(status);
 `)
 
 // V3-alpha.2 Sprint A1：为既有数据库安全补充 observed_at（数据观察日期）
@@ -209,6 +231,19 @@ if (!snapshotColumns.includes('observed_at')) {
   db.exec('ALTER TABLE creator_recent_snapshots ADD COLUMN observed_at TEXT')
   console.log('[db] 已为 creator_recent_snapshots 添加 observed_at 列（历史快照保持 NULL）')
 }
+
+// V3-alpha.3 Playbook Phase 1：为既有数据库安全补充 candidate_id（候选达人稳定身份）
+// 说明：
+//   · 只在列不存在时 ALTER TABLE，不覆盖任何已有快照
+//   · 旧快照（历史达人）保持 NULL，继续按 creator 名称归属；不自动回填任何 candidate
+//   · 索引必须在补列之后创建（老库此刻才有该列）
+if (!snapshotColumns.includes('candidate_id')) {
+  db.exec('ALTER TABLE creator_recent_snapshots ADD COLUMN candidate_id INTEGER')
+  console.log('[db] 已为 creator_recent_snapshots 添加 candidate_id 列（历史快照保持 NULL）')
+}
+db.exec(
+  'CREATE INDEX IF NOT EXISTS idx_recent_snapshots_candidate ON creator_recent_snapshots(candidate_id, created_at)'
+)
 
 // 首次启动写入示例项目（前端工作台展示用）
 const projectCount = db.prepare('SELECT COUNT(*) AS n FROM projects').get().n

@@ -5,6 +5,7 @@ import Dashboard from './pages/Dashboard'
 import CreatorSummary from './pages/CreatorSummary'
 import ImportHistory from './pages/ImportHistory'
 import RepurchaseRadar from './pages/RepurchaseRadar'
+import CreatorPlaybook from './pages/CreatorPlaybook'
 
 export default function App() {
   return (
@@ -25,6 +26,10 @@ export default function App() {
       {/* 复投雷达（V3-alpha P1） */}
       <Route path="/repurchase-radar" element={<MainLayout />}>
         <Route index element={<RepurchaseRadar />} />
+      </Route>
+      {/* 新达人判断（V3-alpha.3 Playbook Phase 1） */}
+      <Route path="/creator-playbook" element={<MainLayout />}>
+        <Route index element={<CreatorPlaybook />} />
       </Route>
       {/* 导入历史 */}
       <Route path="/import-history" element={<MainLayout />}>

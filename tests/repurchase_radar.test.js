@@ -1992,7 +1992,8 @@ async function main() {
     'X10 折叠状态是纯组件内状态：无 localStorage / 无 API / 无 schema 变更',
     !/localStorage|sessionStorage|indexedDB/.test(workspaceSrcPrice) &&
       !/axios|fetch\(|from '\.\.\/api\//.test(workspaceSrcPrice) &&
-      db.prepare('PRAGMA table_info(creator_recent_snapshots)').all().length === 23 &&
+      // Playbook Phase 1 新增 candidate_id（快照表 24 列）；creator_records 保持 12 列不变
+      db.prepare('PRAGMA table_info(creator_recent_snapshots)').all().length === 24 &&
       db.prepare('PRAGMA table_info(creator_records)').all().length === 12
   )
 
@@ -2070,9 +2071,11 @@ async function main() {
   check(
     'Y6 保存分类走 append-only：只替换 content_type，observed_at 继承旧快照',
     /const handleClassifySave = async \(\) => \{/.test(assistantSrc) &&
-      /const res = await saveRecentSnapshot\(\s*buildSnapshotPayload\(draft, \{/.test(assistantSrc) &&
+      // Playbook Phase 1 起 payload 先组装再按历史 / 候选分支提交；历史分支仍走既有 saveRecentSnapshot
+      /buildSnapshotPayload\(draft, \{/.test(assistantSrc) &&
       /identityConfirmed: true/.test(assistantSrc) &&
       /observedAt: isValidDateOnly\(draft\.observed_at\) \? draft\.observed_at : ''/.test(assistantSrc) &&
+      /await saveRecentSnapshot\(payload\)/.test(assistantSrc) &&
       // 没有 UPDATE 旧快照的任何前端写法
       !/UPDATE creator_recent_snapshots|updateRecentSnapshot/.test(assistantSrc)
   )
@@ -2101,14 +2104,15 @@ async function main() {
   )
   check(
     'Y9 未新增 API / schema：路由仍只有 POST / 与 GET /latest，两表列数未变',
-    // 后端本轮零改动：快照表 23 列、投放记录表 12 列，latest 详情仍走既有 GET /latest
+    // 历史 recent-snapshots 路由集合不变（候选路由在独立 router）；快照表 24 列（Playbook Phase 1 新增 candidate_id）、
+    // 投放记录表 12 列，latest 详情仍走既有 GET /latest
     JSON.stringify(
       (await import(pathToFileURL(path.join(REPO_ROOT, 'backend/routes/recentSnapshots.js')).href))
         .default.stack.filter((layer) => layer.route)
         .map((layer) => `${Object.keys(layer.route.methods)[0].toUpperCase()} ${layer.route.path}`)
         .sort()
     ) === JSON.stringify(['GET /latest', 'POST /']) &&
-      db.prepare('PRAGMA table_info(creator_recent_snapshots)').all().length === 23 &&
+      db.prepare('PRAGMA table_info(creator_recent_snapshots)').all().length === 24 &&
       db.prepare('PRAGMA table_info(creator_records)').all().length === 12 &&
       JSON.stringify(
         db

@@ -218,6 +218,8 @@ export function toPublicSnapshot(row) {
   return {
     id: row.id,
     creator: row.creator,
+    // V3-alpha.3 Playbook Phase 1：候选达人稳定身份（NULL = 历史达人快照）
+    candidate_id: row.candidate_id ?? null,
     recognized_creator_name_raw: row.recognized_creator_name_raw ?? null,
     source_type: row.source_type,
     xingtu_price_raw: row.xingtu_price_raw ?? null,
@@ -317,7 +319,8 @@ export function loadLatestSnapshotSummaries(creatorList = []) {
     .prepare(
       `SELECT ${MAKE_SUMMARY_COLUMNS}
        FROM creator_recent_snapshots
-       WHERE creator IN (${placeholders})
+       WHERE candidate_id IS NULL
+         AND creator IN (${placeholders})
        ${LATEST_SNAPSHOT_ORDER_SQL}`
     )
     .all(...creators)
@@ -331,23 +334,33 @@ function findCreatorRecord(creator) {
   return db.prepare('SELECT nickname FROM creator_records WHERE nickname = ? LIMIT 1').get(creator)
 }
 
+/** 候选达人最新快照排序：与历史达人完全同一口径，但按 candidate_id 查（绝不退回名称匹配） */
+export function getLatestSnapshotByCandidate(candidateId) {
+  const numId = Number(candidateId)
+  if (!Number.isInteger(numId) || numId <= 0) return null
+  return (
+    db
+      .prepare(
+        `SELECT * FROM creator_recent_snapshots
+         WHERE candidate_id = ?
+         ${LATEST_SNAPSHOT_ORDER_SQL}
+         LIMIT 1`
+      )
+      .get(numId) || null
+  )
+}
+
 /**
- * POST /api/recent-snapshots
- * append-only 保存一条近期表现快照：
- * - 只接受 raw 事实，后端重新解析并计算全部统计值（前端派生值一律忽略）
+ * 追加一条快照（append-only，唯一写入口，历史达人 / 候选达人共用）
+ * - 只接受 raw 事实（validated.value），全部统计值由后端重算
+ * - candidateId 为空 = 历史达人快照（身份沿用 creator 名称）；非空 = 候选达人快照
  * - 不写 creator_records，不调用 AI，不访问外部网络
+ * @param {{ creator: string, recognizedRaw: string|null, xingtuPriceRaw: string|null, plays: Array, observedAt: string }} value 已通过 validateSnapshotPayload 的原始事实
+ * @param {{ candidateId?: number|null }} [options]
+ * @returns {Object} 落库后的原始行
  */
-router.post('/', (req, res) => {
-  const validated = validateSnapshotPayload(req.body)
-  if (!validated.ok) return fail(res, 400, validated.message)
-
-  const { creator, recognizedRaw, xingtuPriceRaw, plays, observedAt } = validated.value
-
-  // creator 必须存在于历史投放记录中（P2B 不引入 creator master）
-  if (!findCreatorRecord(creator)) {
-    return fail(res, 400, `达人「${creator}」不存在于当前投放记录中，无法保存近期表现快照`)
-  }
-
+export function insertRecentSnapshot(value, { candidateId = null } = {}) {
+  const { creator, recognizedRaw, xingtuPriceRaw, plays, observedAt } = value
   const price = parsePriceText(xingtuPriceRaw)
   const normalized = normalizeSnapshotPlays(plays)
   const stats = computeRecentPerformanceStats(normalized.validPlaysInOrder)
@@ -355,14 +368,15 @@ router.post('/', (req, res) => {
   const info = db
     .prepare(
       `INSERT INTO creator_recent_snapshots (
-         creator, recognized_creator_name_raw, source_type, xingtu_price_raw, xingtu_price, plays_json,
+         creator, candidate_id, recognized_creator_name_raw, source_type, xingtu_price_raw, xingtu_price, plays_json,
          recognized_count, valid_count, excluded_count, unresolved_count, analysis_count,
          median_play, p25_play, p75_play, recent_median_play, prior_median_play,
          trend_ratio, trend_label, stats_status, stats_version, observed_at
-       ) VALUES (?, ?, 'screenshot', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       ) VALUES (?, ?, ?, 'screenshot', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       creator,
+      candidateId,
       recognizedRaw,
       price.raw_text,
       price.value,
@@ -384,9 +398,28 @@ router.post('/', (req, res) => {
       observedAt
     )
 
-  const saved = db
-    .prepare('SELECT * FROM creator_recent_snapshots WHERE id = ?')
-    .get(info.lastInsertRowid)
+  return db.prepare('SELECT * FROM creator_recent_snapshots WHERE id = ?').get(info.lastInsertRowid)
+}
+
+/**
+ * POST /api/recent-snapshots
+ * append-only 保存一条近期表现快照：
+ * - 只接受 raw 事实，后端重新解析并计算全部统计值（前端派生值一律忽略）
+ * - 不写 creator_records，不调用 AI，不访问外部网络
+ */
+router.post('/', (req, res) => {
+  const validated = validateSnapshotPayload(req.body)
+  if (!validated.ok) return fail(res, 400, validated.message)
+
+  const { creator } = validated.value
+
+  // creator 必须存在于历史投放记录中（P2B 不引入 creator master）
+  if (!findCreatorRecord(creator)) {
+    return fail(res, 400, `达人「${creator}」不存在于当前投放记录中，无法保存近期表现快照`)
+  }
+
+  // 历史达人快照：candidate_id 始终为 NULL（候选达人走 creatorCandidates 路由）
+  const saved = insertRecentSnapshot(validated.value, { candidateId: null })
   ok(res, toPublicSnapshot(saved))
 })
 
@@ -403,7 +436,8 @@ router.get('/latest', (req, res) => {
   const row = db
     .prepare(
       `SELECT * FROM creator_recent_snapshots
-       WHERE creator = ?
+       WHERE candidate_id IS NULL
+         AND creator = ?
        ${LATEST_SNAPSHOT_ORDER_SQL}
        LIMIT 1`
     )

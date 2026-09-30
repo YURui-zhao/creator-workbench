@@ -27,6 +27,7 @@ import {
 } from '@ant-design/icons'
 import { extractCreatorScreenshot, getAiStatus } from '../api/ai'
 import { getLatestRecentSnapshot, saveRecentSnapshot } from '../api/recentSnapshots'
+import { getCandidateLatestSnapshot, saveCandidateRecentSnapshot } from '../api/creatorCandidates'
 import { getAiConfig } from '../utils/aiConfig.js'
 import { getErrorMessage } from '../utils/request'
 import { formatInteger, formatPlays } from '../utils/format'
@@ -91,7 +92,10 @@ export default function RecentPerformanceAssistantModal({
   creator = null,
   creatorOptions = [],
   // Alpha.3-04B：'update'（更新近期表现，全能力）/ 'classify_existing'（只补内容分类）
-  mode = 'update'
+  mode = 'update',
+  // V3-alpha.3 Playbook Phase 1：候选达人稳定身份。传入时走候选 snapshot API（按 candidate_id 归属），
+  // 历史 Radar 调用不传该参数，行为完全不变。
+  candidateId = null
 }) {
   const [images, setImages] = useState([])
   const [preparing, setPreparing] = useState(false)
@@ -122,6 +126,8 @@ export default function RecentPerformanceAssistantModal({
   const [classifyLoading, setClassifyLoading] = useState(false)
   const [classifyError, setClassifyError] = useState('')
   const isClassifyMode = mode === 'classify_existing'
+  // 候选模式：存在稳定 candidateId 时，保存 / 读取都走候选 API（绝不按名称匹配）
+  const isCandidateMode = candidateId !== null && candidateId !== undefined && candidateId !== ''
   const inputRef = useRef(null)
   // 并发保护：识别进行中禁止重复点击（同一次请求不会被叠加）
   const aiInFlightRef = useRef(false)
@@ -147,7 +153,11 @@ export default function RecentPerformanceAssistantModal({
     }
     let active = true
     setClassifyLoading(true)
-    getLatestRecentSnapshot(targetCreator)
+    // 候选模式按 candidate_id 读取（不退回名称匹配）；历史模式行为不变
+    const latestRequest = isCandidateMode
+      ? getCandidateLatestSnapshot(candidateId)
+      : getLatestRecentSnapshot(targetCreator)
+    latestRequest
       .then((res) => {
         if (!active) return
         const snapshot = res?.data?.snapshot || null
@@ -169,7 +179,7 @@ export default function RecentPerformanceAssistantModal({
     return () => {
       active = false
     }
-  }, [open, creator, mode])
+  }, [open, creator, mode, candidateId, isCandidateMode])
 
   // 打开时读取 AI 状态（只查后端环境变量与固定 vision 模型，不发送 Key/图片）
   useEffect(() => {
@@ -246,14 +256,16 @@ export default function RecentPerformanceAssistantModal({
     setSaving(true)
     setSaveError('')
     try {
-      const res = await saveRecentSnapshot(
-        buildSnapshotPayload(draft, {
-          creator: boundCreator,
-          // 快照本来就属于该达人：身份核对沿用原快照事实，不再让用户重复确认
-          identityConfirmed: true,
-          observedAt: isValidDateOnly(draft.observed_at) ? draft.observed_at : ''
-        })
-      )
+      const payload = buildSnapshotPayload(draft, {
+        creator: boundCreator,
+        // 快照本来就属于该达人：身份核对沿用原快照事实，不再让用户重复确认
+        identityConfirmed: true,
+        observedAt: isValidDateOnly(draft.observed_at) ? draft.observed_at : ''
+      })
+      // 候选模式走候选 API（服务端用 candidate.name 作为 creator，并落 candidate_id）
+      const res = isCandidateMode
+        ? await saveCandidateRecentSnapshot(candidateId, payload)
+        : await saveRecentSnapshot(payload)
       setSavedSnapshot(res?.data || null)
       onSaved?.(res?.data || null)
       message.success('内容分类已保存为新的快照')
@@ -468,13 +480,15 @@ export default function RecentPerformanceAssistantModal({
     setSaving(true)
     setSaveError('')
     try {
-      const res = await saveRecentSnapshot(
-        buildSnapshotPayload(draft, {
-          creator: boundCreator,
-          identityConfirmed,
-          observedAt
-        })
-      )
+      const payload = buildSnapshotPayload(draft, {
+        creator: boundCreator,
+        identityConfirmed,
+        observedAt
+      })
+      // 候选模式走候选 API（服务端用 candidate.name 作为 creator，并落 candidate_id）
+      const res = isCandidateMode
+        ? await saveCandidateRecentSnapshot(candidateId, payload)
+        : await saveRecentSnapshot(payload)
       setSavedSnapshot(res?.data || null)
       onSaved?.(res?.data || null)
       message.success('近期表现已保存为快照')
@@ -1141,7 +1155,9 @@ export default function RecentPerformanceAssistantModal({
                   </Button>
                 </Tooltip>
                 <Typography.Text type="secondary">
-                  保存后可在复投雷达对应达人处看到最新快照（append-only，不会覆盖历史快照）
+                  {isCandidateMode
+                    ? '保存后可在本页看到该候选达人的最新快照（append-only，不会覆盖历史快照）'
+                    : '保存后可在复投雷达对应达人处看到最新快照（append-only，不会覆盖历史快照）'}
                 </Typography.Text>
               </Space>
 

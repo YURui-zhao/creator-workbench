@@ -9,6 +9,7 @@ import cyclesRouter from './routes/cycles.js'
 import creatorDecisionsRouter from './routes/creatorDecisions.js'
 import creatorDecisionOutcomesRouter from './routes/creatorDecisionOutcomes.js'
 import creatorNegotiationCasesRouter from './routes/creatorNegotiationCases.js'
+import creatorCandidatesRouter from './routes/creatorCandidates.js'
 import importBatchesRouter from './routes/importBatches.js'
 import recentSnapshotsRouter from './routes/recentSnapshots.js'
 import recordsRouter from './routes/records.js'
@@ -63,6 +64,8 @@ app.use('/api/creator-decisions', creatorDecisionsRouter)
 app.use('/api/creator-decisions', creatorDecisionOutcomesRouter)
 // A4：谈判结果沉淀（独立表 / 独立路由，不改写 decision）
 app.use('/api/creator-negotiation-cases', creatorNegotiationCasesRouter)
+// Playbook Phase 1：候选达人身份层（独立表 / 独立路由，不影响 creator_records 与 Radar）
+app.use('/api/creator-candidates', creatorCandidatesRouter)
 app.use('/api/import', importBatchesRouter)
 app.use('/api/recent-snapshots', recentSnapshotsRouter)
 app.use('/api/records', recordsRouter)

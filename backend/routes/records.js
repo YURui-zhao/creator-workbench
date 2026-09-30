@@ -448,7 +448,7 @@ function queryDetailRows(filters = {}) {
   const { where, params } = buildRecordFilter(filters)
   return db
     .prepare(
-      `SELECT time_cycle, nickname, creator_type, homepage, content_link, video_link,
+      `SELECT id, time_cycle, nickname, creator_type, homepage, content_link, video_link,
               total_cost, first_play, second_week_play, publish_date
        FROM creator_records${where}
        ORDER BY time_cycle ASC, id ASC`
@@ -473,6 +473,19 @@ export const HOT_PLAY_THRESHOLD = 100000 // 爆款阈值（沿用现有系统阈
 
 // null / undefined / '' 表示「未填写/待更新」；0 是真实记录值。两者不可混为一谈。
 function toOptionalPlayNumber(value) {
+  if (value === undefined || value === null) return null
+  if (typeof value === 'string' && value.trim() === '') return null
+  const num = Number(value)
+  return Number.isFinite(num) ? num : null
+}
+
+/**
+ * Alpha.3-02：creator_records.total_cost → 实际合作价（严格空值语义）
+ * - null / undefined / '' → null（缺失 → 展示「上次合作价暂无」）
+ * - 0 是真实记录值，原样保留（展示 ¥0）
+ * 注意：CPM / 爆款等既有口径仍走 computePlayMetrics 的 `Number(total_cost) || 0`，本函数不影响它。
+ */
+function toActualCostNumber(value) {
   if (value === undefined || value === null) return null
   if (typeof value === 'string' && value.trim() === '') return null
   const num = Number(value)
@@ -1688,8 +1701,13 @@ export function computeRecordFirstCpm(row = {}) {
 
 /**
  * 复投雷达（纯函数，便于单测）：按 nickname 聚合 → 单次达标判定 → 历史状态 → 中位数 → 分组排序
- * @param {Array<Object>} rows creator_records 行（含 nickname / creator_type / total_cost / first_play / second_week_play / publish_date）
+ * @param {Array<Object>} rows creator_records 行（含 id / nickname / creator_type / total_cost / first_play / second_week_play / publish_date）
  * @param {{ referenceDate?: string }} [options] referenceDate 仅测试注入（YYYY-MM-DD），默认服务端本地今天
+ *
+ * Alpha.3-02：新增只读聚合字段 last_actual_cost —— 「最近一次真实投放记录」的 total_cost。
+ *   · 「最近一次」沿用既有最近合作定义（MAX(publish_date)），同一天多条记录时按 id DESC 取确定性的一条；
+ *     两者取自同一条 creator_record，绝不使用星图价 / 报价 / 谈成价 / 目标价回填，也不做同日求和。
+ *   · 0 是真实值（显示 ¥0）；null / 空字符串代表缺失（显示「上次合作价暂无」）。
  */
 export function buildRepurchaseRadar(rows = [], { referenceDate = null } = {}) {
   const reference = toDateOnly(referenceDate) || todayDateOnly()
@@ -1706,16 +1724,29 @@ export function buildRepurchaseRadar(rows = [], { referenceDate = null } = {}) {
         creator_type: creatorType,
         record_count: 0,
         samples: [],
-        lastDate: null
+        lastDate: null,
+        // Alpha.3-02：最近一次真实投放记录的 id 与 total_cost（内部聚合状态，只对外输出 cost）
+        lastRecordId: null,
+        lastActualCost: null
       })
     }
     const entry = creatorMap.get(nickname)
     entry.record_count += 1
 
-    // 最近合作日期：合作新近度取该达人全部记录的 MAX(publish_date)，与 CPM 有效性无关
+    // 最近合作日期：合作新近度取该达人全部记录的 MAX(publish_date)，与 CPM 有效性无关。
+    // Alpha.3-02：同日多条记录时用 id DESC 做确定性 tie-break，并同步记录该条记录的 total_cost，
+    // 保证 last_collaboration_date 与 last_actual_cost 始终来自同一条 creator_record。
     const publishDate = toDateOnly(row?.publish_date)
-    if (publishDate && (!entry.lastDate || publishDate > entry.lastDate)) {
-      entry.lastDate = publishDate
+    if (publishDate) {
+      const rowId = Number.isInteger(Number(row?.id)) ? Number(row.id) : null
+      const isNewerDate = !entry.lastDate || publishDate > entry.lastDate
+      const isNewerSameDate =
+        publishDate === entry.lastDate && rowId !== null && entry.lastRecordId !== null && rowId > entry.lastRecordId
+      if (isNewerDate || isNewerSameDate) {
+        entry.lastDate = publishDate
+        if (rowId !== null) entry.lastRecordId = rowId
+        entry.lastActualCost = toActualCostNumber(row?.total_cost)
+      }
     }
 
     // 保存 raw CPM（不预先 round2）：达标判断 / 中位数 / 最近风险统一使用原始精度
@@ -1786,6 +1817,9 @@ export function buildRepurchaseRadar(rows = [], { referenceDate = null } = {}) {
       medianCpmRaw: medianRaw,
       last_collaboration_date: entry.lastDate,
       days_since_last_collaboration: daysSince,
+      // Alpha.3-02：最近一次真实投放记录的实际合作价（与 last_collaboration_date 同一条记录）
+      // 0 是真实值；null 表示该条记录未填写花费（前端显示「上次合作价暂无」）
+      last_actual_cost: entry.lastActualCost,
       recent_risk: recentRisk,
       recent_risk_text: recentRisk ? '最近2次合作均未达到 CPM 30' : null
     }

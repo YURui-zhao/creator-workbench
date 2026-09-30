@@ -636,7 +636,7 @@ async function main() {
   )
   check(
     'Alpha.3 第一屏列结构：7 列（近期表现独立成列），列宽常量随之更新',
-    /const RADAR_TABLE_WIDTH = 800/.test(radarPageSource) &&
+    /const RADAR_TABLE_WIDTH = 816/.test(radarPageSource) &&
       (radarPageSource.match(/title: '/g) || []).length === 7,
     `columnTitles=${(radarPageSource.match(/title: '/g) || []).length}`
   )
@@ -1179,6 +1179,135 @@ async function main() {
     'C12 未触碰后端：radar 页面与展示工具都不含业务阈值 / 计算（只做展示格式化）',
     !/\/\s*1000/.test(fs.readFileSync(path.join(REPO_ROOT, 'frontend/src/utils/radarRowDisplay.js'), 'utf8')) &&
       !/cpm\s*[<>=]|pass_count\s*[<>=]|median\s*[<>=]/.test(radarPageA3)
+  )
+
+  console.log('\n===== 19. Alpha.3-02：最近一次实际合作价 last_actual_cost =====')
+  db.prepare('DELETE FROM creator_records').run()
+  const PRICE_SEED = [
+    // 价甲：3 次合作，最近一次（09-20）cost 11000 → 不是平均 5000，不是合计 15000
+    ['2026-W36', '价甲', '数码', 2000, '2026-09-05', 20000, 100000],
+    ['2026-W37', '价甲', '数码', 2000, '2026-09-12', 20000, 100000],
+    ['2026-W38', '价甲', '数码', 11000, '2026-09-20', 20000, 100000],
+    // 价乙：最近一次 cost = 0（真实 0，不得当成缺失）
+    ['2026-W36', '价乙', '数码', 3000, '2026-09-01', 20000, 100000],
+    ['2026-W38', '价乙', '数码', 0, '2026-09-20', 20000, 100000],
+    // 价丙：最近一次 cost = NULL（缺失，不得当成 0）
+    ['2026-W36', '价丙', '数码', 2500, '2026-09-02', 20000, 100000],
+    ['2026-W38', '价丙', '数码', null, '2026-09-21', 20000, 100000],
+    // 价丁：同一天两条记录 → id DESC 取后插入的那条（cost 7777）
+    ['2026-W38', '价丁', '数码', 1111, '2026-09-19', 20000, 100000],
+    ['2026-W38', '价丁', '数码', 7777, '2026-09-19', 20000, 100000],
+    // 价戊：更早的一条更贵（9000），仍必须取最近一次（1000）
+    ['2026-W36', '价戊', '数码', 9000, '2026-09-03', 20000, 100000],
+    ['2026-W38', '价戊', '数码', 1000, '2026-09-22', 20000, 100000],
+    // 价己：完全没有 publish_date → 不构成「最近合作」，cost 也不得被挑出来
+    ['2026-W38', '价己', '数码', 5000, null, 20000, 100000]
+  ]
+  db.transaction(() => {
+    for (const row of PRICE_SEED) insert.run(...row)
+  })()
+  const priced = await call({ current_date: REFERENCE_DATE })
+  const pricedFlat = priced.data.groups.flatMap((group) => group.creators)
+  const priceOf = (name) => pricedFlat.find((item) => item.creator === name)
+  const latestRecordOf = (name) =>
+    db
+      .prepare(
+        `SELECT id, total_cost, publish_date FROM creator_records
+         WHERE nickname = ? AND publish_date IS NOT NULL
+         ORDER BY publish_date DESC, id DESC LIMIT 1`
+      )
+      .get(name)
+
+  check(
+    'D1 最近合作 cost > 0 → last_actual_cost = 该次真实成本（11000，不是平均/合计）',
+    priceOf('价甲')?.last_actual_cost === 11000 &&
+      priceOf('价甲')?.last_collaboration_date === '2026-09-20' &&
+      latestRecordOf('价甲').total_cost === 11000,
+    JSON.stringify({ cost: priceOf('价甲')?.last_actual_cost, date: priceOf('价甲')?.last_collaboration_date })
+  )
+  check(
+    'D2 cost = 0 → 保留 0（真实值，不是缺失）',
+    priceOf('价乙')?.last_actual_cost === 0 && priceOf('价乙')?.last_actual_cost !== null
+  )
+  check(
+    'D3 cost = NULL → 保持 null（不得回填成 0）',
+    priceOf('价丙')?.last_actual_cost === null &&
+      priceOf('价丙')?.last_collaboration_date === '2026-09-21'
+  )
+  check(
+    'D4 同一天多条记录 → id DESC 确定性取最近一条（7777 而非 1111）',
+    priceOf('价丁')?.last_actual_cost === 7777 &&
+      priceOf('价丁')?.last_collaboration_date === '2026-09-19' &&
+      latestRecordOf('价丁').id ===
+        db.prepare("SELECT MAX(id) AS id FROM creator_records WHERE nickname = '价丁'").get().id
+  )
+  check('D5 更早记录更贵也必须取最近一次（1000 而非 9000）', priceOf('价戊')?.last_actual_cost === 1000)
+  check(
+    'D6 没有任何 publish_date → 最近合作为 null，cost 也不挑无日期记录（保持 null）',
+    priceOf('价己')?.last_collaboration_date === null && priceOf('价己')?.last_actual_cost === null
+  )
+  check(
+    'D7 last_collaboration_date 与 last_actual_cost 来自同一条 creator_record（逐达人比对 DB）',
+    ['价甲', '价乙', '价丙', '价丁', '价戊'].every((name) => {
+      const item = priceOf(name)
+      const row = latestRecordOf(name)
+      const expectedCost =
+        row.total_cost === null || row.total_cost === undefined ? null : Number(row.total_cost)
+      return item.last_collaboration_date === row.publish_date && item.last_actual_cost === expectedCost
+    })
+  )
+  check(
+    'D8 只新增一个只读字段：不参与排序 / 分组（sort 说明与分组规则未变，组内仍按既有中位数升序）',
+    !/last_actual_cost/.test(priced.data.sort.priority) &&
+      !/last_actual_cost/.test(priced.data.sort.watch) &&
+      !/last_actual_cost/.test(priced.data.sort.low_priority) &&
+      priced.data.groups.length === 3 &&
+      priced.data.summary.creator_count === 6 &&
+      priced.data.summary.record_count === PRICE_SEED.length &&
+      priced.data.groups.every((group) =>
+        group.creators.every((item, i, list) => {
+          if (i === 0) return true
+          const prev = list[i - 1]
+          const prevNull = prev.median_cpm === null
+          const curNull = item.median_cpm === null
+          if (prevNull) return curNull
+          if (curNull) return true
+          return prev.median_cpm <= item.median_cpm
+        })
+      ),
+    JSON.stringify(priced.data.groups.map((g) => `${g.key}:${g.count}`))
+  )
+  check(
+    'D9 金额展示：0 → ¥0；null → 暂无（绝不把 null 显示成 ¥0）',
+    rowLib.formatLastActualCostValue(11000) === '¥11,000' &&
+      rowLib.formatLastActualCostValue(0) === '¥0' &&
+      rowLib.formatLastActualCostValue(null) === '暂无' &&
+      rowLib.formatLastActualCostValue(undefined) === '暂无' &&
+      rowLib.formatLastActualCostLabel(11000) === '上次合作 ¥11,000' &&
+      rowLib.formatLastActualCostLabel(0) === '上次合作 ¥0' &&
+      rowLib.formatLastActualCostLabel(null) === '上次合作价暂无'
+  )
+  check(
+    'D10 前端接线：最近合作单元格第三行 + Popover 详情层（不新增列）',
+    /\{formatLastActualCostLabel\(record\.last_actual_cost\)\}/.test(radarPageA3) &&
+      /最近一次实际合作价：\{formatLastActualCostValue\(record\.last_actual_cost\)\}/.test(radarPageA3) &&
+      (radarPageA3.match(/title: '/g) || []).length === 7
+  )
+  check(
+    'D11 实际合作价只来自 creator_records.total_cost（前端展示层不引用 negotiated / 报价 / 目标价）',
+    !/negotiated_price|current_quote|target_price/.test(
+      fs.readFileSync(path.join(REPO_ROOT, 'frontend/src/utils/radarRowDisplay.js'), 'utf8')
+    ) &&
+      /last_actual_cost: entry\.lastActualCost/.test(
+        fs.readFileSync(path.join(REPO_ROOT, 'backend/routes/records.js'), 'utf8')
+      )
+  )
+  check(
+    'D12 无 schema 变更 / 隔离库运行（creator_records 列结构未变，行数 = seed 数）',
+    process.env.WORKBENCH_DB_PATH.startsWith(os.tmpdir()) &&
+      JSON.stringify(db.prepare('PRAGMA table_info(creator_records)').all().map((c) => c.name)) ===
+        JSON.stringify(['id', 'time_cycle', 'nickname', 'homepage', 'creator_type', 'content_link', 'total_cost', 'publish_date', 'video_link', 'first_play', 'second_week_play', 'created_at']) &&
+      db.prepare('SELECT COUNT(*) AS n FROM creator_records').get().n === PRICE_SEED.length
   )
 }
 

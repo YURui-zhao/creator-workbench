@@ -33,6 +33,8 @@ import {
 import {
   buildRecentPerformanceCell,
   formatCpmCoverageLine,
+  formatLastActualCostLabel,
+  formatLastActualCostValue,
   formatMedianCpmValue
 } from '../../utils/radarRowDisplay.js'
 import { buildPricingRows, formatPrice } from '../../utils/pricingDisplay.js'
@@ -79,7 +81,7 @@ const OUTCOME_CPM_SHORT_LABELS = {
 
 // Alpha.3 信息架构：近期表现独立成列（高视觉权重），有效样本 / 达标次数降级为历史 CPM 的辅助行，
 // 达人类型降级为达人名称下的次级文字；列宽合计控制在 1024 宽度下不产生页面级 / 表内横向滚动。
-const RADAR_TABLE_WIDTH = 800
+const RADAR_TABLE_WIDTH = 816
 const SECONDARY_TEXT_STYLE = { fontSize: 12, color: 'rgba(0, 0, 0, 0.45)', lineHeight: '18px' }
 const PLACEHOLDER = <Typography.Text type="secondary">-</Typography.Text>
 
@@ -176,6 +178,12 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
                   ) : (
                     <Typography.Text type="secondary">近期表现：尚未更新</Typography.Text>
                   )}
+                  {/* Alpha.3-02：详情层轻量展示最近一次实际合作价（不做价格分析） */}
+                  <div style={{ marginTop: 6 }}>
+                    <Typography.Text type="secondary">
+                      最近一次实际合作价：{formatLastActualCostValue(record.last_actual_cost)}
+                    </Typography.Text>
+                  </div>
                   <div style={{ marginTop: 8 }}>
                     <Button size="small" type="primary" onClick={() => onOpenAssistant?.(value)}>
                       {snapshot ? '重新更新' : '更新近期表现'}
@@ -278,7 +286,7 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
     {
       title: '最近合作 / 距今',
       dataIndex: 'last_collaboration_date',
-      width: 96,
+      width: 112,
       render: (value, record) => (
         <div>
           <div>{value || PLACEHOLDER}</div>
@@ -288,6 +296,8 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
               ? '距今 -'
               : `距今 ${formatInteger(record.days_since_last_collaboration)} 天`}
           </div>
+          {/* Alpha.3-02：最近一次真实投放记录的实际合作价（与上方日期同一条记录） */}
+          <div style={SECONDARY_TEXT_STYLE}>{formatLastActualCostLabel(record.last_actual_cost)}</div>
         </div>
       )
     },

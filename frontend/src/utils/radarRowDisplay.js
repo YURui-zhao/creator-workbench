@@ -9,6 +9,7 @@
  */
 
 import { formatCpm, formatPlays } from './format.js'
+import { formatPrice } from './pricingDisplay.js'
 import { TREND_LABELS, formatObservedAtHint } from './recentPerformanceSave.js'
 
 // 趋势箭头（仅视觉提示，语义仍由 trend_label 决定）
@@ -81,4 +82,23 @@ export function formatCpmCoverageLine({ recordCount, validCpmCount, passCount } 
 export function formatMedianCpmValue(medianCpm) {
   if (medianCpm === null || medianCpm === undefined) return ''
   return formatCpm(medianCpm)
+}
+
+/**
+ * Alpha.3-02：最近一次真实投放记录的实际合作价（last_actual_cost）
+ * - 0 是真实记录值 → ¥0（绝不显示成缺失）
+ * - null / undefined / 非有限值 → 暂无
+ * 只做展示：字段来自后端 creator_records.total_cost，与星图价 / 报价 / 谈成价 / 目标价无关。
+ */
+export function formatLastActualCostValue(lastActualCost) {
+  if (lastActualCost === null || lastActualCost === undefined) return '暂无'
+  const num = Number(lastActualCost)
+  if (!Number.isFinite(num)) return '暂无'
+  return formatPrice(num)
+}
+
+/** 「最近合作」单元格第三行文案：上次合作 ¥11,000 / 上次合作 ¥0 / 上次合作价暂无 */
+export function formatLastActualCostLabel(lastActualCost) {
+  const value = formatLastActualCostValue(lastActualCost)
+  return value === '暂无' ? '上次合作价暂无' : `上次合作 ${value}`
 }

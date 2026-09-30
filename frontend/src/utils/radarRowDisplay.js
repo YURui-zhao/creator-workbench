@@ -102,3 +102,21 @@ export function formatLastActualCostLabel(lastActualCost) {
   const value = formatLastActualCostValue(lastActualCost)
   return value === '暂无' ? '上次合作价暂无' : `上次合作 ${value}`
 }
+
+/**
+ * Alpha.3-03：分组折叠状态（纯前端视图状态）
+ * - 默认全部展开：空对象 = 没有任何分组被折叠
+ * - 只影响「是否渲染该组表格内容」，不参与筛选 / 计数 / 排序
+ * - 不写 DB、不写 localStorage / sessionStorage，刷新后回到全部展开
+ */
+export const DEFAULT_COLLAPSED_GROUPS = {}
+
+export function isGroupCollapsed(collapsedGroups, groupKey) {
+  return Boolean(collapsedGroups?.[groupKey])
+}
+
+/** 切换单个分组（返回新对象，不改写入参；其它分组的折叠状态保持不变） */
+export function toggleGroupCollapsed(collapsedGroups, groupKey) {
+  const current = collapsedGroups && typeof collapsedGroups === 'object' ? collapsedGroups : {}
+  return { ...current, [groupKey]: !isGroupCollapsed(current, groupKey) }
+}

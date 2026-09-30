@@ -18,7 +18,7 @@ import {
   Tooltip,
   Typography
 } from 'antd'
-import { ReloadOutlined, SearchOutlined } from '@ant-design/icons'
+import { CaretDownOutlined, CaretRightOutlined, ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import { getRepurchaseRadar } from '../../api/records'
 import { getErrorMessage } from '../../utils/request'
 import { formatInteger } from '../../utils/format'
@@ -32,10 +32,13 @@ import {
 } from '../../utils/recentPerformanceSave.js'
 import {
   buildRecentPerformanceCell,
+  DEFAULT_COLLAPSED_GROUPS,
   formatCpmCoverageLine,
   formatLastActualCostLabel,
   formatLastActualCostValue,
-  formatMedianCpmValue
+  formatMedianCpmValue,
+  isGroupCollapsed,
+  toggleGroupCollapsed
 } from '../../utils/radarRowDisplay.js'
 import { buildPricingRows, formatPrice } from '../../utils/pricingDisplay.js'
 import {
@@ -342,6 +345,59 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
 }
 
 /**
+ * 分组标题栏（Alpha.3-03）：整块可点击折叠，标题 / 数量 / 说明始终显示。
+ * 只控制「是否渲染该组表格内容」，不参与筛选、计数与排序（数量始终是当前筛选后的真实数量）。
+ */
+function GroupHeader({ group, filterActive, collapsed, onToggle }) {
+  const [hover, setHover] = useState(false)
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      aria-expanded={!collapsed}
+      aria-label={`${collapsed ? '展开' : '收起'}${group.label}`}
+      onClick={onToggle}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          onToggle()
+        }
+      }}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        flexWrap: 'wrap',
+        width: '100%',
+        cursor: 'pointer',
+        userSelect: 'none',
+        padding: '2px 6px',
+        margin: '-2px -6px',
+        borderRadius: 4,
+        background: hover ? 'rgba(0, 0, 0, 0.03)' : 'transparent',
+        transition: 'background 150ms ease'
+      }}
+    >
+      <span style={{ display: 'inline-flex', alignItems: 'center', color: 'rgba(0, 0, 0, 0.45)', fontSize: 12 }}>
+        {collapsed ? <CaretRightOutlined /> : <CaretDownOutlined />}
+      </span>
+      <Typography.Text strong>{group.label}</Typography.Text>
+      {/* 原始 group.count 始终是全量口径；有筛选时补充「命中 / 全量」 */}
+      <Tag>
+        {filterActive
+          ? `${formatInteger(group.matched_count)} / ${formatInteger(group.count)} 位达人`
+          : `${formatInteger(group.count)} 位达人`}
+      </Tag>
+      <Typography.Text type="secondary" style={{ fontWeight: 'normal' }}>
+        {GROUP_HINTS[group.key]}
+      </Typography.Text>
+    </div>
+  )
+}
+
+/**
  * 复投雷达（V3-alpha P1）
  * 只展示后端已算好的分组结果，前端不重新实现 CPM / 中位数 / 状态判定逻辑。
  */
@@ -360,6 +416,8 @@ export default function RepurchaseRadar() {
   const [decisionView, setDecisionView] = useState('record')
   // B2：检索状态（纯 UI 视图状态，不写库、不改变后端返回的任何业务字段）
   const [filters, setFilters] = useState(EMPTY_RADAR_FILTERS)
+  // Alpha.3-03：分组折叠状态（纯组件内状态，刷新即回到「全部展开」；不写库 / 不写存储）
+  const [collapsedGroups, setCollapsedGroups] = useState(DEFAULT_COLLAPSED_GROUPS)
 
   const loadRadar = useCallback(async () => {
     setLoading(true)
@@ -607,44 +665,48 @@ export default function RepurchaseRadar() {
         </Col>
       </Row>
 
-      {visibleGroups.map((group) => (
-        <Card
-          key={group.key}
-          style={{ marginTop: 16 }}
-          title={
-            <Space size={8} wrap>
-              <Typography.Text strong>{group.label}</Typography.Text>
-              {/* 原始 group.count 始终是全量口径；有筛选时补充「命中 / 全量」 */}
-              <Tag>
-                {filterActive
-                  ? `${formatInteger(group.matched_count)} / ${formatInteger(group.count)} 位达人`
-                  : `${formatInteger(group.count)} 位达人`}
-              </Tag>
-              <Typography.Text type="secondary" style={{ fontWeight: 'normal' }}>
-                {GROUP_HINTS[group.key]}
-              </Typography.Text>
-            </Space>
-          }
-        >
-          {loading ? (
-            <Skeleton active paragraph={{ rows: 4 }} />
-          ) : group.creators.length === 0 ? (
-            <Empty
-              description={filterActive ? '暂无符合条件的达人' : '当前分组暂无达人'}
-              style={{ padding: 24 }}
-            />
-          ) : (
-            <Table
-              size="small"
-              rowKey="creator"
-              dataSource={group.creators}
-              columns={columns}
-              pagination={false}
-              scroll={{ x: RADAR_TABLE_WIDTH }}
-            />
-          )}
-        </Card>
-      ))}
+      {visibleGroups.map((group) => {
+        const collapsed = isGroupCollapsed(collapsedGroups, group.key)
+        return (
+          <Card
+            key={group.key}
+            style={{ marginTop: 16 }}
+            styles={{
+              header: { cursor: 'pointer' },
+              // 收起时只隐藏该组的表格内容，标题栏照常显示
+              body: collapsed ? { display: 'none' } : undefined
+            }}
+            title={
+              <GroupHeader
+                group={group}
+                filterActive={filterActive}
+                collapsed={collapsed}
+                onToggle={() => setCollapsedGroups((prev) => toggleGroupCollapsed(prev, group.key))}
+              />
+            }
+          >
+            {collapsed
+              ? null
+              : loading ? (
+                  <Skeleton active paragraph={{ rows: 4 }} />
+                ) : group.creators.length === 0 ? (
+                  <Empty
+                    description={filterActive ? '暂无符合条件的达人' : '当前分组暂无达人'}
+                    style={{ padding: 24 }}
+                  />
+                ) : (
+                  <Table
+                    size="small"
+                    rowKey="creator"
+                    dataSource={group.creators}
+                    columns={columns}
+                    pagination={false}
+                    scroll={{ x: RADAR_TABLE_WIDTH }}
+                  />
+                )}
+          </Card>
+        )
+      })}
 
       {!loading && !loadError && groups.length === 0 && (
         <Card style={{ marginTop: 16 }}>

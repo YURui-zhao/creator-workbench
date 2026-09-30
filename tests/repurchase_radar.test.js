@@ -1309,6 +1309,95 @@ async function main() {
         JSON.stringify(['id', 'time_cycle', 'nickname', 'homepage', 'creator_type', 'content_link', 'total_cost', 'publish_date', 'video_link', 'first_play', 'second_week_play', 'created_at']) &&
       db.prepare('SELECT COUNT(*) AS n FROM creator_records').get().n === PRICE_SEED.length
   )
+
+  console.log('\n===== 20. Alpha.3-03：分组折叠 / 展开（纯前端视图状态）=====')
+  const radarPageCollapse = fs.readFileSync(
+    path.join(REPO_ROOT, 'frontend/src/pages/RepurchaseRadar/index.jsx'),
+    'utf8'
+  )
+
+  check(
+    'E1 默认状态：空对象 = 三个分组全部展开（不替用户隐藏信息）',
+    JSON.stringify(rowLib.DEFAULT_COLLAPSED_GROUPS) === '{}' &&
+      rowLib.isGroupCollapsed(rowLib.DEFAULT_COLLAPSED_GROUPS, 'priority') === false &&
+      rowLib.isGroupCollapsed(rowLib.DEFAULT_COLLAPSED_GROUPS, 'watch') === false &&
+      rowLib.isGroupCollapsed(rowLib.DEFAULT_COLLAPSED_GROUPS, 'low_priority') === false &&
+      /const \[collapsedGroups, setCollapsedGroups\] = useState\(DEFAULT_COLLAPSED_GROUPS\)/.test(radarPageCollapse)
+  )
+  check(
+    'E2 三个分组可独立折叠：折叠 A 不影响 B / C',
+    (() => {
+      const afterWatch = rowLib.toggleGroupCollapsed(rowLib.DEFAULT_COLLAPSED_GROUPS, 'watch')
+      return (
+        rowLib.isGroupCollapsed(afterWatch, 'watch') === true &&
+        rowLib.isGroupCollapsed(afterWatch, 'priority') === false &&
+        rowLib.isGroupCollapsed(afterWatch, 'low_priority') === false &&
+        // 再折叠另一个分组：两个折叠状态并存，互不覆盖
+        rowLib.isGroupCollapsed(rowLib.toggleGroupCollapsed(afterWatch, 'low_priority'), 'low_priority') === true &&
+        rowLib.isGroupCollapsed(rowLib.toggleGroupCollapsed(afterWatch, 'low_priority'), 'watch') === true &&
+        rowLib.isGroupCollapsed(rowLib.toggleGroupCollapsed(afterWatch, 'low_priority'), 'priority') === false
+      )
+    })()
+  )
+  check(
+    'E3 再点一次恢复展开；切换返回新对象（不改写入参）',
+    (() => {
+      const base = rowLib.DEFAULT_COLLAPSED_GROUPS
+      const once = rowLib.toggleGroupCollapsed(base, 'watch')
+      const twice = rowLib.toggleGroupCollapsed(once, 'watch')
+      return (
+        rowLib.isGroupCollapsed(twice, 'watch') === false &&
+        JSON.stringify(twice) === JSON.stringify({ watch: false }) &&
+        JSON.stringify(base) === '{}' &&
+        once !== base
+      )
+    })()
+  )
+  check(
+    'E4 折叠只影响渲染：标题 / 数量 / 说明始终在标题栏，表格内容才被隐藏',
+    // 标题栏组件仍渲染 分组名 + 数量 Tag + 说明文案
+    /<Typography.Text strong>\{group.label\}<\/Typography.Text>/.test(radarPageCollapse) &&
+      /位达人`\}/.test(radarPageCollapse) &&
+      /GROUP_HINTS\[group\.key\]/.test(radarPageCollapse) &&
+      // 数量仍取筛选后的 matched_count / 全量 count（未新增计数逻辑）
+      /formatInteger\(group\.matched_count\)/.test(radarPageCollapse) &&
+      /formatInteger\(group\.count\)/.test(radarPageCollapse) &&
+      // 折叠时跳过表格渲染 + body 收起
+      /collapsed\s*\?\s*null\s*:/.test(radarPageCollapse) &&
+      /body: collapsed \? \{ display: 'none' \} : undefined/.test(radarPageCollapse) &&
+      // 箭头随状态切换
+      /collapsed \? <CaretRightOutlined \/> : <CaretDownOutlined \/>/.test(radarPageCollapse)
+  )
+  check(
+    'E5 折叠状态是纯组件内状态：不写库 / 不用 localStorage / 不新增 API 调用',
+    !/localStorage|sessionStorage|indexedDB/.test(radarPageCollapse) &&
+      (radarPageCollapse.match(/setCollapsedGroups/g) || []).length === 2 && // 一处 useState + 一处 onToggle
+      (radarPageCollapse.match(/getRepurchaseRadar\(/g) || []).length === 1 && // 仍只有 loadRadar
+      !/collapsedGroups/.test(
+        radarPageCollapse.slice(
+          radarPageCollapse.indexOf('const loadRadar'),
+          radarPageCollapse.indexOf('const summary = radar?.summary')
+        )
+      )
+  )
+  check(
+    'E6 折叠与搜索 / 筛选解耦：filtered rows、计数、排序仍全部来自 filterRadarGroups',
+    /filterRadarGroups\(radar\?\.groups \|\| \[\], filters\)/.test(radarPageCollapse) &&
+      /\{visibleGroups\.map\(\(group\) => \{/.test(radarPageCollapse) &&
+      // 折叠状态只在「标题栏点击」时被修改，筛选 / 清空筛选不触碰它
+      /onToggle=\{\(\) => setCollapsedGroups\(\(prev\) => toggleGroupCollapsed\(prev, group\.key\)\)\}/.test(radarPageCollapse) &&
+      (radarPageCollapse.match(/setCollapsedGroups/g) || []).length === 2 &&
+      !/useEffect\([\s\S]{0,200}setCollapsedGroups/.test(radarPageCollapse)
+  )
+  check(
+    'E7 折叠不触碰业务字段（页面仍只读后端下发的 historical_status / work_priority / CPM / 快照）',
+    /dataIndex: 'historical_status'/.test(radarPageCollapse) &&
+      /dataIndex: 'median_cpm'/.test(radarPageCollapse) &&
+      /record\.work_priority_label/.test(radarPageCollapse) &&
+      /record\.recent_snapshot/.test(radarPageCollapse) &&
+      /record\.last_actual_cost/.test(radarPageCollapse) &&
+      !/collapsedGroups\s*[^,)]*=\s*(?!=)/.test(radarPageCollapse)
+  )
 }
 
 main()

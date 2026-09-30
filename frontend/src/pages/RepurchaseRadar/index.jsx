@@ -21,16 +21,20 @@ import {
 import { ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import { getRepurchaseRadar } from '../../api/records'
 import { getErrorMessage } from '../../utils/request'
-import { formatCpm, formatInteger } from '../../utils/format'
+import { formatInteger } from '../../utils/format'
 import RecentPerformanceAssistantModal from '../../components/RecentPerformanceAssistantModal'
 import CreatorDecisionDrawer from '../../components/CreatorDecisionDrawer'
 import {
   formatPlayRange,
-  formatObservedAtHint,
   formatSnapshotStatusText,
   formatTrendRatio,
   TREND_LABELS_FULL
 } from '../../utils/recentPerformanceSave.js'
+import {
+  buildRecentPerformanceCell,
+  formatCpmCoverageLine,
+  formatMedianCpmValue
+} from '../../utils/radarRowDisplay.js'
 import { buildPricingRows, formatPrice } from '../../utils/pricingDisplay.js'
 import {
   EMPTY_RADAR_FILTERS,
@@ -73,9 +77,9 @@ const OUTCOME_CPM_SHORT_LABELS = {
   not_met: '未达标'
 }
 
-// 列宽合计刻意控制在 1024 宽度下不产生页面级 / 表内横向滚动：
-// 「达人名称」列加宽以容纳第二行的近期表现状态，同时小幅收紧中位数与风险列
-const RADAR_TABLE_WIDTH = 836
+// Alpha.3 信息架构：近期表现独立成列（高视觉权重），有效样本 / 达标次数降级为历史 CPM 的辅助行，
+// 达人类型降级为达人名称下的次级文字；列宽合计控制在 1024 宽度下不产生页面级 / 表内横向滚动。
+const RADAR_TABLE_WIDTH = 800
 const SECONDARY_TEXT_STYLE = { fontSize: 12, color: 'rgba(0, 0, 0, 0.45)', lineHeight: '18px' }
 const PLACEHOLDER = <Typography.Text type="secondary">-</Typography.Text>
 
@@ -87,18 +91,13 @@ const PLACEHOLDER = <Typography.Text type="secondary">-</Typography.Text>
 function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
   return [
     {
-      title: '达人名称 / 近期表现',
+      title: '达人',
       dataIndex: 'creator',
-      width: 128,
+      width: 116,
       render: (value, record) => {
         const snapshot = record.recent_snapshot
-        // Alpha.2：主表行内暴露「这份近期数据是哪天观察的」（无快照时不显示）
-        const observedHint = formatObservedAtHint(snapshot)
         return (
           <div style={{ minWidth: 0 }}>
-            <div style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-              {value}
-            </div>
             <Popover
               trigger="click"
               placement="right"
@@ -195,67 +194,91 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
                 </div>
               }
             >
-              <a style={{ ...SECONDARY_TEXT_STYLE, display: 'inline-block', maxWidth: '100%' }}>
+              <a style={{ display: 'inline-block', maxWidth: '100%', fontWeight: 600 }}>
                 <span style={{ display: 'block', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                  {formatSnapshotStatusText(snapshot)}
+                  {value}
                 </span>
-                {snapshot?.pricing?.target_price !== null && snapshot?.pricing?.target_price !== undefined && (
-                  <span style={{ display: 'block', whiteSpace: 'nowrap' }}>
-                    目标价 {formatPrice(snapshot.pricing.target_price)}
-                  </span>
-                )}
-                {observedHint && (
-                  <span
-                    style={{
-                      display: 'block',
-                      whiteSpace: 'nowrap',
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis'
-                    }}
-                  >
-                    {observedHint}
-                  </span>
-                )}
               </a>
             </Popover>
+            {/* 达人类型：保留数据能力，降级为次级文字 */}
+            <div
+              style={{
+                ...SECONDARY_TEXT_STYLE,
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis'
+              }}
+            >
+              {record.creator_type || '未分类'}
+            </div>
           </div>
         )
       }
     },
-    { title: '达人类型', dataIndex: 'creator_type', width: 84, ellipsis: true },
     {
-      title: '历史合作次数',
+      title: '近期表现',
+      key: 'recentPerformance',
+      width: 156,
+      render: (_, record) => {
+        const cell = buildRecentPerformanceCell(record.recent_snapshot)
+        if (!cell.hasSnapshot) {
+          return <Typography.Text type="secondary">尚未更新</Typography.Text>
+        }
+        const targetPrice = record.recent_snapshot?.pricing?.target_price
+        return (
+          <div>
+            {cell.isInsufficient ? (
+              <Typography.Text type="secondary">样本不足</Typography.Text>
+            ) : (
+              <div style={{ fontSize: 15, fontWeight: 600, lineHeight: '20px', whiteSpace: 'nowrap' }}>
+                {cell.playText} {cell.arrow}
+              </div>
+            )}
+            {!cell.isInsufficient && <div style={SECONDARY_TEXT_STYLE}>{cell.trendText}</div>}
+            {cell.observedHint && <div style={SECONDARY_TEXT_STYLE}>{cell.observedHint}</div>}
+            {targetPrice !== null && targetPrice !== undefined && (
+              <div style={SECONDARY_TEXT_STYLE}>目标价 {formatPrice(targetPrice)}</div>
+            )}
+          </div>
+        )
+      }
+    },
+    {
+      title: '历史投放',
       dataIndex: 'record_count',
-      width: 84,
+      width: 80,
       align: 'right',
       render: (value) => `${formatInteger(value)} 次`
     },
     {
-      title: '有效CPM样本',
-      dataIndex: 'valid_cpm_count',
-      width: 84,
-      align: 'right',
-      render: (value) => `${formatInteger(value)} 次`
-    },
-    {
-      title: 'CPM达标次数',
-      key: 'passCount',
-      width: 88,
-      align: 'right',
-      render: (_, record) =>
-        `${formatInteger(record.pass_count)} / ${formatInteger(record.valid_cpm_count)}`
-    },
-    {
-      title: '历史CPM中位数',
+      title: '历史CPM',
       dataIndex: 'median_cpm',
-      width: 84,
+      width: 156,
       align: 'right',
-      render: (value) => (value === null || value === undefined ? PLACEHOLDER : formatCpm(value))
+      render: (value, record) => {
+        const medianText = formatMedianCpmValue(value)
+        return (
+          <div>
+            {/* 0 是真实数值，只有 null 才显示占位 */}
+            <div style={{ fontSize: 15, fontWeight: 600, lineHeight: '20px' }}>
+              {medianText === '' ? PLACEHOLDER : medianText}
+            </div>
+            {/* 「有效 CPM 样本 / 达标次数」降级为辅助解释：X/Y 次可计算 · X/Y 达标 */}
+            <div style={SECONDARY_TEXT_STYLE}>
+              {formatCpmCoverageLine({
+                recordCount: record.record_count,
+                validCpmCount: record.valid_cpm_count,
+                passCount: record.pass_count
+              })}
+            </div>
+          </div>
+        )
+      }
     },
     {
       title: '最近合作 / 距今',
       dataIndex: 'last_collaboration_date',
-      width: 100,
+      width: 96,
       render: (value, record) => (
         <div>
           <div>{value || PLACEHOLDER}</div>
@@ -271,7 +294,7 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision) {
     {
       title: '历史状态',
       dataIndex: 'historical_status',
-      width: 96,
+      width: 108,
       render: (value, record) => {
         const meta = STATUS_META[value] || { label: value, color: 'default' }
         // 工作优先级标记（仅单样本突出 / 优先补数据 / 单次明显低效时出现，文案由后端给出）

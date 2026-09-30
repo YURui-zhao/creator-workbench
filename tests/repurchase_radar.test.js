@@ -627,15 +627,17 @@ async function main() {
     'utf8'
   )
   check(
-    '雷达主表第一列渲染该提示（接入未丢失）',
-    /formatObservedAtHint\(snapshot\)/.test(radarPageSource) &&
-      /const observedHint = formatObservedAtHint\(snapshot\)/.test(radarPageSource) &&
-      /\{observedHint && \(/.test(radarPageSource)
+    '雷达主表渲染该提示（Alpha.3 起改由「近期表现」独立列接入，语义未变）',
+    /buildRecentPerformanceCell\(record\.recent_snapshot\)/.test(radarPageSource) &&
+      /\{cell\.observedHint && <div style=\{SECONDARY_TEXT_STYLE\}>\{cell\.observedHint\}<\/div>\}/.test(radarPageSource) &&
+      /formatObservedAtHint\(snapshot\)/.test(
+        fs.readFileSync(path.join(REPO_ROOT, 'frontend/src/utils/radarRowDisplay.js'), 'utf8')
+      )
   )
   check(
-    '未新增列 / 未改表格宽度结构（仍是 9 列且列宽常量不变）',
-    /const RADAR_TABLE_WIDTH = 836/.test(radarPageSource) &&
-      (radarPageSource.match(/title: '/g) || []).length === 9,
+    'Alpha.3 第一屏列结构：7 列（近期表现独立成列），列宽常量随之更新',
+    /const RADAR_TABLE_WIDTH = 800/.test(radarPageSource) &&
+      (radarPageSource.match(/title: '/g) || []).length === 7,
     `columnTitles=${(radarPageSource.match(/title: '/g) || []).length}`
   )
 
@@ -1051,8 +1053,7 @@ async function main() {
     !/fetch\(|axios|localStorage|sessionStorage|deepseek/i.test(filterSource) &&
       /const \[filters, setFilters\] = useState\(EMPTY_RADAR_FILTERS\)/.test(radarPageB2) &&
       /filterRadarGroups\(radar\?\.groups \|\| \[\], filters\)/.test(radarPageB2) &&
-      /const RADAR_TABLE_WIDTH = 836/.test(radarPageB2) &&
-      (radarPageB2.match(/title: '/g) || []).length === 9 &&
+      /const RADAR_TABLE_WIDTH = \d+/.test(radarPageB2) &&
       db.prepare('SELECT COUNT(*) AS n FROM creator_records').get().n === B1_SEED.length &&
       db.prepare('SELECT COUNT(*) AS n FROM creator_negotiation_cases').get().n === 0
   )
@@ -1063,6 +1064,121 @@ async function main() {
       /options=\{WORK_PRIORITY_FILTER_OPTIONS\}/.test(radarPageB2) &&
       /清空筛选/.test(radarPageB2) &&
       /显示 \{formatInteger\(visibleCount\)\} \/ \{formatInteger\(totalCount\)\} 位达人/.test(radarPageB2)
+  )
+
+  console.log('\n===== 18. Alpha.3 信息架构：近期表现独立列 / 历史 CPM 合并辅助行 =====')
+  const rowLib = await import(
+    pathToFileURL(path.join(REPO_ROOT, 'frontend/src/utils/radarRowDisplay.js')).href
+  )
+  const radarPageA3 = fs.readFileSync(
+    path.join(REPO_ROOT, 'frontend/src/pages/RepurchaseRadar/index.jsx'),
+    'utf8'
+  )
+
+  // ---- 近期表现单元格语义 ----
+  const cellNoSnapshot = rowLib.buildRecentPerformanceCell(null)
+  check(
+    'C1 没有 snapshot → 只显示「尚未更新」（不显示观察日期未知）',
+    cellNoSnapshot.hasSnapshot === false &&
+      cellNoSnapshot.statusText === '尚未更新' &&
+      cellNoSnapshot.observedHint === '' &&
+      cellNoSnapshot.playText === ''
+  )
+  const cellUp = rowLib.buildRecentPerformanceCell({
+    stats_status: 'ok',
+    median_play: 53000,
+    trend_label: 'up',
+    observed_at: '2026-09-29'
+  })
+  check(
+    'C2 有 snapshot → 播放值 5.3万 + 箭头 ↑ + 趋势「上升」+ 数据截至 09-29',
+    cellUp.hasSnapshot === true &&
+      cellUp.isInsufficient === false &&
+      cellUp.playText === '5.3万' &&
+      cellUp.arrow === '↑' &&
+      cellUp.trendText === '上升' &&
+      cellUp.observedHint === '数据截至 09-29',
+    JSON.stringify(cellUp)
+  )
+  check(
+    'C3 旧快照 observed_at 为 null → 「观察日期未知」（不用 created_at 冒充）',
+    rowLib.buildRecentPerformanceCell({
+      stats_status: 'ok',
+      median_play: 50000,
+      trend_label: 'stable',
+      observed_at: null,
+      created_at: '2026-09-29 08:07:54'
+    }).observedHint === '观察日期未知'
+  )
+  check(
+    'C4 snapshot 存在但样本不足 → 主文案「样本不足」，不伪造播放值',
+    (() => {
+      const cell = rowLib.buildRecentPerformanceCell({ stats_status: 'insufficient', median_play: null, trend_label: 'insufficient', observed_at: '2026-09-29' })
+      return cell.hasSnapshot === true && cell.isInsufficient === true && cell.playText === '' && cell.statusText === '样本不足' && cell.observedHint === '数据截至 09-29'
+    })()
+  )
+  check(
+    'C5 趋势箭头：up ↑ / down ↓ / stable → / insufficient 空（文字仍由 trend_label 决定）',
+    rowLib.getTrendArrow('up') === '↑' &&
+      rowLib.getTrendArrow('down') === '↓' &&
+      rowLib.getTrendArrow('stable') === '→' &&
+      rowLib.getTrendArrow('insufficient') === '' &&
+      rowLib.getTrendArrow(undefined) === ''
+  )
+
+  // ---- 历史 CPM 主值 + 辅助解释行 ----
+  check(
+    'C6 历史 CPM 辅助行 =「X/Y 次可计算 · X/Y 达标」（有效样本不再单独占列）',
+    rowLib.formatCpmCoverageLine({ recordCount: 3, validCpmCount: 2, passCount: 2 }) === '2/3 次可计算 · 2/2 达标' &&
+      rowLib.formatCpmCoverageLine({ recordCount: 5, validCpmCount: 5, passCount: 3 }) === '5/5 次可计算 · 3/5 达标'
+  )
+  check(
+    'C7 0 是真实数值：0 次可计算 / 0 达标 照常显示（不表达「其他投放无效」）',
+    rowLib.formatCpmCoverageLine({ recordCount: 3, validCpmCount: 0, passCount: 0 }) === '0/3 次可计算' &&
+      rowLib.formatCpmCoverageLine({ recordCount: 1, validCpmCount: 1, passCount: 0 }) === '1/1 次可计算 · 0/1 达标'
+  )
+  check(
+    'C8 历史 CPM 主值：median=0 → "0.0"（不是空值）；null → 空（页面显示占位 -）',
+    rowLib.formatMedianCpmValue(0) === '0.0' &&
+      rowLib.formatMedianCpmValue(18.6) === '18.6' &&
+      rowLib.formatMedianCpmValue(null) === '' &&
+      rowLib.formatMedianCpmValue(undefined) === ''
+  )
+
+  // ---- 页面结构契约 ----
+  check(
+    'C9 第一屏列：达人 / 近期表现 / 历史投放 / 历史CPM / 最近合作 / 历史状态 / 风险提示',
+    /title: '达人',/.test(radarPageA3) &&
+      /title: '近期表现',/.test(radarPageA3) &&
+      /title: '历史投放',/.test(radarPageA3) &&
+      /title: '历史CPM',/.test(radarPageA3) &&
+      /title: '最近合作 \/ 距今',/.test(radarPageA3) &&
+      /title: '历史状态',/.test(radarPageA3) &&
+      /title: '风险提示',/.test(radarPageA3) &&
+      !/title: '有效CPM样本'/.test(radarPageA3) &&
+      !/title: 'CPM达标次数'/.test(radarPageA3) &&
+      !/title: '历史CPM中位数'/.test(radarPageA3) &&
+      !/title: '达人类型'/.test(radarPageA3)
+  )
+  check(
+    'C10 达人类型 / 有效样本 / 达标次数 / 目标价 仍被渲染（降级而非删除）',
+    /record\.creator_type \|\| '未分类'/.test(radarPageA3) &&
+      /formatCpmCoverageLine\(\{[\s\S]{0,120}validCpmCount: record\.valid_cpm_count/.test(radarPageA3) &&
+      /passCount: record\.pass_count/.test(radarPageA3) &&
+      /目标价 \{formatPrice\(targetPrice\)\}/.test(radarPageA3) &&
+      /比较|有效样本：\{formatInteger\(snapshot\.valid_count\)\}/.test(radarPageA3)
+  )
+  check(
+    'C11 操作入口与 Alpha.2 一致（Popover 内更新近期表现 / 记录决策 / 查看决策记录，未重构）',
+    /onOpenAssistant\?\.\(value\)/.test(radarPageA3) &&
+      /onOpenDecision\?\.\(record, 'record'\)/.test(radarPageA3) &&
+      /onOpenDecision\?\.\(record, 'history'\)/.test(radarPageA3) &&
+      /trigger="click"/.test(radarPageA3)
+  )
+  check(
+    'C12 未触碰后端：radar 页面与展示工具都不含业务阈值 / 计算（只做展示格式化）',
+    !/\/\s*1000/.test(fs.readFileSync(path.join(REPO_ROOT, 'frontend/src/utils/radarRowDisplay.js'), 'utf8')) &&
+      !/cpm\s*[<>=]|pass_count\s*[<>=]|median\s*[<>=]/.test(radarPageA3)
   )
 }
 

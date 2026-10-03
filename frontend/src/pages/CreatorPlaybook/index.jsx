@@ -46,6 +46,7 @@ import {
   applyXingtuIdFormValues
 } from '../../utils/creatorCandidateForm.js'
 import RecentPerformanceAssistantModal from '../../components/RecentPerformanceAssistantModal'
+import NegotiationCaseModal from '../../components/NegotiationCaseModal'
 
 const PLACEHOLDER = '-'
 
@@ -210,6 +211,8 @@ export default function CreatorPlaybook() {
   const [outcomeIdentityConfirmed, setOutcomeIdentityConfirmed] = useState(false)
   const [outcomeTimingConfirmed, setOutcomeTimingConfirmed] = useState(false)
   const [savingOutcome, setSavingOutcome] = useState(false)
+  // Phase 4F-B：谈价结果（复用现有 NegotiationCaseModal）
+  const [negotiationOpen, setNegotiationOpen] = useState(false)
   const [createOpen, setCreateOpen] = useState(false)
   const [creating, setCreating] = useState(false)
   const [assistantOpen, setAssistantOpen] = useState(false)
@@ -543,10 +546,14 @@ export default function CreatorPlaybook() {
     Boolean(latestPostQuoteDecision) &&
     ['proceed', 'small_test'].includes(latestPostQuoteDecision.human_decision)
   const currentOutcome = latestPostQuoteDecision?.outcome || null
+  // Phase 4F-B：最新 post_quote = negotiate 时的谈价事实（按 decision_id 关联）
+  const latestPostQuoteNegotiating = latestPostQuoteDecision?.human_decision === 'negotiate'
+  const latestNegotiationCase = latestPostQuoteDecision?.negotiation_case || null
 
   // 报价阶段：必须由用户主动点击后打开，无默认选中
-  const openPostQuote = () => {
-    setPostQuoteAmount('')
+  const openPostQuote = (prefillAmount) => {
+    // 只有显式传入字符串才预填（点击事件对象不会被当成金额）
+    setPostQuoteAmount(typeof prefillAmount === 'string' ? prefillAmount : '')
     setPostQuoteDecision(null)
     setPostQuoteNote('')
     setPostQuoteOpen(true)
@@ -1077,6 +1084,73 @@ export default function CreatorPlaybook() {
                             备注：{latestPostQuoteDecision.decision_note}
                           </Typography.Text>
                         )}
+
+                        {/* Phase 4F-B：谈价结果（只有「最新 post_quote = negotiate」才出现） */}
+                        {latestPostQuoteNegotiating && !latestNegotiationCase && (
+                          <Button size="small" onClick={() => setNegotiationOpen(true)}>
+                            记录谈价结果
+                          </Button>
+                        )}
+                        {latestPostQuoteNegotiating && latestNegotiationCase && (
+                          <div style={{ marginTop: 6, borderTop: '1px dashed #f0f0f0', paddingTop: 6 }}>
+                            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                              谈价结果
+                            </Typography.Text>
+                            <Typography.Text style={{ display: 'block' }}>
+                              初始报价：{formatPrice(latestNegotiationCase.current_quote_snapshot) ?? '暂无'}
+                            </Typography.Text>
+                            <Typography.Text style={{ display: 'block' }}>
+                              谈后价格：{formatPrice(latestNegotiationCase.negotiated_price) ?? '-'}
+                            </Typography.Text>
+                            <Typography.Text type="secondary" style={{ display: 'block' }}>
+                              星图刊例：
+                              {latestNegotiationCase.xingtu_price_snapshot === null ||
+                              latestNegotiationCase.xingtu_price_snapshot === undefined
+                                ? '暂无'
+                                : `${formatPrice(latestNegotiationCase.xingtu_price_snapshot)} · 谈后价约为星图 ${
+                                    latestNegotiationCase.outcome?.xingtu_discount_zhe ?? '-'
+                                  }折 · 初始报价约为星图 ${
+                                    latestNegotiationCase.outcome?.initial_quote_to_xingtu_ratio !== null &&
+                                    latestNegotiationCase.outcome?.initial_quote_to_xingtu_ratio !== undefined
+                                      ? (latestNegotiationCase.outcome.initial_quote_to_xingtu_ratio * 10).toFixed(1)
+                                      : '-'
+                                  }折`}
+                            </Typography.Text>
+                            <Typography.Text type="secondary" style={{ display: 'block' }}>
+                              相对初始报价：
+                              {latestNegotiationCase.outcome?.quote_change_rate === null ||
+                              latestNegotiationCase.outcome?.quote_change_rate === undefined
+                                ? '无法计算（初始报价为 0 / 暂无）'
+                                : latestNegotiationCase.outcome.quote_change_rate < 0
+                                  ? `下降 ${(Math.abs(latestNegotiationCase.outcome.quote_change_rate) * 100).toFixed(1)}%`
+                                  : latestNegotiationCase.outcome.quote_change_rate > 0
+                                    ? `上升 ${(latestNegotiationCase.outcome.quote_change_rate * 100).toFixed(1)}%`
+                                    : '无变化'}
+                            </Typography.Text>
+                            {(latestNegotiationCase.reason_tag_labels || []).length > 0 && (
+                              <Typography.Text type="secondary" style={{ display: 'block' }}>
+                                原因：{latestNegotiationCase.reason_tag_labels.join(' · ')}
+                              </Typography.Text>
+                            )}
+                            {latestNegotiationCase.reason_note && (
+                              <Typography.Text type="secondary" style={{ display: 'block' }}>
+                                补充说明：{latestNegotiationCase.reason_note}
+                              </Typography.Text>
+                            )}
+                            {latestNegotiationCase.strategy_note && (
+                              <Typography.Text type="secondary" style={{ display: 'block' }}>
+                                谈价依据 / 过程：{latestNegotiationCase.strategy_note}
+                              </Typography.Text>
+                            )}
+                            <Button
+                              size="small"
+                              style={{ marginTop: 6 }}
+                              onClick={() => openPostQuote(String(latestNegotiationCase.negotiated_price))}
+                            >
+                              以谈后价继续判断
+                            </Button>
+                          </div>
+                        )}
                       </Space>
                     </div>
                   )}
@@ -1331,6 +1405,15 @@ export default function CreatorPlaybook() {
           </div>
         </Space>
       </Modal>
+
+      {/* Phase 4F-B：记录谈价结果（复用现有 NegotiationCaseModal，candidate 模式不展示 CPM30 体系） */}
+      <NegotiationCaseModal
+        open={negotiationOpen}
+        decision={latestPostQuoteDecision}
+        mode="candidate_playbook"
+        onClose={() => setNegotiationOpen(false)}
+        onSaved={() => loadDecisions(selectedId)}
+      />
 
       {/* Phase 4E：选择真实投放记录（候选来自既有 outcome-candidates 接口） */}
       <Modal

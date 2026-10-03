@@ -21,7 +21,13 @@ export const NEGOTIATION_REASON_TAGS = [
   { value: 'batch_cooperation', label: '批量合作' },
   { value: 'creator_price_cut', label: '达人主动让价' },
   { value: 'schedule_factor', label: '档期因素' },
-  { value: 'other', label: '其他' }
+  { value: 'other', label: '其他' },
+  // Phase 4F-B：结合 Playbook 真实业务经验补充的谈价原因（全部由用户勾选，系统不自动预选）
+  { value: 'sponsored_below_organic', label: '商单播放低于日常' },
+  { value: 'sponsored_sample_low', label: '商单样本较少' },
+  { value: 'playback_volatile', label: '播放波动较大' },
+  { value: 'quote_above_playbook_range', label: '报价高于经验估价' },
+  { value: 'quote_above_history_reference', label: '报价高于历史同量级案例' }
 ]
 
 export const NEGOTIATION_REASON_TAG_VALUES = NEGOTIATION_REASON_TAGS.map((tag) => tag.value)
@@ -74,6 +80,12 @@ export function computeNegotiationOutcome({
     // 相对星图刊例价（只在有星图价时可用；没有就是没有，绝不显示 0 折）
     negotiated_vs_xingtu_rate: null,
     negotiated_vs_xingtu_zhe: null,
+    // Phase 4F-B：read-time 派生比率（不落库；命名用于未来 Negotiation Reference 复用）
+    xingtu_discount_ratio: null,
+    xingtu_discount_zhe: null,
+    quote_retention_ratio: null,
+    quote_change_rate: null,
+    initial_quote_to_xingtu_ratio: null,
     // 相对达人报价的变化（可能为降价，也可能为加价）
     quote_drop_amount: null,
     quote_drop_rate: null,
@@ -90,6 +102,9 @@ export function computeNegotiationOutcome({
     result.has_xingtu = true
     result.negotiated_vs_xingtu_rate = round4(rate)
     result.negotiated_vs_xingtu_zhe = toZhe(rate)
+    // 同一事实的「可迁移经验」命名（未来跨量级只传比率，不传绝对价格）
+    result.xingtu_discount_ratio = round4(rate)
+    result.xingtu_discount_zhe = toZhe(rate)
   }
 
   // 报价为 0 是「真实记录到的 0 元报价」，不等于「没有报价」：
@@ -98,11 +113,18 @@ export function computeNegotiationOutcome({
   if (isFiniteNumber(currentQuoteSnapshot)) {
     result.has_quote = true
     if (currentQuoteSnapshot > 0) {
+      // 当前报价 → 星图刊例（比值事实；报价为 0 时不做比例，避免无意义/误导的 0 折）
+      if (isFiniteNumber(xingtuPriceSnapshot) && xingtuPriceSnapshot > 0) {
+        result.initial_quote_to_xingtu_ratio = round4(currentQuoteSnapshot / xingtuPriceSnapshot)
+      }
       const drop = currentQuoteSnapshot - negotiatedPrice
       result.quote_drop_computable = true
       result.quote_drop_amount = round2(drop)
       result.quote_drop_rate = round4(drop / currentQuoteSnapshot)
       result.quote_drop_direction = isGt(drop, 0) ? 'drop' : isGt(-drop, 0) ? 'increase' : 'flat'
+      // 保留率与变化率（变化率带符号：<0 下降 / =0 不变 / >0 上升；绝不出现"下降 -X%"）
+      result.quote_retention_ratio = round4(negotiatedPrice / currentQuoteSnapshot)
+      result.quote_change_rate = round4((negotiatedPrice - currentQuoteSnapshot) / currentQuoteSnapshot)
     }
   }
 

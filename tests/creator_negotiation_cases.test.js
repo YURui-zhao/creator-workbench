@@ -466,7 +466,7 @@ async function main() {
       'A4-42 前后端原因标签 allowlist 完全一致',
       JSON.stringify(displayLib.NEGOTIATION_REASON_TAGS.map((t) => t.value)) ===
         JSON.stringify(caseUtil.NEGOTIATION_REASON_TAG_VALUES) &&
-        displayLib.NEGOTIATION_REASON_TAGS.length === 7
+        displayLib.NEGOTIATION_REASON_TAGS.length === 12
     )
     const rowsA = displayLib.buildNegotiationPriceRows(caseA.data)
     check(

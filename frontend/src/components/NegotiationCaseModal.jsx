@@ -16,8 +16,9 @@ import { createNegotiationCase } from '../api/creatorNegotiationCases'
 import { getErrorMessage } from '../utils/request'
 import { isValidDateOnly, todayLocalDateOnly } from '../utils/recentPerformanceSave.js'
 import {
-  NEGOTIATION_REASON_TAGS,
-  buildNegotiationContextRows
+  buildCandidateNegotiationContextRows,
+  buildNegotiationContextRows,
+  getNegotiationReasonTagsForMode
 } from '../utils/negotiationCaseDisplay.js'
 
 const rowStyle = { display: 'flex', justifyContent: 'space-between', gap: 12 }
@@ -29,7 +30,9 @@ const rowStyle = { display: 'flex', justifyContent: 'space-between', gap: 12 }
  * 星图价 / 达人报价 / CPM30 目标价 / 参考区间由后端在创建时重新读取并冻结，
  * 前端提交的同名字段会被忽略。
  */
-export default function NegotiationCaseModal({ open, decision, onClose, onSaved }) {
+export default function NegotiationCaseModal({ open, decision, onClose, onSaved, mode = 'legacy' }) {
+  // Phase 4F-B：candidate_playbook 模式只展示 Playbook 体系事实，不展示旧 CPM30 目标价 / 参考区间
+  const isCandidateMode = mode === 'candidate_playbook'
   const [priceRaw, setPriceRaw] = useState('')
   const [negotiatedAt, setNegotiatedAt] = useState(() => todayLocalDateOnly())
   const [reasonTags, setReasonTags] = useState([])
@@ -62,6 +65,11 @@ export default function NegotiationCaseModal({ open, decision, onClose, onSaved 
   }, [decision])
 
   const contextRows = useMemo(() => buildNegotiationContextRows(context), [context])
+  const candidateContextRows = useMemo(
+    () => buildCandidateNegotiationContextRows(decision),
+    [decision]
+  )
+  const visibleContextRows = isCandidateMode ? candidateContextRows : contextRows
   const canSave = Boolean(decision?.id) && priceRaw.trim() !== '' && isValidDateOnly(negotiatedAt) && !saving
 
   const handleSave = async () => {
@@ -105,12 +113,14 @@ export default function NegotiationCaseModal({ open, decision, onClose, onSaved 
     >
       <Space direction="vertical" size={10} style={{ display: 'flex' }}>
         <Typography.Text type="secondary">
-          记录真实谈价结果。星图价 / 达人报价 / 目标价 / 参考区间由系统按当时证据冻结，无需填写。
+          {isCandidateMode
+            ? '记录真实谈价结果。星图刊例价 / 当前报价按当时证据冻结，无需填写；此处不涉及 CPM30 体系。'
+            : '记录真实谈价结果。星图价 / 达人报价 / 目标价 / 参考区间由系统按当时证据冻结，无需填写。'}
         </Typography.Text>
 
         <div style={{ border: '1px solid #f0f0f0', borderRadius: 8, padding: 10 }}>
           <Space direction="vertical" size={4} style={{ display: 'flex' }}>
-            {contextRows.map((row) => (
+            {visibleContextRows.map((row) => (
               <div key={row.label} style={rowStyle}>
                 <Typography.Text type="secondary">{row.label}</Typography.Text>
                 <Typography.Text>{row.value}</Typography.Text>
@@ -151,11 +161,13 @@ export default function NegotiationCaseModal({ open, decision, onClose, onSaved 
         </div>
 
         <div>
-          <Typography.Text type="secondary">为什么能谈下来（可多选，可留空）</Typography.Text>
+          <Typography.Text type="secondary">
+            {isCandidateMode ? '谈价原因 / 背景（可多选，可留空）' : '为什么能谈下来（可多选，可留空）'}
+          </Typography.Text>
           <div style={{ marginTop: 6 }}>
             <Checkbox.Group value={reasonTags} onChange={(values) => setReasonTags(values)}>
               <Space direction="vertical" size={4}>
-                {NEGOTIATION_REASON_TAGS.map((tag) => (
+                {getNegotiationReasonTagsForMode(mode).map((tag) => (
                   <Checkbox key={tag.value} value={tag.value}>
                     {tag.label}
                   </Checkbox>
@@ -182,7 +194,11 @@ export default function NegotiationCaseModal({ open, decision, onClose, onSaved 
             value={strategyNote}
             rows={2}
             maxLength={500}
-            placeholder="例如：用历史CPM和CPM30目标价作为依据，并强调后续复投机会。"
+            placeholder={
+              isCandidateMode
+                ? '例如：用历史同量级案例与 Playbook 经验估价作为依据，并强调后续复投机会。'
+                : '例如：用历史CPM和CPM30目标价作为依据，并强调后续复投机会。'
+            }
             onChange={(event) => setStrategyNote(event.target.value)}
           />
         </div>
@@ -191,7 +207,9 @@ export default function NegotiationCaseModal({ open, decision, onClose, onSaved 
 
         <Divider style={{ margin: '2px 0' }} />
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-          谈价结果只做事实记录，不参与 P1 历史判断与 P3 价格规则；实际投放花费仍以投放记录为准。
+          {isCandidateMode
+            ? '谈价结果只做事实记录，不代表系统决策；实际投放花费仍以投放记录为准。'
+            : '谈价结果只做事实记录，不参与 P1 历史判断与 P3 价格规则；实际投放花费仍以投放记录为准。'}
         </Typography.Text>
       </Space>
     </Modal>

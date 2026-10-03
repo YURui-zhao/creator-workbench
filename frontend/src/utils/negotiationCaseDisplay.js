@@ -19,12 +19,31 @@ export const NEGOTIATION_REASON_TAGS = [
   { value: 'batch_cooperation', label: '批量合作' },
   { value: 'creator_price_cut', label: '达人主动让价' },
   { value: 'schedule_factor', label: '档期因素' },
-  { value: 'other', label: '其他' }
+  { value: 'other', label: '其他' },
+  // Phase 4F-B：Playbook 业务经验补充的谈价原因（需与 backend/utils/negotiationCase.js 完全一致）
+  { value: 'sponsored_below_organic', label: '商单播放低于日常' },
+  { value: 'sponsored_sample_low', label: '商单样本较少' },
+  { value: 'playback_volatile', label: '播放波动较大' },
+  { value: 'quote_above_playbook_range', label: '报价高于经验估价' },
+  { value: 'quote_above_history_reference', label: '报价高于历史同量级案例' }
 ]
 
 export const NEGOTIATION_REASON_TAG_LABELS = Object.fromEntries(
   NEGOTIATION_REASON_TAGS.map((tag) => [tag.value, tag.label])
 )
+
+/**
+ * Phase 4F-B：candidate_playbook 模式下不展示的原因标签（**只过滤前端展示**）
+ *   · history_performance_plain（历史投放效果一般）：新 candidate 尚无我方历史投放记录，语义不成立
+ *   · machine code 仍保留在 backend allowlist（legacy Radar 继续显示与使用；旧数据兼容）
+ */
+export const CANDIDATE_HIDDEN_REASON_TAGS = ['history_performance_plain']
+
+/** 按使用场景返回可见的 reason tags（legacy 返回全量，行为不变） */
+export function getNegotiationReasonTagsForMode(mode) {
+  if (mode !== 'candidate_playbook') return NEGOTIATION_REASON_TAGS
+  return NEGOTIATION_REASON_TAGS.filter((tag) => !CANDIDATE_HIDDEN_REASON_TAGS.includes(tag.value))
+}
 
 /** 降幅/增幅百分比：0.2667 → 26.7% */
 export function formatChangePercent(rate) {
@@ -107,4 +126,40 @@ export function buildNegotiationContextRows({ xingtuPrice, currentQuote, targetP
     { label: 'CPM30目标价', value: targetPrice === null || targetPrice === undefined ? '暂无' : formatPrice(targetPrice) },
     { label: 'CPM30参考区间', value: hasRange ? `${formatPrice(referenceLow)}～${formatPrice(referenceHigh)}` : '暂无' }
   ]
+}
+
+/**
+ * Phase 4F-B：candidate Playbook 的谈价上下文（**不**混入旧 CPM30 目标价 / 参考区间）
+ * 数据来自 decision 创建时固化的 pricing_evidence（Playbook 体系），不做任何重算。
+ */
+export function buildCandidateNegotiationContextRows(decision) {
+  const pricing = decision?.pricing_evidence || null
+  const estimate = pricing?.playbook_estimate || null
+  const summary = pricing?.historical_price_reference?.summary || null
+  const rows = [
+    {
+      label: '星图刊例价',
+      value:
+        pricing?.xingtu_price === null || pricing?.xingtu_price === undefined
+          ? '暂无'
+          : formatPrice(pricing.xingtu_price)
+    },
+    {
+      label: '当前报价',
+      value:
+        decision?.current_quote === null || decision?.current_quote === undefined
+          ? '暂无'
+          : formatPrice(decision.current_quote)
+    }
+  ]
+  if (estimate && estimate.estimate_low !== null && estimate.estimate_high !== null) {
+    rows.push({
+      label: 'Playbook 经验估价',
+      value: `${formatPrice(estimate.estimate_low)}～${formatPrice(estimate.estimate_high)}`
+    })
+  }
+  if (summary && summary.cost_median !== null && summary.cost_median !== undefined) {
+    rows.push({ label: '历史案例成交中位', value: formatPrice(summary.cost_median) })
+  }
+  return rows
 }

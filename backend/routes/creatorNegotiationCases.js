@@ -83,6 +83,13 @@ router.post('/', (req, res) => {
   if (decision.decision_stage !== 'post_quote') {
     return fail(res, 400, '只有「已拿到报价」阶段的决策才能记录谈价结果')
   }
+  // Phase 4F-B：candidate 决策必须来自「继续议价」这一条（candidate 的 proceed / small_test / pause 不可记录谈价）
+  // 说明：legacy（candidate_id = NULL）保持既有宽松行为（只校验 stage），本阶段不收紧旧契约，
+  //      也兼容 historically「post_quote + repurchase/small_test 也记录谈价」的旧用法。
+  const isCandidateDecision = decision.candidate_id !== null && decision.candidate_id !== undefined
+  if (isCandidateDecision && decision.human_decision !== 'negotiate') {
+    return fail(res, 400, '候选达人只有「继续议价」的报价阶段决策才能记录谈价结果')
+  }
 
   const negotiatedPrice = parseNegotiatedPrice(body.negotiated_price)
   if (negotiatedPrice === null) {

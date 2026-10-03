@@ -3,6 +3,7 @@ import {
   Alert,
   Button,
   Card,
+  Checkbox,
   Col,
   Descriptions,
   Divider,
@@ -33,6 +34,10 @@ import {
 import { distillCreatorNote, getAiStatus } from '../../api/ai'
 import { getAiConfig } from '../../utils/aiConfig.js'
 import { getErrorMessage } from '../../utils/request'
+import {
+  getDecisionOutcomeCandidates,
+  linkDecisionOutcome
+} from '../../api/creatorDecisions'
 import { formatInteger, formatPlays } from '../../utils/format'
 import { TREND_LABELS_FULL } from '../../utils/recentPerformanceSave.js'
 import { buildCreatorPlaybookAssessment } from '../../utils/creatorPlaybookRules.js'
@@ -196,6 +201,15 @@ export default function CreatorPlaybook() {
   const [postQuoteDecision, setPostQuoteDecision] = useState(null)
   const [postQuoteNote, setPostQuoteNote] = useState('')
   const [savingPostQuote, setSavingPostQuote] = useState(false)
+  // Phase 4E：实际投放结果关联
+  const [outcomeOpen, setOutcomeOpen] = useState(false)
+  const [outcomeCandidates, setOutcomeCandidates] = useState([])
+  const [outcomeLoading, setOutcomeLoading] = useState(false)
+  const [outcomeError, setOutcomeError] = useState('')
+  const [selectedOutcomeRecordId, setSelectedOutcomeRecordId] = useState(null)
+  const [outcomeIdentityConfirmed, setOutcomeIdentityConfirmed] = useState(false)
+  const [outcomeTimingConfirmed, setOutcomeTimingConfirmed] = useState(false)
+  const [savingOutcome, setSavingOutcome] = useState(false)
   const [createOpen, setCreateOpen] = useState(false)
   const [creating, setCreating] = useState(false)
   const [assistantOpen, setAssistantOpen] = useState(false)
@@ -311,6 +325,11 @@ export default function CreatorPlaybook() {
     setPostQuoteAmount('')
     setPostQuoteDecision(null)
     setPostQuoteNote('')
+    setOutcomeOpen(false)
+    setOutcomeCandidates([])
+    setSelectedOutcomeRecordId(null)
+    setOutcomeIdentityConfirmed(false)
+    setOutcomeTimingConfirmed(false)
   }, [selectedId])
 
   // AI 可用性：会话 Key（本地）或后端环境变量任一可用即可；查询失败不影响页面其它能力
@@ -519,6 +538,11 @@ export default function CreatorPlaybook() {
   const latestReviewDecision = decisions.find((item) => item.decision_stage === 'candidate_review') || null
   const latestPostQuoteDecision = decisions.find((item) => item.decision_stage === 'post_quote') || null
   const reviewContactConfirmed = latestReviewDecision?.human_decision === 'contact'
+  // Phase 4E：只以「最新 post_quote」为当前状态（不越过更晚的 negotiate / pause 去找早期 proceed）
+  const latestPostQuoteEligible =
+    Boolean(latestPostQuoteDecision) &&
+    ['proceed', 'small_test'].includes(latestPostQuoteDecision.human_decision)
+  const currentOutcome = latestPostQuoteDecision?.outcome || null
 
   // 报价阶段：必须由用户主动点击后打开，无默认选中
   const openPostQuote = () => {
@@ -548,6 +572,57 @@ export default function CreatorPlaybook() {
       // 失败提示由 request 响应拦截器统一给出，这里不再重复 toast
     } finally {
       setSavingPostQuote(false)
+    }
+  }
+
+  // Phase 4E：关联真实投放记录（候选列表来自既有 outcome-candidates 接口，前端不自己查 records）
+  const selectedOutcomeCandidate =
+    outcomeCandidates.find((item) => item.record_id === selectedOutcomeRecordId) || null
+
+  const openOutcome = async () => {
+    if (!latestPostQuoteDecision) return
+    setOutcomeOpen(true)
+    setOutcomeCandidates([])
+    setSelectedOutcomeRecordId(null)
+    setOutcomeIdentityConfirmed(false)
+    setOutcomeTimingConfirmed(false)
+    setOutcomeError('')
+    setOutcomeLoading(true)
+    try {
+      const res = await getDecisionOutcomeCandidates(latestPostQuoteDecision.id)
+      setOutcomeCandidates(res?.data?.candidates || [])
+    } catch (error) {
+      setOutcomeError(getErrorMessage(error))
+    } finally {
+      setOutcomeLoading(false)
+    }
+  }
+
+  const handleLinkOutcome = async () => {
+    if (!latestPostQuoteDecision || !selectedOutcomeCandidate || savingOutcome) return
+    if (selectedOutcomeCandidate.requires_identity_confirmation && !outcomeIdentityConfirmed) {
+      message.warning('请先确认这条投放记录属于当前候选达人')
+      return
+    }
+    if (selectedOutcomeCandidate.requires_timing_confirmation && !outcomeTimingConfirmed) {
+      message.warning('请先确认发布时间与当前决策的时间关系')
+      return
+    }
+    setSavingOutcome(true)
+    try {
+      // 只提交 record_id + 两个人工确认 flag；candidate / decision / evidence 由后端决定
+      await linkDecisionOutcome(latestPostQuoteDecision.id, {
+        recordId: selectedOutcomeCandidate.record_id,
+        identityConfirmed: outcomeIdentityConfirmed,
+        timingConfirmed: outcomeTimingConfirmed
+      })
+      message.success('已关联实际投放')
+      setOutcomeOpen(false)
+      await loadDecisions(selected.id)
+    } catch {
+      // 失败提示由 request 响应拦截器统一给出，这里不再重复 toast
+    } finally {
+      setSavingOutcome(false)
     }
   }
 
@@ -1006,6 +1081,55 @@ export default function CreatorPlaybook() {
                     </div>
                   )}
                 </div>
+
+                <Divider style={{ margin: '12px 0' }} />
+
+                {/* Phase 4E：实际投放结果（只针对「最新 post_quote 且 eligible」的决策） */}
+                <div>
+                  <Typography.Text strong>实际投放结果</Typography.Text>
+                  {!latestPostQuoteEligible ? (
+                    <Typography.Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 6 }}>
+                      尚未进入可关联实际投放结果的阶段。
+                    </Typography.Text>
+                  ) : currentOutcome ? (
+                    <Space direction="vertical" size={2} style={{ display: 'flex', marginTop: 6 }}>
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        已关联实际投放
+                      </Typography.Text>
+                      <Typography.Text>达人：{currentOutcome.creator || '-'}</Typography.Text>
+                      <Typography.Text type="secondary">
+                        发布日期：{currentOutcome.publish_date || '-'} · 实际合作成本：
+                        {formatPrice(currentOutcome.total_cost) ?? '-'}
+                      </Typography.Text>
+                      <Typography.Text type="secondary">
+                        7日播放：{formatPlays(currentOutcome.first_play)} · 累计播放：
+                        {formatPlays(currentOutcome.latest_play)} · 最终 CPM：
+                        {currentOutcome.latest_cpm ?? '-'}
+                      </Typography.Text>
+                      <Typography.Text type="secondary">
+                        关联时间：{String(currentOutcome.linked_at || '').slice(0, 16)}
+                      </Typography.Text>
+                      <Space size={6} wrap>
+                        {currentOutcome.link_evidence?.identity?.override_used && (
+                          <Tag>人工确认身份关联</Tag>
+                        )}
+                        {currentOutcome.link_evidence?.timing?.override_used && (
+                          <Tag>人工确认发布时间关系</Tag>
+                        )}
+                      </Space>
+                    </Space>
+                  ) : (
+                    <Space size={8} wrap align="center" style={{ marginTop: 6 }}>
+                      <Typography.Text type="secondary">
+                        当前投放决定：
+                        {latestPostQuoteDecision.human_decision_label || latestPostQuoteDecision.human_decision}
+                      </Typography.Text>
+                      <Button type="primary" onClick={openOutcome}>
+                        关联实际投放记录
+                      </Button>
+                    </Space>
+                  )}
+                </div>
               </div>
             </Card>
           )}
@@ -1206,6 +1330,105 @@ export default function CreatorPlaybook() {
             />
           </div>
         </Space>
+      </Modal>
+
+      {/* Phase 4E：选择真实投放记录（候选来自既有 outcome-candidates 接口） */}
+      <Modal
+        title="关联实际投放记录"
+        open={outcomeOpen}
+        onCancel={() => setOutcomeOpen(false)}
+        onOk={handleLinkOutcome}
+        confirmLoading={savingOutcome}
+        okText="关联"
+        cancelText="取消"
+        okButtonProps={{ disabled: !selectedOutcomeCandidate }}
+        destroyOnClose
+        width={720}
+      >
+        {outcomeLoading ? (
+          <Typography.Text type="secondary">加载可关联记录…</Typography.Text>
+        ) : outcomeError ? (
+          <Typography.Text type="danger">{outcomeError}</Typography.Text>
+        ) : outcomeCandidates.length === 0 ? (
+          <Space direction="vertical" size={8}>
+            <Typography.Text type="secondary">
+              暂未找到可关联的真实投放记录。请先在投放记录中录入或导入实际合作结果，再回来关联。
+            </Typography.Text>
+            <Button size="small" onClick={openOutcome}>
+              刷新
+            </Button>
+          </Space>
+        ) : (
+          <Space direction="vertical" size={10} style={{ display: 'flex' }}>
+            <List
+              size="small"
+              dataSource={outcomeCandidates}
+              renderItem={(item) => (
+                <List.Item
+                  style={{
+                    cursor: 'pointer',
+                    background: item.record_id === selectedOutcomeRecordId ? 'rgba(22,119,255,0.06)' : undefined,
+                    borderRadius: 4,
+                    paddingLeft: 8,
+                    paddingRight: 8
+                  }}
+                  onClick={() => {
+                    setSelectedOutcomeRecordId(item.record_id)
+                    setOutcomeIdentityConfirmed(false)
+                    setOutcomeTimingConfirmed(false)
+                  }}
+                >
+                  <Space direction="vertical" size={2} style={{ display: 'flex' }}>
+                    <Space size={6} wrap>
+                      <Typography.Text strong>{item.creator}</Typography.Text>
+                      <Typography.Text type="secondary">{item.publish_date || '-'}</Typography.Text>
+                      {item.already_linked && <Tag>已关联其他决策</Tag>}
+                    </Space>
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      实际合作 {formatPrice(item.total_cost) ?? '-'} · 7日播放 {formatPlays(item.first_play)} · 累计播放{' '}
+                      {formatPlays(item.latest_play)} · 最终 CPM {item.latest_cpm ?? '-'}
+                    </Typography.Text>
+                  </Space>
+                </List.Item>
+              )}
+            />
+
+            {selectedOutcomeCandidate?.requires_identity_confirmation && (
+              <div style={{ padding: 8, background: 'rgba(0,0,0,0.02)', borderRadius: 4 }}>
+                <Checkbox
+                  checked={outcomeIdentityConfirmed}
+                  onChange={(event) => setOutcomeIdentityConfirmed(event.target.checked)}
+                >
+                  我确认这条投放记录属于当前候选达人
+                </Checkbox>
+                {selectedOutcomeCandidate.identity_reason === 'ambiguous_name' ? (
+                  <Typography.Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 4 }}>
+                    存在多个同名候选达人，仅凭名称无法确认身份归属。
+                  </Typography.Text>
+                ) : (
+                  <Typography.Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 4 }}>
+                    候选达人当前名称：{selected?.name || '-'}；投放记录名称：{selectedOutcomeCandidate.creator || '-'}
+                  </Typography.Text>
+                )}
+              </div>
+            )}
+
+            {selectedOutcomeCandidate?.requires_timing_confirmation && (
+              <div style={{ padding: 8, background: 'rgba(0,0,0,0.02)', borderRadius: 4 }}>
+                <Checkbox
+                  checked={outcomeTimingConfirmed}
+                  onChange={(event) => setOutcomeTimingConfirmed(event.target.checked)}
+                >
+                  我确认该发布时间与当前决策的时间关系无误
+                </Checkbox>
+                <Typography.Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 4 }}>
+                  决策时间：{String(latestPostQuoteDecision?.created_at || '').slice(0, 16)}；投放发布日期：
+                  {selectedOutcomeCandidate.publish_date || '-'}
+                </Typography.Text>
+              </div>
+            )}
+          </Space>
+        )}
       </Modal>
 
       {/* D. 复用现有近期表现助手（候选模式：按 candidate_id 保存 / 读取） */}

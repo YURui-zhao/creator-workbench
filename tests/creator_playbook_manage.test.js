@@ -106,7 +106,7 @@ function main() {
 
   console.log('\n===== 5. 提示 / 语义 =====')
   const successCount = (page.match(/message\.success\(/g) || []).length
-  check('每个动作各一次成功提示（创建 / AI整理 / 星图ID / 复制 / 资料 / 决定 / 报价决定）', successCount === 7, String(successCount))
+  check('每个动作各一次成功提示（创建 / AI整理 / 星图ID / 复制 / 资料 / 决定 / 报价决定 / 关联投放）', successCount === 8, String(successCount))
   check('复制使用 clipboard API，失败时明确报错（不静默假成功）', /navigator\.clipboard\.writeText/.test(page) && /复制失败/.test(page))
   check('编辑资料保存成功后刷新候选（loadCandidates）', /await updateCreatorCandidate\(editingCandidate\.id, \{[\s\S]{0,300}?await loadCandidates\(\)/.test(page))
   check('编辑资料保存后清空未保存的 AI 预览', /setDistillPreview\(null\)[\s\S]{0,80}?await loadCandidates\(\)/.test(page))
@@ -149,6 +149,22 @@ function main() {
   check('保存后展示最近报价阶段事实', /最近报价阶段/.test(page) && /报价位置：/.test(page) && /折/.test(page))
   check('报价位置文案为事实描述', /低于经验区间/.test(page) && /位于经验区间/.test(page) && /高于经验区间/.test(page))
   check('不自动弹窗（默认 false）', /const \[postQuoteOpen, setPostQuoteOpen\] = useState\(false\)/.test(page))
+
+  console.log('\n===== 11. 实际投放结果（Phase 4E） =====')
+  check('引入 outcome API（复用既有接口）', /getDecisionOutcomeCandidates\(/.test(page) && /linkDecisionOutcome\(/.test(page))
+  check('只以「最新 post_quote」判定 eligible（不越过更晚的 pause）', /const latestPostQuoteDecision = decisions\.find\(\(item\) => item\.decision_stage === 'post_quote'\) \|\| null/.test(page) && /latestPostQuoteEligible/.test(page) && /\['proceed', 'small_test'\]\.includes\(latestPostQuoteDecision\.human_decision\)/.test(page))
+  check('状态 A 空态文案', /尚未进入可关联实际投放结果的阶段/.test(page))
+  check('状态 B CTA「关联实际投放记录」', /关联实际投放记录/.test(page))
+  check('状态 C 展示达人 / 发布日期 / 成本 / 7日 / 累计 / 最终 CPM / 关联时间', /达人：/.test(page) && /实际合作成本/.test(page) && /7日播放/.test(page) && /累计播放/.test(page) && /最终 CPM/.test(page) && /关联时间：/.test(page))
+  check('override Tag：人工确认身份关联 / 人工确认发布时间关系', /人工确认身份关联/.test(page) && /人工确认发布时间关系/.test(page))
+  check('无候选记录空态 + 刷新', /暂未找到可关联的真实投放记录/.test(page) && /请先在投放记录中录入或导入实际合作结果/.test(page) && /onClick=\{openOutcome\}>\s*刷新/.test(page))
+  check('identity 确认 checkbox + 两种原因文案', /我确认这条投放记录属于当前候选达人/.test(page) && /存在多个同名候选达人，仅凭名称无法确认身份归属/.test(page) && /投放记录名称：/.test(page))
+  check('timing 确认 checkbox + 时间展示（两个独立 checkbox）', /我确认该发布时间与当前决策的时间关系无误/.test(page) && /决策时间：/.test(page) && (page.match(/<Checkbox/g) || []).length >= 2)
+  check('POST 只发送 record_id + 两个确认 flag', /linkDecisionOutcome\(latestPostQuoteDecision\.id, \{\s*recordId: selectedOutcomeCandidate\.record_id,\s*identityConfirmed: outcomeIdentityConfirmed,\s*timingConfirmed: outcomeTimingConfirmed\s*\}\)/.test(page))
+  check('未提交 candidate / creator / evidence', !/linkDecisionOutcome\([\s\S]{0,200}candidate_id|linkDecisionOutcome\([\s\S]{0,200}link_evidence/.test(page))
+  check('需要确认但未勾选 -> 阻止提交', /requires_identity_confirmation && !outcomeIdentityConfirmed/.test(page) && /requires_timing_confirmation && !outcomeTimingConfirmed/.test(page))
+  check('成功后刷新 decisions', /已关联实际投放[\s\S]{0,120}await loadDecisions\(selected\.id\)/.test(page))
+  check('关联 Modal 使用 confirmLoading 防重复提交', /confirmLoading=\{savingOutcome\}/.test(page))
 }
 
 main()

@@ -23,6 +23,8 @@ import {
 } from './creatorDecisions.js'
 // 复用既有报价原文解析器（不复制第二套解析逻辑）
 import { parsePriceText } from '../utils/screenshotValues.js'
+// Phase 4E：候选决策历史附带 outcome（live 事实；无关联为 null）
+import { loadOutcomeSummaries } from './creatorDecisionOutcomes.js'
 
 /**
  * 候选达人身份层（V3-alpha.3 Playbook Phase 1）
@@ -727,10 +729,11 @@ router.get('/:id/decisions', (req, res) => {
   const rows = db
     .prepare('SELECT * FROM creator_decisions WHERE candidate_id = ? ORDER BY created_at DESC, id DESC')
     .all(row.id)
+  const outcomeMap = loadOutcomeSummaries(rows)
   ok(res, {
     candidate_id: row.id,
     creator: row.name,
-    decisions: rows.map((item) => toPublicDecision(item, null, null))
+    decisions: rows.map((item) => toPublicDecision(item, outcomeMap.get(item.id) || null, null))
   })
 })
 

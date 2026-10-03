@@ -108,33 +108,124 @@ export function evaluateOutcomeIdentity({
       return {
         ok: false,
         code: 400,
-        mode: 'legacy',
+        mode: 'legacy_exact_name',
+        nameMatch: false,
+        candidateNameAmbiguous: false,
         requiresIdentityConfirmation: false,
+        overrideUsed: false,
         message: `投放记录 #${recordId} 属于「${recordName || '未命名'}」，不能关联给达人「${frozenCreator}」的决策`
       }
     }
-    return { ok: true, mode: 'legacy', requiresIdentityConfirmation: false }
+    return {
+      ok: true,
+      mode: 'legacy_exact_name',
+      nameMatch: true,
+      candidateNameAmbiguous: false,
+      requiresIdentityConfirmation: false,
+      overrideUsed: false
+    }
   }
 
   const currentName = String(candidateName ?? '').trim()
   const nameMatches = recordName === currentName
   // 名称唯一且一致 → 直接通过；名称重复（存在多个同名候选）时即使一致也不能静默通过
   if (nameMatches && candidateNameAmbiguous !== true) {
-    return { ok: true, mode: 'candidate', requiresIdentityConfirmation: false }
+    return {
+      ok: true,
+      mode: 'candidate_current_name',
+      nameMatch: true,
+      candidateNameAmbiguous: false,
+      requiresIdentityConfirmation: false,
+      overrideUsed: false
+    }
   }
   if (identityConfirmed !== true) {
     return {
       ok: false,
       code: 409,
-      mode: 'candidate',
+      mode: 'candidate_identity_override',
+      nameMatch: nameMatches,
+      candidateNameAmbiguous: candidateNameAmbiguous === true,
       requiresIdentityConfirmation: true,
+      overrideUsed: false,
       ambiguousName: nameMatches,
       message: nameMatches
         ? '存在多个同名候选达人，仅凭名称无法确认该投放记录的身份归属。如确认该记录属于当前候选达人，请显式确认后再关联。'
         : '投放记录中的达人名称与当前候选达人名称不同。如果确认这是同一达人，请显式确认身份后再关联。'
     }
   }
-  return { ok: true, mode: 'candidate', requiresIdentityConfirmation: true }
+  return {
+    ok: true,
+    mode: 'candidate_identity_override',
+    nameMatch: nameMatches,
+    candidateNameAmbiguous: candidateNameAmbiguous === true,
+    requiresIdentityConfirmation: true,
+    overrideUsed: true
+  }
+}
+
+/** Outcome linking 证据版本（Phase 4E） */
+export const OUTCOME_LINK_EVIDENCE_VERSION = 'outcome-link-v0.1'
+
+/**
+ * Phase 4E：timing 确认评估（纯函数，规则与既有 computeTimingWarning 完全一致）
+ *   · confirmation_required：发布日期早于决策创建日期
+ *   · override_used = required && provided（只有「本来需要 + 用户显式确认」才算人工 override）
+ */
+export function evaluateOutcomeTiming({
+  publishDate = null,
+  decisionCreatedAt = null,
+  timingConfirmed = false
+} = {}) {
+  const confirmationRequired = computeTimingWarning(publishDate, decisionCreatedAt) === true
+  const confirmationProvided = timingConfirmed === true
+  return {
+    confirmationRequired,
+    confirmationProvided,
+    overrideUsed: confirmationRequired && confirmationProvided,
+    decisionCreatedAt: decisionCreatedAt ?? null,
+    recordPublishDate: publishDate ?? null
+  }
+}
+
+/**
+ * Phase 4E：冻结一次 outcome linking 事件的完整上下文
+ * 只记录「为什么允许关联」（身份 / 时间的人工确认证据），不复制 creator_record 的业务结果事实。
+ * confirmation_provided 记录「请求是否显式传了 true」；override_used 只在「本来必须确认 + 已确认」时为 true，
+ * 避免「本来名称一致却误传 identity_confirmed=true」被记成人工 override 的假历史。
+ */
+export function buildOutcomeLinkEvidence({
+  candidateId = null,
+  frozenDecisionCreator = '',
+  candidateNameAtLink = null,
+  recordNickname = '',
+  identity = {},
+  identityConfirmationProvided = false,
+  timing = {},
+  timingConfirmationProvided = false
+} = {}) {
+  return {
+    version: OUTCOME_LINK_EVIDENCE_VERSION,
+    identity: {
+      candidate_id: candidateId ?? null,
+      frozen_decision_creator: frozenDecisionCreator ?? null,
+      candidate_name_at_link: candidateNameAtLink ?? null,
+      record_nickname: recordNickname ?? null,
+      candidate_name_ambiguous: identity.candidateNameAmbiguous === true,
+      name_match: identity.nameMatch === true,
+      confirmation_required: identity.requiresIdentityConfirmation === true,
+      confirmation_provided: identityConfirmationProvided === true,
+      override_used: identity.overrideUsed === true,
+      mode: identity.mode ?? null
+    },
+    timing: {
+      decision_created_at: timing.decisionCreatedAt ?? null,
+      record_publish_date: timing.recordPublishDate ?? null,
+      confirmation_required: timing.confirmationRequired === true,
+      confirmation_provided: timingConfirmationProvided === true,
+      override_used: timing.overrideUsed === true
+    }
+  }
 }
 
 /** 解析 'YYYY-MM-DD HH:MM:SS' / 'YYYY-MM-DD' 的日期部分 */
@@ -209,6 +300,7 @@ export function buildOutcomeSummary(linkRow, recordRow, { targetCpm = TARGET_CPM
     link_id: linkRow.id,
     linked_at: linkRow.linked_at ?? null,
     record_id: recordRow.id,
+    creator: recordRow.nickname ?? null,
     publish_date: recordRow.publish_date ?? null,
     creator_type: recordRow.creator_type ?? null,
     total_cost: facts.total_cost,
@@ -221,7 +313,19 @@ export function buildOutcomeSummary(linkRow, recordRow, { targetCpm = TARGET_CPM
     latest_status_label: facts.latest_status_label,
     target_cpm: targetCpm,
     target_cpm_status: status,
-    target_cpm_status_label: TARGET_CPM_STATUS_LABELS[status]
+    target_cpm_status_label: TARGET_CPM_STATUS_LABELS[status],
+    // Phase 4E：linking 事件证据（已解析；旧关联为 null）。绝不把 raw JSON string 暴露给前端。
+    link_evidence: parseLinkEvidence(linkRow.link_evidence_json)
+  }
+}
+
+/** 解析 outcome linking 证据（非法 / 缺失 -> null） */
+function parseLinkEvidence(text) {
+  if (!text) return null
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
   }
 }
 

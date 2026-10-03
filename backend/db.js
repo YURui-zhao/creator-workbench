@@ -161,6 +161,9 @@ db.exec(`
     decision_id INTEGER NOT NULL,
     record_id INTEGER NOT NULL,
     linked_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    -- Phase 4E：冻结「当时为什么允许建立关联」的 linking 事件上下文（identity / timing 人工确认证据）
+    -- 只记录关联事件本身；花费 / 播放 / CPM 等结果事实仍实时取自 creator_records
+    link_evidence_json TEXT,
     UNIQUE(decision_id),
     UNIQUE(record_id)
   );
@@ -291,6 +294,17 @@ if (!decisionColumns.includes('candidate_id')) {
 db.exec(
   'CREATE INDEX IF NOT EXISTS idx_creator_decisions_candidate_created ON creator_decisions(candidate_id, created_at)'
 )
+
+// Phase 4E：为既有 creator_decision_outcomes 安全补充 link_evidence_json（旧关联保持 NULL）
+// 说明：只在列不存在时 ALTER TABLE；不修改任何旧 outcome 行；无 FK，保持全库风格。
+const outcomeColumns = db
+  .prepare('PRAGMA table_info(creator_decision_outcomes)')
+  .all()
+  .map((column) => column.name)
+if (!outcomeColumns.includes('link_evidence_json')) {
+  db.exec('ALTER TABLE creator_decision_outcomes ADD COLUMN link_evidence_json TEXT')
+  console.log('[db] 已为 creator_decision_outcomes 添加 link_evidence_json 列（旧关联保持 NULL）')
+}
 
 // 首次启动写入示例项目（前端工作台展示用）
 const projectCount = db.prepare('SELECT COUNT(*) AS n FROM projects').get().n

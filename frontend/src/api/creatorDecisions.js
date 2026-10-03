@@ -35,11 +35,21 @@ export function getDecisionOutcomeCandidates(decisionId) {
   return request.get(`/creator-decisions/${decisionId}/outcome-candidates`)
 }
 
-/** P5：把一条真实投放记录关联到决策（只提交关联关系，不提交任何派生指标） */
-export function linkDecisionOutcome(decisionId, { recordId, timingConfirmed = false }) {
+/**
+ * P5：把一条真实投放记录关联到决策（只提交关联关系 + 人工确认 flag，不提交任何派生指标）
+ * Phase 4E：candidate 跨名称 / 同名歧义需要 identity_confirmed；link evidence 全部由后端冻结。
+ */
+export function linkDecisionOutcome(
+  decisionId,
+  { recordId, timingConfirmed = false, identityConfirmed = false }
+) {
   return request.post(
     `/creator-decisions/${decisionId}/outcome`,
-    { record_id: recordId, timing_confirmed: timingConfirmed === true },
+    {
+      record_id: recordId,
+      timing_confirmed: timingConfirmed === true,
+      identity_confirmed: identityConfirmed === true
+    },
     { timeout: 20000 }
   )
 }

@@ -3,9 +3,11 @@ import db from '../db.js'
 import { toPublicDecision } from './creatorDecisions.js'
 import {
   buildOutcomeCandidates,
+  buildOutcomeLinkEvidence,
   buildOutcomeSummary,
   computeTimingWarning,
   evaluateOutcomeIdentity,
+  evaluateOutcomeTiming,
   isDecisionEligibleForOutcome
 } from '../utils/creatorDecisionOutcome.js'
 import { TARGET_CPM } from '../utils/creatorBusinessRules.js'
@@ -146,7 +148,7 @@ export function loadOutcomeSummaries(decisionRows = []) {
   const rows = db
     .prepare(
       `SELECT o.id AS link_id, o.decision_id AS link_decision_id, o.record_id AS link_record_id,
-              o.linked_at AS link_linked_at,
+              o.linked_at AS link_linked_at, o.link_evidence_json AS link_evidence_json,
               r.id AS record_id, r.nickname, r.creator_type, r.total_cost, r.publish_date,
               r.first_play, r.second_week_play
        FROM creator_decision_outcomes o
@@ -156,7 +158,13 @@ export function loadOutcomeSummaries(decisionRows = []) {
     .all(...ids)
   for (const row of rows) {
     const summary = buildOutcomeSummary(
-      { id: row.link_id, decision_id: row.link_decision_id, record_id: row.link_record_id, linked_at: row.link_linked_at },
+      {
+        id: row.link_id,
+        decision_id: row.link_decision_id,
+        record_id: row.link_record_id,
+        linked_at: row.link_linked_at,
+        link_evidence_json: row.link_evidence_json
+      },
       { ...row, id: row.record_id },
       { targetCpm: targetByDecision.get(row.link_decision_id) ?? TARGET_CPM }
     )
@@ -194,12 +202,48 @@ router.get('/:id/outcome-candidates', (req, res) => {
     decisionCreatedAt: decision.created_at,
     linkMap
   })
+  // Phase 4E：为每条记录附加只读「预检查」元数据，帮助 UI 提前提示需要哪些人工确认。
+  // 注意：这只是 UI 提示，最终 authorization 仍由 POST outcome 重新完整校验，绝不因为 GET 通过而跳过。
+  const isCandidateDecision = decision.candidate_id !== null && decision.candidate_id !== undefined
+  const candidateRow = isCandidateDecision ? findCandidate(decision.candidate_id) : null
+  const currentCandidateName = candidateRow?.name ?? null
+  const precheckAmbiguous =
+    isCandidateDecision && currentCandidateName ? countCandidatesWithName(currentCandidateName) > 1 : false
+  const candidatesWithPrecheck = candidates.map((item) => {
+    const recordRow = records.find((row) => row.id === item.record_id)
+    const identityPrecheck = evaluateOutcomeIdentity({
+      candidateId: decision.candidate_id,
+      candidateName: currentCandidateName,
+      frozenCreator: String(decision.creator ?? ''),
+      recordNickname: recordRow?.nickname ?? '',
+      recordId: item.record_id,
+      identityConfirmed: false,
+      candidateNameAmbiguous: precheckAmbiguous
+    })
+    const timingPrecheck = evaluateOutcomeTiming({
+      publishDate: recordRow?.publish_date,
+      decisionCreatedAt: decision.created_at,
+      timingConfirmed: false
+    })
+    return {
+      ...item,
+      requires_identity_confirmation: identityPrecheck.ok === false,
+      identity_reason:
+        identityPrecheck.ok === false
+          ? identityPrecheck.nameMatch
+            ? 'ambiguous_name'
+            : 'name_mismatch'
+          : null,
+      requires_timing_confirmation: timingPrecheck.confirmationRequired === true,
+      timing_reason: timingPrecheck.confirmationRequired ? 'publish_before_decision' : null
+    }
+  })
   // 仅对 candidate 决策附加可解释 metadata（旧达人响应保持原样）；
   // 这只是「记录从哪个名称被发现」，绝不表示身份已确认。
   const enrichedCandidates =
     discovery.currentName === null
-      ? candidates
-      : candidates.map((item) => {
+      ? candidatesWithPrecheck
+      : candidatesWithPrecheck.map((item) => {
           const matchesCurrent = item.creator === discovery.currentName
           const matchesFrozen = item.creator === discovery.frozenName
           const source =
@@ -274,6 +318,15 @@ router.post('/:id/outcome', (req, res) => {
     return fail(res, identity.code, identity.message)
   }
 
+  // Phase 4E：timing 评估（与既有规则完全一致；identity / timing 永久独立）
+  const timing = evaluateOutcomeTiming({
+    publishDate: record.publish_date,
+    decisionCreatedAt: decision.created_at,
+    timingConfirmed: body.timing_confirmed === true
+  })
+  const identityConfirmationProvided = body.identity_confirmed === true
+  const timingConfirmationProvided = body.timing_confirmed === true
+
   const existingForDecision = findLinkByDecision(id)
   if (existingForDecision) {
     return fail(res, 409, `决策 #${id} 已关联投放记录 #${existingForDecision.record_id}，请先解除关联`)
@@ -283,14 +336,25 @@ router.post('/:id/outcome', (req, res) => {
     return fail(res, 409, `投放记录 #${recordId} 已关联决策 #${existingForRecord.decision_id}，不能重复关联`)
   }
 
-  const timingWarning = computeTimingWarning(record.publish_date, decision.created_at)
-  if (timingWarning && body.timing_confirmed !== true) {
+  if (timing.confirmationRequired && !timing.confirmationProvided) {
     return fail(
       res,
       400,
       '该投放记录的发布日期早于本次决策记录，请确认是否关联正确（需 timing_confirmed=true）'
     )
   }
+
+  // 冻结「为什么允许这条关联」——与 outcome 插入在同一事务中，二者要么都成功、要么都不写
+  const linkEvidence = buildOutcomeLinkEvidence({
+    candidateId: decision.candidate_id ?? null,
+    frozenDecisionCreator: String(decision.creator ?? ''),
+    candidateNameAtLink: candidateName,
+    recordNickname: record.nickname ?? null,
+    identity,
+    identityConfirmationProvided,
+    timing,
+    timingConfirmationProvided
+  })
 
   // 校验 + INSERT 放在同一事务，避免检查后状态变化；UNIQUE 约束是并发下的最终保护。
   let link
@@ -307,8 +371,10 @@ router.post('/:id/outcome', (req, res) => {
         throw error
       }
       const info = db
-        .prepare('INSERT INTO creator_decision_outcomes (decision_id, record_id) VALUES (?, ?)')
-        .run(id, recordId)
+        .prepare(
+          'INSERT INTO creator_decision_outcomes (decision_id, record_id, link_evidence_json) VALUES (?, ?, ?)'
+        )
+        .run(id, recordId, JSON.stringify(linkEvidence))
       return db.prepare('SELECT * FROM creator_decision_outcomes WHERE id = ?').get(info.lastInsertRowid)
     })()
   } catch (error) {

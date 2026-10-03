@@ -88,12 +88,12 @@ async function main() {
     const evalIdentity = (args) => evaluateOutcomeIdentity(args)
 
     console.log('===== 1. 纯函数：旧达人路径 =====')
-    check('legacy 名称相同 -> pass', (() => { const r = evalIdentity({ candidateId: null, frozenCreator: '旧达人', recordNickname: '旧达人', recordId: 1 }); return r.ok === true && r.mode === 'legacy' })())
+    check('legacy 名称相同 -> pass', (() => { const r = evalIdentity({ candidateId: null, frozenCreator: '旧达人', recordNickname: '旧达人', recordId: 1 }); return r.ok === true && r.mode === 'legacy_exact_name' })())
     check('legacy 名称不同 + 未确认 -> reject（400）', (() => { const r = evalIdentity({ candidateId: null, frozenCreator: '旧达人', recordNickname: '别的', recordId: 1, identityConfirmed: false }); return r.ok === false && r.code === 400 && !r.requiresIdentityConfirmation })())
     check('legacy 名称不同 + identityConfirmed=true -> 仍 reject（flag 对旧达人无效）', (() => { const r = evalIdentity({ candidateId: null, frozenCreator: '旧达人', recordNickname: '别的', recordId: 1, identityConfirmed: true }); return r.ok === false && r.code === 400 })())
 
     console.log('\n===== 2. 纯函数：candidate 路径 =====')
-    check('candidate 当前名一致 -> pass', (() => { const r = evalIdentity({ candidateId: 1, candidateName: '新名', frozenCreator: '旧名', recordNickname: '新名', recordId: 2 }); return r.ok === true && r.mode === 'candidate' })())
+    check('candidate 当前名一致 -> pass', (() => { const r = evalIdentity({ candidateId: 1, candidateName: '新名', frozenCreator: '旧名', recordNickname: '新名', recordId: 2 }); return r.ok === true && r.mode === 'candidate_current_name' })())
     check('candidate 改名：frozen 旧名 / 当前新名 / record 新名 -> pass（不要求匹配 frozen）', (() => { const r = evalIdentity({ candidateId: 1, candidateName: '新名', frozenCreator: '旧名', recordNickname: '新名', recordId: 2 }); return r.ok === true })())
     check('candidate 名称不同 + 未确认 -> 409 + requiresIdentityConfirmation', (() => { const r = evalIdentity({ candidateId: 1, candidateName: '新名', frozenCreator: '旧名', recordNickname: '别的名字', recordId: 3, identityConfirmed: false }); return r.ok === false && r.code === 409 && r.requiresIdentityConfirmation === true })())
     check('candidate 名称不同 + identityConfirmed=true -> pass', (() => { const r = evalIdentity({ candidateId: 1, candidateName: '新名', frozenCreator: '旧名', recordNickname: '别的名字', recordId: 3, identityConfirmed: true }); return r.ok === true && r.requiresIdentityConfirmation === true })())
@@ -104,7 +104,7 @@ async function main() {
     check('名称唯一 + 一致 -> 直接 pass（不要求确认）', evalIdentity({ candidateId: 1, candidateName: '同名达人', frozenCreator: 'x', recordNickname: '同名达人', recordId: 5, candidateNameAmbiguous: false }).ok === true)
     check('名称重复 + 一致 -> 409（不能静默通过）', (() => { const r = evalIdentity({ candidateId: 1, candidateName: '同名达人', frozenCreator: 'x', recordNickname: '同名达人', recordId: 5, candidateNameAmbiguous: true }); return r.ok === false && r.code === 409 && r.requiresIdentityConfirmation === true && r.ambiguousName === true })())
     check('名称重复 + 一致 + identityConfirmed=true -> pass', (() => { const r = evalIdentity({ candidateId: 1, candidateName: '同名达人', frozenCreator: 'x', recordNickname: '同名达人', recordId: 5, candidateNameAmbiguous: true, identityConfirmed: true }); return r.ok === true })())
-    check('旧达人忽略 candidateNameAmbiguous（仍按名称严格判定）', (() => { const r = evalIdentity({ candidateId: null, frozenCreator: '旧达人', recordNickname: '旧达人', recordId: 5, candidateNameAmbiguous: true }); return r.ok === true && r.mode === 'legacy' })())
+    check('旧达人忽略 candidateNameAmbiguous（仍按名称严格判定）', (() => { const r = evalIdentity({ candidateId: null, frozenCreator: '旧达人', recordNickname: '旧达人', recordId: 5, candidateNameAmbiguous: true }); return r.ok === true && r.mode === 'legacy_exact_name' })())
 
     // ---------- 路由集成（临时库） ----------
     const insertRecord = db.prepare(

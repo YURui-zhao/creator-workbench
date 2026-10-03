@@ -5,6 +5,7 @@ import {
   buildOutcomeCandidates,
   buildOutcomeSummary,
   computeTimingWarning,
+  evaluateOutcomeIdentity,
   isDecisionEligibleForOutcome
 } from '../utils/creatorDecisionOutcome.js'
 import { TARGET_CPM } from '../utils/creatorBusinessRules.js'
@@ -44,6 +45,61 @@ const findLinkByDecision = (decisionId) =>
   db.prepare('SELECT * FROM creator_decision_outcomes WHERE decision_id = ?').get(decisionId)
 const findLinkByRecord = (recordId) =>
   db.prepare('SELECT * FROM creator_decision_outcomes WHERE record_id = ?').get(recordId)
+const findCandidate = (id) =>
+  db.prepare('SELECT id, name FROM creator_candidates WHERE id = ?').get(id)
+// 同名候选达人数量（>1 表示「名称」不足以唯一确定身份）
+const countCandidatesWithName = (name) =>
+  Number(db.prepare('SELECT COUNT(*) AS n FROM creator_candidates WHERE name = ?').get(name)?.n ?? 0)
+
+/**
+ * Phase 4C：用于匹配投放记录的身份名称
+ *   · candidate decision（candidate_id 非空）→ candidate 的「当前」name（改名后仍能匹配新名字的记录）
+ *   · 旧历史达人 → 冻结的 decision.creator
+ * 找不到 candidate 时回退到 decision.creator（只影响候选池展示，写入仍由 evaluateOutcomeIdentity 严格校验）。
+ */
+function identityNameForDecision(decision) {
+  if (decision?.candidate_id === null || decision?.candidate_id === undefined) {
+    return String(decision?.creator ?? '').trim()
+  }
+  const candidate = findCandidate(decision.candidate_id)
+  return String(candidate?.name ?? decision.creator ?? '').trim()
+}
+
+/**
+ * Phase 4C：outcome 候选记录的「发现名称」集合
+ *   · 旧达人：只有 frozen decision.creator（行为完全不变）
+ *   · candidate：current candidate.name（primary）+ frozen decision.creator；两者相同则只查一次
+ * 只用于「能被用户看到」，绝不等于身份授权（最终仍由 evaluateOutcomeIdentity 判定）。
+ */
+function discoveryNamesForDecision(decision) {
+  const isCandidateDecision = decision?.candidate_id !== null && decision?.candidate_id !== undefined
+  const primary = identityNameForDecision(decision)
+  const frozen = String(decision?.creator ?? '').trim()
+  const names =
+    isCandidateDecision && frozen && frozen !== primary ? [primary, frozen] : [primary]
+  return {
+    names: names.filter(Boolean),
+    currentName: isCandidateDecision ? primary || null : null,
+    frozenName: frozen
+  }
+}
+
+/** 按多个名称批量查询投放记录（IN + 同一排序；单名称时与旧查询等价） */
+function listCreatorRecordsByNames(names = []) {
+  const unique = [...new Set(names.map((name) => String(name ?? '').trim()).filter(Boolean))]
+  if (!unique.length) return []
+  // 单名称（旧达人 / current === frozen）：完全沿用既有查询，保证旧行为字节不变
+  if (unique.length === 1) return listCreatorRecords(unique[0])
+  const placeholders = unique.map(() => '?').join(', ')
+  return db
+    .prepare(
+      `SELECT id, nickname, creator_type, total_cost, publish_date, first_play, second_week_play
+       FROM creator_records
+       WHERE nickname IN (${placeholders})
+       ORDER BY publish_date DESC, id DESC`
+    )
+    .all(...unique)
+}
 
 /** 该达人全部投放记录（候选池只含同一 creator，不返回其他达人的记录） */
 const listCreatorRecords = (creator) =>
@@ -129,18 +185,33 @@ router.get('/:id/outcome-candidates', (req, res) => {
   if (!decision) return fail(res, 404, `决策 #${id} 不存在`)
 
   const eligibility = isDecisionEligibleForOutcome(decision)
-  const records = listCreatorRecords(decision.creator)
+  // Phase 4C：candidate 决策同时发现「当前 name」与「创建时 frozen name」两组记录（跨名称确认路径可见）；
+  // 旧达人仍只查冻结的 decision.creator（discoveryNamesForDecision 内部保证）。
+  const discovery = discoveryNamesForDecision(decision)
+  const records = listCreatorRecordsByNames(discovery.names)
   const linkMap = loadRecordLinkMap(records.map((row) => row.id))
   const candidates = buildOutcomeCandidates(records, {
     decisionCreatedAt: decision.created_at,
     linkMap
   })
+  // 仅对 candidate 决策附加可解释 metadata（旧达人响应保持原样）；
+  // 这只是「记录从哪个名称被发现」，绝不表示身份已确认。
+  const enrichedCandidates =
+    discovery.currentName === null
+      ? candidates
+      : candidates.map((item) => {
+          const matchesCurrent = item.creator === discovery.currentName
+          const matchesFrozen = item.creator === discovery.frozenName
+          const source =
+            matchesCurrent && matchesFrozen ? 'both' : matchesCurrent ? 'current' : 'frozen'
+          return { ...item, identity_name_source: source }
+        })
   ok(res, {
     decision_id: decision.id,
     creator: decision.creator,
     eligible: eligibility.eligible,
     eligibility_reason: eligibility.reason,
-    candidates
+    candidates: enrichedCandidates
   })
 })
 
@@ -165,13 +236,42 @@ router.post('/:id/outcome', (req, res) => {
   const record = findRecord(recordId)
   if (!record) return fail(res, 404, `投放记录 #${recordId} 不存在`)
 
-  const recordCreator = String(record.nickname ?? '').trim()
-  if (recordCreator !== decision.creator) {
-    return fail(
-      res,
-      400,
-      `投放记录 #${recordId} 属于「${recordCreator || '未命名'}」，不能关联给达人「${decision.creator}」的决策`
-    )
+  // Phase 4C：身份校验统一走 evaluateOutcomeIdentity（旧达人 / candidate 两条路径严格分开）
+  //   · 旧达人（candidate_id=NULL）：仍要求 record.nickname === decision.creator，
+  //     identity_confirmed 对其完全无效（不能成为绕过所有名称校验的万能开关）
+  //   · candidate（candidate_id 非空）：按 candidate「当前」name 校验（改名后仍可关联），
+  //     名称不同时默认 409，只有显式 identity_confirmed=true 才放行
+  const isCandidateDecision = decision.candidate_id !== null && decision.candidate_id !== undefined
+  let candidateName = null
+  let candidateNameAmbiguous = false
+  if (isCandidateDecision) {
+    const candidate = findCandidate(decision.candidate_id)
+    if (!candidate) {
+      return fail(res, 400, `决策 #${id} 关联的候选达人 #${decision.candidate_id} 不存在`)
+    }
+    candidateName = candidate.name
+    // 同名候选达人（>1）：名称一致也不足以证明归属，必须显式确认
+    candidateNameAmbiguous = countCandidatesWithName(candidateName) > 1
+  }
+  const identity = evaluateOutcomeIdentity({
+    candidateId: decision.candidate_id,
+    candidateName,
+    frozenCreator: String(decision.creator ?? ''),
+    recordNickname: record.nickname,
+    recordId,
+    identityConfirmed: body.identity_confirmed === true,
+    candidateNameAmbiguous
+  })
+  if (!identity.ok) {
+    // candidate 跨名称：附带结构化标记，供前端做「人工身份确认」交互（不是自动判断同一达人）
+    if (identity.requiresIdentityConfirmation) {
+      return res.status(identity.code).json({
+        code: identity.code,
+        data: { requires_identity_confirmation: true },
+        msg: identity.message
+      })
+    }
+    return fail(res, identity.code, identity.message)
   }
 
   const existingForDecision = findLinkByDecision(id)

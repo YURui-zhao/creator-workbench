@@ -69,6 +69,66 @@ export function isDecisionEligibleForOutcome(decision) {
   return { eligible: true, reason: null }
 }
 
+/**
+ * Phase 4C：决策 ↔ 投放记录 的身份校验（纯函数）
+ *
+ * 两条路径严格分开：
+ *   · 旧历史达人（candidateId = null）：沿用 record.nickname === frozenCreator；
+ *     identity_confirmed 对其「完全无效」，不能成为绕过名称校验的万能开关。
+ *   · candidate decision（candidateId 非空）：按「candidate 当前 name」校验（改名后仍可关联）；
+ *     若 record.nickname !== candidate 当前 name，默认拒绝，只有显式 identity_confirmed 才放行。
+ *
+ * 注意：这是「人工身份确认」，不是系统自动判断同一达人；frozen decision.creator 可能是旧名字，绝不作为依据。
+ * @returns {{ ok: boolean, mode: 'legacy'|'candidate', code?: number, message?: string, requiresIdentityConfirmation?: boolean }}
+ */
+export function evaluateOutcomeIdentity({
+  candidateId = null,
+  candidateName = null,
+  frozenCreator = '',
+  recordNickname = '',
+  recordId = null,
+  identityConfirmed = false,
+  // 由调用方（route）查询后传入：当前 candidate.name 在 creator_candidates 中是否对应多个 candidate_id。
+  // 纯函数自身绝不查 DB；名称重复时「名称相同」不足以证明归属，必须显式人工确认。
+  candidateNameAmbiguous = false
+} = {}) {
+  const recordName = String(recordNickname ?? '').trim()
+  const isCandidateDecision = candidateId !== null && candidateId !== undefined
+
+  if (!isCandidateDecision) {
+    if (recordName !== frozenCreator) {
+      return {
+        ok: false,
+        code: 400,
+        mode: 'legacy',
+        requiresIdentityConfirmation: false,
+        message: `投放记录 #${recordId} 属于「${recordName || '未命名'}」，不能关联给达人「${frozenCreator}」的决策`
+      }
+    }
+    return { ok: true, mode: 'legacy', requiresIdentityConfirmation: false }
+  }
+
+  const currentName = String(candidateName ?? '').trim()
+  const nameMatches = recordName === currentName
+  // 名称唯一且一致 → 直接通过；名称重复（存在多个同名候选）时即使一致也不能静默通过
+  if (nameMatches && candidateNameAmbiguous !== true) {
+    return { ok: true, mode: 'candidate', requiresIdentityConfirmation: false }
+  }
+  if (identityConfirmed !== true) {
+    return {
+      ok: false,
+      code: 409,
+      mode: 'candidate',
+      requiresIdentityConfirmation: true,
+      ambiguousName: nameMatches,
+      message: nameMatches
+        ? '存在多个同名候选达人，仅凭名称无法确认该投放记录的身份归属。如确认该记录属于当前候选达人，请显式确认后再关联。'
+        : '投放记录中的达人名称与当前候选达人名称不同。如果确认这是同一达人，请显式确认身份后再关联。'
+    }
+  }
+  return { ok: true, mode: 'candidate', requiresIdentityConfirmation: true }
+}
+
 /** 解析 'YYYY-MM-DD HH:MM:SS' / 'YYYY-MM-DD' 的日期部分 */
 export function dateOnlyOf(value) {
   const text = String(value ?? '').trim()

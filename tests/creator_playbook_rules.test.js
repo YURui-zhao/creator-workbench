@@ -4,7 +4,7 @@
 // 运行方式：node tests/creator_playbook_rules.test.js
 // 特性：纯函数测试，不启动服务、不打开浏览器、不写数据库、不访问网络。
 //
-// 覆盖：播放量级、商单密度、播放稳定性（含 20% 浮点边界）、稳定高播放、商单优先 / 日常辅助、
+// 覆盖：播放量级、商单密度、播放稳定性（含 20% 浮点边界）、整体高播放、商单优先 / 日常辅助、
 //       CPM15-20 估价与置信度、万元风险、NULL/0 语义、缺数据优雅降级、确定性、无评分字段。
 const fs = require('node:fs')
 const http = require('node:http')
@@ -96,8 +96,10 @@ async function main() {
     check('median=0 -> stability unknown（不除 0）', assess({ median_play: 0, mean_play: 0 }).stability.code === 'unknown')
     check('deviationRatio 数值正确（150000/110000）', Math.abs(assess({ mean_play: 150000, median_play: 110000 }).stability.deviationRatio - (40000 / 110000)) < 1e-12)
 
-    console.log('\n===== 4. 稳定高播放（规则 4，独立维度）=====')
-    check('mean/median 均 >= 10w -> 稳定高播放', assess({ mean_play: 150000, median_play: 110000 }).highPlaySignal.active === true && assess({ mean_play: 150000, median_play: 110000 }).highPlaySignal.label === '稳定高播放')
+    console.log('\n===== 4. 整体高播放（规则 4，独立维度；判断条件不变）=====')
+    check('mean/median 均 >= 10w -> 整体高播放', assess({ mean_play: 150000, median_play: 110000 }).highPlaySignal.active === true && assess({ mean_play: 150000, median_play: 110000 }).highPlaySignal.label === '整体高播放')
+    check('波动较大 + 整体高播放 可同时成立', assess({ mean_play: 150000, median_play: 110000 }).stability.code === 'volatile' && assess({ mean_play: 150000, median_play: 110000 }).highPlaySignal.active === true)
+    check('高量级 + 波动较大 + 整体高播放 三者并存', assess({ mean_play: 150000, median_play: 110000 }).scale.code === 'high' && assess({ mean_play: 150000, median_play: 110000 }).stability.code === 'volatile' && assess({ mean_play: 150000, median_play: 110000 }).highPlaySignal.active === true)
     check('仅 median >= 10w（mean<10w）-> 不触发', assess({ mean_play: 90000, median_play: 100000 }).highPlaySignal.active === false)
     check('触发高播放信号时不覆盖量级 / 稳定性', assess({ mean_play: 150000, median_play: 110000 }).scale.code === 'high' && assess({ mean_play: 150000, median_play: 110000 }).stability.code === 'volatile')
 
@@ -133,6 +135,26 @@ async function main() {
     })())
     check('估价不覆盖 TARGET_CPM=30（无 targetCpm 字段）', !('targetCpm' in assess({ sponsored_count: 3 })) && !('target_cpm' in assess({ sponsored_count: 3 })))
 
+    console.log('\n===== 6b. CPM15-20 弱样本说明（文案动态化，规则不变） =====')
+    const weak1 = assess({ sponsored_count: 1, sponsored_median_play: 50000, organic_count: 8, organic_median_play: 80000 }).estimate
+    check('1 条：显示真实条数 + 商单中位（5.0万）', /商单样本仅1条/.test(weak1.explanation) && /商单中位5\.0万/.test(weak1.explanation), weak1.explanation)
+    check('1 条：含日常中位辅助且明确不直接参与估价', /日常中位8\.0万/.test(weak1.explanation) && /不直接参与商单估价/.test(weak1.explanation))
+    const weak2 = assess({ sponsored_count: 2, sponsored_median_play: 531000, organic_count: 10, organic_median_play: 2631000 }).estimate
+    check(
+      '2 条：正确展示真实值（53.1万 / 263.1万）',
+      weak2.explanation === '商单样本仅2条，当前估价基于商单中位53.1万；日常中位263.1万仅辅助判断，不直接参与商单估价。',
+      weak2.explanation
+    )
+    const weakNoOrganic = assess({ sponsored_count: 2, sponsored_median_play: 531000, organic_median_play: null }).estimate
+    check('organic 缺失：不输出伪造的日常中位', !/日常中位/.test(weakNoOrganic.explanation) && /商单样本仅2条/.test(weakNoOrganic.explanation), weakNoOrganic.explanation)
+    const strongEstimate = assess({ sponsored_count: 3, sponsored_median_play: 20000, organic_median_play: 30000 }).estimate
+    check('>=3 条：不显示「样本仅N条」', !/样本仅/.test(strongEstimate.explanation) && strongEstimate.confidence === 'normal')
+    check('>=3 条：评估文案保持原样', strongEstimate.explanation === '以商单中位作为基础估价锚点（CPM 15-20）。')
+    check('estimate low/high 未改变（50000 -> 750/1000）', weak1.low === 750 && weak1.high === 1000)
+    check('estimate low/high 未改变（531000 -> 7965/10620）', weak2.low === 7965 && weak2.high === 10620)
+    check('organic 不参与价格计算（low/high 只由 sponsored 决定）', assess({ sponsored_count: 2, sponsored_median_play: 100000, organic_median_play: 999999 }).estimate.low === 1500)
+    check('0 sponsored：不生成商单估价且保持原语义', (() => { const e = assess({ sponsored_count: 0, organic_count: 5, organic_median_play: 80000 }).estimate; return e.low === null && e.high === null && /暂无商单样本/.test(e.explanation) })())
+
     console.log('\n===== 7. 万元风险（规则 7）=====')
     check('xingtu=10000 -> 不触发', assess({ xingtu_price: 10000 }).risk.highAmount === false)
     check('xingtu=10000.01 -> 触发', assess({ xingtu_price: 10000.01 }).risk.highAmount === true && /万元/.test(String(assess({ xingtu_price: 10000.01 }).risk.explanation)))
@@ -160,6 +182,7 @@ async function main() {
     check('输出维度彼此独立（8 个顶层维度）', ['metrics', 'scale', 'commercialDensity', 'stability', 'highPlaySignal', 'performanceBasis', 'estimate', 'risk'].every((k) => k in assess(sample)))
     const ruleSource = fs.readFileSync(path.join(root, 'frontend/src/utils/creatorPlaybookRules.js'), 'utf8')
     check('规则模块不引用 AI / 网络 / 数据库', !/deepseek|fetch\(|axios|better-sqlite3|from '\.\.\/api/i.test(ruleSource))
+    check('Rule Engine 不再出现旧文案「稳定高播放」', !/稳定高播放/.test(ruleSource))
     check('未发生任何外部网络请求', networkGuard.blocked.length === 0, JSON.stringify(networkGuard.blocked))
   } finally {
     networkGuard.restore()

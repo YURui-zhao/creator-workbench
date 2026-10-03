@@ -1,3 +1,5 @@
+import { formatPlays } from './format.js'
+
 // Creator Decision Playbook V0.1 - Rule Engine（纯函数，deterministic）
 //
 // 定位：把已冻结的 Playbook 业务经验实现成独立、可测试、可解释的规则。
@@ -32,7 +34,8 @@ export const PLAYBOOK_MIN_VALID_FOR_STATS = 5
 export const SCALE_LABELS = { base: '基础量级', high: '高量级', unknown: '量级未知' }
 export const DENSITY_LABELS = { weak: '弱商单账号', strong: '强商单账号' }
 export const STABILITY_LABELS = { stable: '播放较稳定', volatile: '波动较大', unknown: '稳定性未知' }
-export const HIGH_PLAY_SIGNAL_LABEL = '稳定高播放'
+// 只代表「均值与中位都站在 10w 以上」，并不代表偏差 <= 20%（稳定性是独立维度）
+export const HIGH_PLAY_SIGNAL_LABEL = '整体高播放'
 
 // 有限数字或 null（0 保留为 0；null/undefined/NaN/Infinity/非数字 -> null）
 function toFiniteOrNull(value) {
@@ -111,7 +114,7 @@ function buildStability(meanPlay, medianPlay) {
   }
 }
 
-// 规则 4：稳定高播放（独立维度，不与稳定性互相覆盖）
+// 规则 4：整体高播放（独立维度，不与稳定性互相覆盖；判断条件不变）
 function buildHighPlaySignal(meanPlay, medianPlay) {
   const active =
     meanPlay !== null && medianPlay !== null &&
@@ -150,6 +153,18 @@ function buildPerformanceBasis(sponsoredCount, organicCount) {
 }
 
 // 规则 6：CPM15-20 基础估价（不使用日常数据替代商单估价）
+// 弱样本（1-2 条）说明：只陈述真实事实（条数 + 商单中位），日常中位仅在有效时作为辅助提示，
+// 绝不参与价格计算，也不在缺失时伪造。
+function buildWeakSponsoredExplanation(sponsoredCount, sponsoredMedianPlay, organicMedianPlay) {
+  let text = `商单样本仅${sponsoredCount}条，当前估价基于商单中位${formatPlays(sponsoredMedianPlay)}`
+  if (organicMedianPlay !== null && organicMedianPlay !== undefined) {
+    text += `；日常中位${formatPlays(organicMedianPlay)}仅辅助判断，不直接参与商单估价。`
+  } else {
+    text += '。'
+  }
+  return text
+}
+
 function buildEstimate(sponsoredCount, sponsoredMedianPlay, organicMedianPlay) {
   if (sponsoredCount >= 1 && sponsoredMedianPlay !== null) {
     return {
@@ -162,7 +177,7 @@ function buildEstimate(sponsoredCount, sponsoredMedianPlay, organicMedianPlay) {
       explanation:
         sponsoredCount >= PLAYBOOK_STRONG_SPONSORED_MIN
           ? '以商单中位作为基础估价锚点（CPM 15-20）。'
-          : '商单样本较少，日常中位仅辅助判断。'
+          : buildWeakSponsoredExplanation(sponsoredCount, sponsoredMedianPlay, organicMedianPlay)
     }
   }
   return {

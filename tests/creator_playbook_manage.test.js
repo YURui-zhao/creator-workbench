@@ -123,6 +123,11 @@ function main() {
   check('同类型仅作 Tag 提示', /item\.same_creator_type && <Tag>同类型<\/Tag>/.test(page))
   check('无相似度展示（不渲染相似度文案 / 分数）', !/similarity|相似度[：:]|相似度\s*\{/.test(page) && !/item\.similarity/.test(page))
   check('空态文案齐全（无商单 / 高量级 / 无案例）', /暂无商单样本，暂不生成历史价格参考/.test(page) && /V0.1 暂不生成历史价格参考/.test(page) && /暂无符合当前口径的历史价格案例/.test(page))
+
+  console.log('\n===== 8. 文案单一来源（copy patch） =====')
+  check('页面不出现旧文案「稳定高播放」', !/稳定高播放/.test(page))
+  check('高播放标签只消费 Rule Engine（assessment.highPlaySignal.label）', /assessment\.highPlaySignal\.label/.test(page))
+  check('估价说明只消费 Rule Engine（页面不自行拼装商单/日常文案）', /assessment\.estimate\.explanation/.test(page) && !/商单样本仅/.test(page))
 }
 
 main()

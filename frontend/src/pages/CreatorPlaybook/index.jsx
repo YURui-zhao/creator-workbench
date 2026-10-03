@@ -21,9 +21,11 @@ import {
 } from 'antd'
 import { PlusOutlined, ReloadOutlined, UserAddOutlined } from '@ant-design/icons'
 import {
+  createCandidateDecision,
   createCreatorCandidate,
   getCandidateLatestSnapshot,
   getCandidatePriceReference,
+  listCandidateDecisions,
   listCreatorCandidates,
   updateCreatorCandidate
 } from '../../api/creatorCandidates'
@@ -67,6 +69,13 @@ const PRICE_REF_MESSAGES = {
   no_sponsored_sample: '暂无商单样本，暂不生成历史价格参考。日常播放仅作为辅助，不直接换算商单价格。',
   high_scale_not_supported: '当前属于高量级达人。现有高量级历史样本较少，V0.1 暂不生成历史价格参考。'
 }
+
+// Phase 4B：candidate_review 人工决定（必须由用户显式选择；系统 / AI / 规则绝不自动选择）
+const CANDIDATE_REVIEW_OPTIONS = [
+  { value: 'contact', label: '继续联系' },
+  { value: 'observe', label: '继续观察' },
+  { value: 'hold', label: '暂不推进' }
+]
 
 // 历史价格参考渲染（严格使用后端返回顺序，前端不再排序；不显示相似度）
 function renderPriceReference(priceRef, loading) {
@@ -157,6 +166,13 @@ export default function CreatorPlaybook() {
   // Phase 3B：历史价格参考（只读，后端按 candidate_id 派生 target）
   const [priceRef, setPriceRef] = useState(null)
   const [priceRefLoading, setPriceRefLoading] = useState(false)
+  // Phase 4B：人工决定（append-only）
+  const [decisions, setDecisions] = useState([])
+  const [decisionsLoading, setDecisionsLoading] = useState(false)
+  const [pendingDecision, setPendingDecision] = useState(null)
+  const [decisionNote, setDecisionNote] = useState('')
+  const [savingDecision, setSavingDecision] = useState(false)
+  const [historyExpanded, setHistoryExpanded] = useState(false)
   const [createOpen, setCreateOpen] = useState(false)
   const [creating, setCreating] = useState(false)
   const [assistantOpen, setAssistantOpen] = useState(false)
@@ -241,6 +257,34 @@ export default function CreatorPlaybook() {
   useEffect(() => {
     loadPriceReference(selectedId)
   }, [selectedId, loadPriceReference])
+
+  // 人工决定：随选中候选变化重新拉取 append-only 历史（按 candidate_id）
+  const loadDecisions = useCallback(async (candidateId) => {
+    if (!candidateId) {
+      setDecisions([])
+      return
+    }
+    setDecisionsLoading(true)
+    try {
+      const res = await listCandidateDecisions(candidateId)
+      setDecisions(res?.data?.decisions || [])
+    } catch {
+      setDecisions([])
+    } finally {
+      setDecisionsLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    loadDecisions(selectedId)
+  }, [selectedId, loadDecisions])
+
+  // 切换候选时收起历史 / 清空待提交的决定
+  useEffect(() => {
+    setHistoryExpanded(false)
+    setPendingDecision(null)
+    setDecisionNote('')
+  }, [selectedId])
 
   // AI 可用性：会话 Key（本地）或后端环境变量任一可用即可；查询失败不影响页面其它能力
   useEffect(() => {
@@ -409,6 +453,31 @@ export default function CreatorPlaybook() {
       // 失败提示由 request 响应拦截器统一给出，这里不再重复 toast
     } finally {
       setSavingEdit(false)
+    }
+  }
+
+  // 人工决定：必须由用户点击某个按钮显式发起（无默认选中、无系统推荐）
+  const openDecision = (option) => {
+    setPendingDecision(option)
+    setDecisionNote('')
+  }
+
+  const handleSaveDecision = async () => {
+    if (!selected || !pendingDecision || savingDecision) return
+    setSavingDecision(true)
+    try {
+      await createCandidateDecision(selected.id, {
+        human_decision: pendingDecision.value,
+        decision_note: decisionNote.trim() ? decisionNote.trim() : null
+      })
+      message.success('决定已记录')
+      setPendingDecision(null)
+      setDecisionNote('')
+      await loadDecisions(selected.id)
+    } catch {
+      // 失败提示由 request 响应拦截器统一给出，这里不再重复 toast
+    } finally {
+      setSavingDecision(false)
     }
   }
 
@@ -745,6 +814,76 @@ export default function CreatorPlaybook() {
                 </Typography.Text>
                 <div style={{ marginTop: 8 }}>{renderPriceReference(priceRef, priceRefLoading)}</div>
               </div>
+
+              <Divider style={{ margin: '12px 0' }} />
+
+              {/* Phase 4B：人工决定（append-only；系统不推荐、不自动选择、AI 不参与） */}
+              <div>
+                <Space size={8} wrap align="baseline">
+                  <Typography.Text strong>人工决定</Typography.Text>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    由人显式选择，系统不推荐、不自动决定
+                  </Typography.Text>
+                </Space>
+                <Space size={8} wrap style={{ display: 'flex', marginTop: 8 }}>
+                  {CANDIDATE_REVIEW_OPTIONS.map((option) => (
+                    <Button key={option.value} onClick={() => openDecision(option)}>
+                      {option.label}
+                    </Button>
+                  ))}
+                </Space>
+
+                {decisionsLoading ? (
+                  <Typography.Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
+                    加载决定历史…
+                  </Typography.Text>
+                ) : decisions.length === 0 ? (
+                  <Typography.Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
+                    还没有记录人工决定
+                  </Typography.Text>
+                ) : (
+                  <div style={{ marginTop: 10 }}>
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      最近一次人工决定
+                    </Typography.Text>
+                    <div>
+                      <Typography.Text strong>
+                        {decisions[0].human_decision_label || decisions[0].human_decision}
+                      </Typography.Text>
+                      <Typography.Text type="secondary" style={{ marginLeft: 8 }}>
+                        {String(decisions[0].created_at || '').slice(0, 16)}
+                      </Typography.Text>
+                    </div>
+                    {decisions[0].decision_note && (
+                      <Typography.Paragraph style={{ marginTop: 4, marginBottom: 0, whiteSpace: 'pre-wrap' }}>
+                        备注：{decisions[0].decision_note}
+                      </Typography.Paragraph>
+                    )}
+                    {decisions.length > 1 && (
+                      <div style={{ marginTop: 6 }}>
+                        <a style={{ fontSize: 12 }} onClick={() => setHistoryExpanded((value) => !value)}>
+                          {historyExpanded ? '收起历史决定' : `查看历史决定（${decisions.length - 1}）`}
+                        </a>
+                        {historyExpanded && (
+                          <List
+                            size="small"
+                            dataSource={decisions.slice(1)}
+                            renderItem={(item) => (
+                              <List.Item style={{ paddingLeft: 0, paddingRight: 0 }}>
+                                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                                  {String(item.created_at || '').slice(0, 16)} ·{' '}
+                                  {item.human_decision_label || item.human_decision}
+                                  {item.decision_note ? ` · ${item.decision_note}` : ''}
+                                </Typography.Text>
+                              </List.Item>
+                            )}
+                          />
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
             </Card>
           )}
         </Col>
@@ -859,6 +998,38 @@ export default function CreatorPlaybook() {
             <Input.TextArea placeholder="来源 / 判断线索等" maxLength={500} autoSize={{ minRows: 2, maxRows: 4 }} />
           </Form.Item>
         </Form>
+      </Modal>
+
+      {/* Phase 4B：人工决定确认（轻量 Modal；无默认选中，不推荐） */}
+      <Modal
+        title="记录人工决定"
+        open={Boolean(pendingDecision)}
+        onCancel={() => {
+          setPendingDecision(null)
+          setDecisionNote('')
+        }}
+        onOk={handleSaveDecision}
+        confirmLoading={savingDecision}
+        okText="记录决定"
+        cancelText="取消"
+        destroyOnClose
+      >
+        <Space direction="vertical" size={8} style={{ display: 'flex' }}>
+          <div>
+            <Typography.Text type="secondary">你选择：</Typography.Text>
+            <Typography.Text strong>{pendingDecision?.label}</Typography.Text>
+          </div>
+          <div>
+            <Typography.Text type="secondary">决策备注（可选）</Typography.Text>
+            <Input.TextArea
+              value={decisionNote}
+              onChange={(event) => setDecisionNote(event.target.value)}
+              maxLength={500}
+              autoSize={{ minRows: 2, maxRows: 4 }}
+              placeholder="记录判断依据 / 后续动作"
+            />
+          </div>
+        </Space>
       </Modal>
 
       {/* D. 复用现有近期表现助手（候选模式：按 candidate_id 保存 / 读取） */}

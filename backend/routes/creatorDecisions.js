@@ -13,8 +13,14 @@ const router = Router()
 export const DECISION_STAGES = ['contact', 'post_quote']
 export const CONTACT_DECISIONS = ['contact_now', 'observe', 'skip_for_now']
 export const POST_QUOTE_DECISIONS = ['repurchase', 'small_test', 'negotiate', 'pause']
+// Phase 4B：候选达人判断阶段（独立 workflow context，不改动上面三个既有 enum）
+export const CANDIDATE_REVIEW_STAGE = 'candidate_review'
+export const CANDIDATE_REVIEW_DECISIONS = ['contact', 'observe', 'hold']
 export const IP_JUDGEMENTS = ['strong', 'medium', 'weak', 'unknown']
 export const SYSTEM_CONTEXT_VERSION = 'decision-context-v1'
+// Phase 4B：候选 decision 的版本标识（不冒充旧 creator-pricing-v1 / decision-context-v1）
+export const CANDIDATE_REVIEW_PRICING_VERSION = 'creator-playbook-pricing-v0.1'
+export const CANDIDATE_REVIEW_SYSTEM_CONTEXT_VERSION = 'candidate-review-v0.1'
 export const MAX_NOTE_LENGTH = 500
 export const MAX_QUOTE_RAW_LENGTH = 60
 
@@ -25,7 +31,10 @@ export const HUMAN_DECISION_LABELS = {
   repurchase: '复投',
   small_test: '小额测试',
   negotiate: '继续议价',
-  pause: '暂缓'
+  pause: '暂缓',
+  // Phase 4B：candidate_review 的三个决定（与旧 contact_now / skip_for_now 语义不同）
+  contact: '继续联系',
+  hold: '暂不推进'
 }
 
 export const IP_JUDGEMENT_LABELS = {
@@ -301,6 +310,8 @@ export function toPublicDecision(row, outcome = null, negotiationCase = null) {
   return {
     id: row.id,
     creator: row.creator,
+    // Phase 4B：候选达人稳定身份（旧历史达人决策为 null）
+    candidate_id: row.candidate_id ?? null,
     decision_stage: row.decision_stage,
     snapshot_id: row.snapshot_id ?? null,
     current_quote_raw: row.current_quote_raw ?? null,

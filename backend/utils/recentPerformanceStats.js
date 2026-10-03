@@ -72,6 +72,16 @@ export function medianOf(values) {
   return quantile(sorted, 0.5)
 }
 
+/**
+ * 算术平均（有效播放均值；无有效样本返回 null）
+ * 与前端 Rule Engine 的 mean 口径一致：全部「有效播放」的算术平均，不提前去极值。
+ */
+export function meanOf(values) {
+  const list = (Array.isArray(values) ? values : []).filter((value) => Number.isFinite(value))
+  if (!list.length) return null
+  return list.reduce((sum, value) => sum + value, 0) / list.length
+}
+
 /** 最终输出统一取整（播放量展示为整数；内部计算不受影响） */
 function roundPlay(value) {
   return value === null || value === undefined ? null : Math.round(value)

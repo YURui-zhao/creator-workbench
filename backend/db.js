@@ -128,6 +128,8 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS creator_decisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     creator TEXT NOT NULL,
+    -- Phase 4B：候选达人稳定身份（NULL = 旧历史达人决策）；不声明 FK，保持全库现有风格
+    candidate_id INTEGER,
     decision_stage TEXT NOT NULL,
     snapshot_id INTEGER,
     current_quote_raw TEXT,
@@ -273,6 +275,22 @@ if (!candidateColumns.includes('xingtu_id')) {
   db.exec('ALTER TABLE creator_candidates ADD COLUMN xingtu_id TEXT')
   console.log('[db] 已为 creator_candidates 添加 xingtu_id 列（旧候选保持 NULL）')
 }
+
+// Phase 4B：为既有 creator_decisions 安全补充 candidate_id（候选达人稳定身份）
+// 说明：
+//   · 只在列不存在时 ALTER TABLE，不修改任何旧决策行（旧行 candidate_id 保持 NULL）
+//   · 索引必须在补列之后创建（老库此刻才有该列）
+const decisionColumns = db
+  .prepare('PRAGMA table_info(creator_decisions)')
+  .all()
+  .map((column) => column.name)
+if (!decisionColumns.includes('candidate_id')) {
+  db.exec('ALTER TABLE creator_decisions ADD COLUMN candidate_id INTEGER')
+  console.log('[db] 已为 creator_decisions 添加 candidate_id 列（旧决策保持 NULL）')
+}
+db.exec(
+  'CREATE INDEX IF NOT EXISTS idx_creator_decisions_candidate_created ON creator_decisions(candidate_id, created_at)'
+)
 
 // 首次启动写入示例项目（前端工作台展示用）
 const projectCount = db.prepare('SELECT COUNT(*) AS n FROM projects').get().n

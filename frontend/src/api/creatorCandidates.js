@@ -47,3 +47,16 @@ export function getCandidateLatestSnapshot(candidateId) {
 export function getCandidatePriceReference(candidateId) {
   return request.get(`/creator-candidates/${candidateId}/price-reference`)
 }
+
+/**
+ * candidate_review 人工决定（Phase 4B，append-only）
+ * 只提交 { human_decision, decision_note? }；creator / candidate_id / decision_stage 由服务端决定。
+ */
+export function createCandidateDecision(candidateId, payload) {
+  return request.post(`/creator-candidates/${candidateId}/decisions`, payload)
+}
+
+/** 候选达人的 append-only 决定历史（created_at DESC, id DESC） */
+export function listCandidateDecisions(candidateId) {
+  return request.get(`/creator-candidates/${candidateId}/decisions`)
+}

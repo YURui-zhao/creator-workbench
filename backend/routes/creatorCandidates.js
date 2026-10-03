@@ -7,7 +7,17 @@ import {
   validateSnapshotPayload
 } from './recentSnapshots.js'
 // 复用既有内容类型分组统计（sponsored / organic / unknown 中位数），不复制第二套算法
-import { medianOf } from '../utils/recentPerformanceStats.js'
+import { meanOf, medianOf } from '../utils/recentPerformanceStats.js'
+import { TARGET_CPM } from '../utils/creatorBusinessRules.js'
+// Phase 4B：candidate_review 阶段枚举 / 版本标识 / 公开映射（单一来源在 decision 模块）
+import {
+  CANDIDATE_REVIEW_DECISIONS,
+  CANDIDATE_REVIEW_PRICING_VERSION,
+  CANDIDATE_REVIEW_STAGE,
+  CANDIDATE_REVIEW_SYSTEM_CONTEXT_VERSION,
+  MAX_NOTE_LENGTH,
+  toPublicDecision
+} from './creatorDecisions.js'
 
 /**
  * 候选达人身份层（V3-alpha.3 Playbook Phase 1）
@@ -42,6 +52,13 @@ const HTTP_URL_RE = /^https?:\/\/[^\s]+$/i
 const PRICE_REF_MAX_CASES = 5
 const PRICE_REF_MIN_CASES_FOR_SUMMARY = 3
 const PRICE_REF_BASE_SCALE_MAX = 100000
+
+// Phase 4B：Playbook 估价锚点（与前端 creatorPlaybookRules.js 的常量对应）。
+// 这里是「简单确定性价格事实」，后端可独立计算；不复制 Rule Engine 的量级 / 稳定性 / 高播放判断。
+const PLAYBOOK_ESTIMATE_CPM_LOW = 15
+const PLAYBOOK_ESTIMATE_CPM_HIGH = 20
+const PLAYBOOK_HIGH_AMOUNT_THRESHOLD = 10000
+const PLAYBOOK_RULE_VERSION = 'creator-playbook-v0.1'
 
 const round2 = (value) =>
   value === null || value === undefined || !Number.isFinite(Number(value))
@@ -356,12 +373,15 @@ router.get('/:id/recent-snapshots/latest', (req, res) => {
  *   · 只返回历史事实（成交价 / 累计播放 / final CPM），不含推荐价 / 评分 / 是否投放结论
  *   · final_cpm 只用 second_week_play（累计播放），绝不用 first_play
  */
-router.get('/:id/price-reference', (req, res) => {
-  const row = findCandidateRow(req.params.id)
-  if (!row) return fail(res, 404, `候选达人不存在（id=${req.params.id}）`)
-
-  const unavailable = (reasonCode, message, target = null) =>
-    ok(res, { available: false, reason_code: reasonCode, message, target })
+// 价格参考核心（纯查询 + 确定性计算）：GET 路由与 candidate decision 证据冻结共用同一实现，
+// 避免出现第二套历史案例查询。
+export function buildPriceReference(row) {
+  const unavailable = (reasonCode, message, target = null) => ({
+    available: false,
+    reason_code: reasonCode,
+    message,
+    target
+  })
 
   // 1) candidate latest snapshot（沿用既有 candidate latest 语义，绝不按名称匹配）
   const snapshotRow = getLatestSnapshotByCandidate(row.id)
@@ -450,13 +470,165 @@ router.get('/:id/price-reference', (req, res) => {
     }
   }
 
-  ok(res, {
+  return {
     available: true,
     target: { sponsored_median_play: targetPlay, sponsored_count: sponsoredCount },
     pool: { eligible_case_count: cases.length, selected_case_count: selected.length },
     summary,
     insufficient_for_range: summary === null,
     cases: selected
+  }
+}
+
+router.get('/:id/price-reference', (req, res) => {
+  const row = findCandidateRow(req.params.id)
+  if (!row) return fail(res, 404, `候选达人不存在（id=${req.params.id}）`)
+  ok(res, buildPriceReference(row))
+})
+
+/**
+ * Phase 4B：candidate_review decision 的近期证据（只冻结产生判断的原始确定性事实）
+ * 明确不复制前端 Rule Engine 的文案 / 判断逻辑（量级 / 稳定性 / 强弱商单 / 高播放）。
+ * mean_play 从 plays 的有效播放确定性派生（与前端同一口径）。
+ */
+function buildCandidateRecentEvidence(candidateId, snapshot) {
+  const validValues = (snapshot.plays || [])
+    .filter(
+      (play) =>
+        play && play.excluded !== true && Number.isFinite(play.normalized_play) && play.normalized_play >= 0
+    )
+    .map((play) => play.normalized_play)
+  return {
+    candidate_id: candidateId,
+    snapshot_id: snapshot.id,
+    observed_at: snapshot.observed_at ?? null,
+    created_at: snapshot.created_at ?? null,
+    valid_count: snapshot.valid_count ?? null,
+    median_play: snapshot.median_play ?? null,
+    mean_play: meanOf(validValues),
+    sponsored_count: snapshot.sponsored_count ?? 0,
+    sponsored_median_play: snapshot.sponsored_median_play ?? null,
+    organic_count: snapshot.organic_count ?? 0,
+    organic_median_play: snapshot.organic_median_play ?? null,
+    unknown_count: snapshot.unknown_count ?? 0,
+    p25_play: snapshot.p25_play ?? null,
+    p75_play: snapshot.p75_play ?? null,
+    trend_label: snapshot.trend_label ?? null,
+    xingtu_price: snapshot.xingtu_price ?? null,
+    source_stats_version: snapshot.stats_version ?? null,
+    playbook_rule_version: PLAYBOOK_RULE_VERSION
+  }
+}
+
+/**
+ * Phase 4B：candidate_review decision 的价格证据（CPM15-20 与 TARGET_CPM=30 明确分开）
+ * historical_price_reference 复用 Phase 3B 的同一实现，只冻结 summary / target / selected record ids。
+ */
+function buildCandidatePricingEvidence(snapshot, priceReference) {
+  const sponsoredCount = Number(snapshot.sponsored_count ?? 0)
+  const sponsoredMedian = snapshot.sponsored_median_play ?? null
+  const estimate = {
+    cpm_low: PLAYBOOK_ESTIMATE_CPM_LOW,
+    cpm_high: PLAYBOOK_ESTIMATE_CPM_HIGH,
+    sponsored_median_play: sponsoredMedian,
+    estimate_low: null,
+    estimate_high: null,
+    confidence: null
+  }
+  // sponsored_count >= 1 才生成 estimate；0 时保持 null（绝不用 organic 换算商单价格）
+  if (sponsoredCount >= 1 && sponsoredMedian !== null && Number.isFinite(Number(sponsoredMedian))) {
+    estimate.estimate_low = round2((Number(sponsoredMedian) * PLAYBOOK_ESTIMATE_CPM_LOW) / 1000)
+    estimate.estimate_high = round2((Number(sponsoredMedian) * PLAYBOOK_ESTIMATE_CPM_HIGH) / 1000)
+    estimate.confidence = sponsoredCount >= 3 ? 'normal' : 'low'
+  }
+  const xingtuPrice = snapshot.xingtu_price ?? null
+  return {
+    playbook_estimate: estimate,
+    xingtu_price: xingtuPrice,
+    high_amount_risk: xingtuPrice !== null && Number(xingtuPrice) > PLAYBOOK_HIGH_AMOUNT_THRESHOLD,
+    historical_price_reference: {
+      available: Boolean(priceReference.available),
+      reason_code: priceReference.available ? null : priceReference.reason_code ?? null,
+      target_play: priceReference?.target?.sponsored_median_play ?? null,
+      selected_case_count: priceReference?.pool?.selected_case_count ?? 0,
+      summary: priceReference?.summary ?? null,
+      selected_record_ids: (priceReference?.cases || []).map((item) => item.record_id)
+    }
+  }
+}
+
+/**
+ * POST /api/creator-candidates/:id/decisions
+ * candidate_review 阶段的人工决定（append-only）：
+ *   · creator / candidate_id / decision_stage / snapshot_id 全部由服务端决定，前端不能伪造
+ *   · human_decision 只接受 contact / observe / hold，由用户显式选择（系统 / AI / 规则不推断）
+ *   · 不要求有 recent snapshot；无快照时 snapshot_id / recent / pricing evidence 均为 NULL
+ */
+router.post('/:id/decisions', (req, res) => {
+  const row = findCandidateRow(req.params.id)
+  if (!row) return fail(res, 404, `候选达人不存在（id=${req.params.id}）`)
+  const body = req.body
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return fail(res, 400, '请求体必须是对象')
+  }
+  const humanDecision = String(body.human_decision ?? '').trim()
+  if (!CANDIDATE_REVIEW_DECISIONS.includes(humanDecision)) {
+    return fail(res, 400, `human_decision 必须为：${CANDIDATE_REVIEW_DECISIONS.join(' / ')}`)
+  }
+  const errors = []
+  const decisionNote = readOptionalText(body.decision_note, 'decision_note', MAX_NOTE_LENGTH, errors)
+  if (errors.length) return fail(res, 400, errors[0])
+
+  // snapshot 由服务端按 candidate_id 取 latest（前端不能指定 snapshot_id）
+  const snapshotRow = getLatestSnapshotByCandidate(row.id)
+  const snapshot = snapshotRow ? toPublicSnapshot(snapshotRow) : null
+  const priceReference = buildPriceReference(row)
+
+  const historicalEvidence = { has_prior_collaboration: false }
+  const recentEvidence = snapshot ? buildCandidateRecentEvidence(row.id, snapshot) : null
+  const pricingEvidence = snapshot ? buildCandidatePricingEvidence(snapshot, priceReference) : null
+
+  const info = db
+    .prepare(
+      `INSERT INTO creator_decisions (
+         creator, candidate_id, decision_stage, snapshot_id, current_quote_raw, current_quote, ip_judgement,
+         human_decision, decision_note, historical_evidence_json, recent_evidence_json,
+         pricing_evidence_json, target_cpm, pricing_version, system_context_version
+       ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      row.name,
+      row.id,
+      CANDIDATE_REVIEW_STAGE,
+      snapshotRow ? snapshotRow.id : null,
+      humanDecision,
+      decisionNote,
+      JSON.stringify(historicalEvidence),
+      recentEvidence ? JSON.stringify(recentEvidence) : null,
+      pricingEvidence ? JSON.stringify(pricingEvidence) : null,
+      TARGET_CPM,
+      CANDIDATE_REVIEW_PRICING_VERSION,
+      CANDIDATE_REVIEW_SYSTEM_CONTEXT_VERSION
+    )
+
+  const saved = db.prepare('SELECT * FROM creator_decisions WHERE id = ?').get(info.lastInsertRowid)
+  ok(res, toPublicDecision(saved, null, null))
+})
+
+/**
+ * GET /api/creator-candidates/:id/decisions
+ * append-only 历史（created_at DESC, id DESC）；严格按 candidate_id 查询，同名 candidate 不串。
+ */
+router.get('/:id/decisions', (req, res) => {
+  const row = findCandidateRow(req.params.id)
+  if (!row) return fail(res, 404, `候选达人不存在（id=${req.params.id}）`)
+  const rows = db
+    .prepare('SELECT * FROM creator_decisions WHERE candidate_id = ? ORDER BY created_at DESC, id DESC')
+    .all(row.id)
+  ok(res, {
+    candidate_id: row.id,
+    creator: row.name,
+    decisions: rows.map((item) => toPublicDecision(item, null, null))
   })
 })
 

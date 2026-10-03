@@ -149,6 +149,19 @@ async function main() {
       JSON.stringify(Object.keys(candidateColumnMap))
     )
     check('每列都显式声明类型', candidateColumns.every((c) => c.type && c.type.trim()))
+    check(
+      'Phase 2.1 新增 xingtu_url / distilled_description（均 TEXT 可空）',
+      candidateColumnMap.xingtu_url?.type === 'TEXT' &&
+        candidateColumnMap.distilled_description?.type === 'TEXT' &&
+        candidateColumnMap.xingtu_url.notnull === 0 &&
+        candidateColumnMap.distilled_description.notnull === 0
+    )
+    check(
+      'Phase 2.2 新增 xingtu_id（TEXT 可空，保留 legacy xingtu_url）',
+      candidateColumnMap.xingtu_id?.type === 'TEXT' &&
+        candidateColumnMap.xingtu_id.notnull === 0 &&
+        candidateColumnMap.xingtu_url?.type === 'TEXT'
+    )
     const nameUnique = candidateColumns.find((c) => c.name === 'name').pk
     check('name 不是主键（稳定身份是 id）', nameUnique === 0)
     const candidateIndexes = db.prepare('PRAGMA index_list(creator_candidates)').all()
@@ -379,7 +392,136 @@ async function main() {
       db.prepare('SELECT COUNT(*) AS n FROM creator_recent_snapshots WHERE candidate_id = ?').get(archId).n === 2
     )
 
-    console.log('\n===== 11. 安全边界 =====')
+    console.log('\n===== 11. Phase 2.1：xingtu_url 与 distilled_description =====')
+    const withXingtu = await callRoute(createCandidate, {
+      body: { name: '星图达人', profile_url: 'https://www.douyin.com/user/abc', xingtu_url: 'https://www.xingtu.cn/creator/xyz' }
+    })
+    check('合法 xingtu_url 可保存', withXingtu.status === 200 && withXingtu.data.xingtu_url === 'https://www.xingtu.cn/creator/xyz', String(withXingtu.data?.xingtu_url))
+    check('profile_url 与 xingtu_url 独立', withXingtu.data.profile_url === 'https://www.douyin.com/user/abc' && withXingtu.data.xingtu_url !== withXingtu.data.profile_url)
+    const noXingtu = await callRoute(createCandidate, { body: { name: '无星图达人', xingtu_url: null } })
+    check('xingtu_url 可为 null', noXingtu.status === 200 && noXingtu.data.xingtu_url === null)
+    const emptyXingtu = await callRoute(createCandidate, { body: { name: '空星图达人', xingtu_url: '   ' } })
+    check('空字符串 -> null', emptyXingtu.status === 200 && emptyXingtu.data.xingtu_url === null)
+    check('非 http/https（ftp）被拒', (await callRoute(createCandidate, { body: { name: 'x', xingtu_url: 'ftp://a.com' } })).status === 400)
+    check('非 URL 文本被拒', (await callRoute(createCandidate, { body: { name: 'x', xingtu_url: 'just-text' } })).status === 400)
+    const patchXingtu = await callRoute(patchCandidate, { params: { id: String(noXingtu.data.id) }, body: { xingtu_url: 'https://www.xingtu.cn/a' } })
+    check('PATCH 可设置 xingtu_url', patchXingtu.status === 200 && patchXingtu.data.xingtu_url === 'https://www.xingtu.cn/a')
+    check('PATCH 非法 xingtu_url 被拒', (await callRoute(patchCandidate, { params: { id: String(noXingtu.data.id) }, body: { xingtu_url: 'bad' } })).status === 400)
+    // profile_url 是既有字段，本轮不改其校验语义（仍为自由文本）；只有 xingtu_url 增加 http/https 校验
+    check('profile_url 校验保持不变（自由文本，不强制 URL）', (await callRoute(patchCandidate, { params: { id: String(noXingtu.data.id) }, body: { profile_url: '某主页说明' } })).status === 200)
+
+    // 旧 candidate（无新字段）仍可读 —— 新建时不传新字段时两者均为 null
+    const legacyLike = await callRoute(createCandidate, { body: { name: '旧结构达人' } })
+    check('未提供新字段时 xingtu_url / distilled_description 均为 null', legacyLike.data.xingtu_url === null && legacyLike.data.distilled_description === null)
+
+    // distilled_description：只有显式 PATCH 才写入；人工备注变化自动清空过期派生文本
+    const dCand = await callRoute(createCandidate, { body: { name: '蒸馏达人', description: '备注A' } })
+    const dId = dCand.data.id
+    check('AI 输出不会自动写库（新建后 distilled_description=null）', dCand.data.distilled_description === null)
+    const savedDistill = await callRoute(patchCandidate, { params: { id: String(dId) }, body: { distilled_description: 'AI整理A' } })
+    check('用户保存后 distilled_description 才持久化', savedDistill.status === 200 && savedDistill.data.distilled_description === 'AI整理A')
+    const sameDesc = await callRoute(patchCandidate, { params: { id: String(dId) }, body: { description: '备注A' } })
+    check('description 未变化：不无意义清空 distilled_description', sameDesc.data.distilled_description === 'AI整理A', JSON.stringify(sameDesc.data?.distilled_description))
+    const changedDesc = await callRoute(patchCandidate, { params: { id: String(dId) }, body: { description: '备注B' } })
+    check('修改 description：旧 distilled_description 自动清空', changedDesc.data.description === '备注B' && changedDesc.data.distilled_description === null, JSON.stringify({ d: changedDesc.data?.description, dd: changedDesc.data?.distilled_description }))
+    check('清除只清派生文本，不删除 candidate', db.prepare('SELECT COUNT(*) AS n FROM creator_candidates WHERE id = ?').get(dId).n === 1)
+    const changeWithNew = await callRoute(createCandidate, { body: { name: '连带更新达人', description: 'A' } })
+    await callRoute(patchCandidate, { params: { id: String(changeWithNew.data.id) }, body: { distilled_description: 'AI(A)' } })
+    const changeAndProvide = await callRoute(patchCandidate, { params: { id: String(changeWithNew.data.id) }, body: { description: 'B', distilled_description: 'AI(B)' } })
+    check('description 变化且同请求提供新蒸馏：保留新值', changeAndProvide.data.description === 'B' && changeAndProvide.data.distilled_description === 'AI(B)')
+    check('旧 candidate 无新字段仍可正常读取', (await callRoute(detailCandidate, { params: { id: String(legacyLike.data.id) } })).status === 200)
+
+    // 资料维护：只改 name / 链接不得让 AI 整理失效（AI 蒸馏只以 description 为输入）
+    const keepCand = await callRoute(createCandidate, {
+      body: { name: '保留蒸馏达人', description: '备注X', profile_url: 'https://a.com/p', xingtu_url: 'https://a.com/x' }
+    })
+    await callRoute(patchCandidate, { params: { id: String(keepCand.data.id) }, body: { distilled_description: 'AI(X)' } })
+    const nameOnly = await callRoute(patchCandidate, { params: { id: String(keepCand.data.id) }, body: { name: '保留蒸馏达人2' } })
+    check('只改 name 不清空 distilled_description', nameOnly.data.name === '保留蒸馏达人2' && nameOnly.data.distilled_description === 'AI(X)')
+    const xingtuOnly = await callRoute(patchCandidate, { params: { id: String(keepCand.data.id) }, body: { xingtu_url: 'https://a.com/x2' } })
+    check('只改 xingtu_url 不清空 distilled_description', xingtuOnly.data.xingtu_url === 'https://a.com/x2' && xingtuOnly.data.distilled_description === 'AI(X)')
+    const profileOnly = await callRoute(patchCandidate, { params: { id: String(keepCand.data.id) }, body: { profile_url: 'https://a.com/p2' } })
+    check('只改 profile_url 不清空 distilled_description', profileOnly.data.distilled_description === 'AI(X)')
+    check('只改链接：profile_url / xingtu_url 仍独立', profileOnly.data.profile_url === 'https://a.com/p2' && profileOnly.data.xingtu_url === 'https://a.com/x2')
+    check('编辑资料：candidate_id 不变', profileOnly.data.id === keepCand.data.id)
+    const typeOnly = await callRoute(patchCandidate, { params: { id: String(keepCand.data.id) }, body: { creator_type: '科普' } })
+    check('只改 creator_type 不清空 distilled_description', typeOnly.data.creator_type === '科普' && typeOnly.data.distilled_description === 'AI(X)')
+
+    // Phase 2.2：星图 ID（字符串，正式字段；与 profile_url / legacy xingtu_url 独立）
+    const idCand = await callRoute(createCandidate, {
+      body: { name: '星图ID达人', description: '备注I', profile_url: 'https://a.com/p', xingtu_url: 'https://a.com/legacy', xingtu_id: '007123456' }
+    })
+    check('xingtu_id 原样保存（字符串）', idCand.status === 200 && idCand.data.xingtu_id === '007123456', String(idCand.data?.xingtu_id))
+    check('前导 0 不丢失', idCand.data.xingtu_id === '007123456' && typeof idCand.data.xingtu_id === 'string')
+    check('xingtu_id 与 profile_url 独立', idCand.data.profile_url === 'https://a.com/p' && idCand.data.xingtu_id !== idCand.data.profile_url)
+    check('xingtu_id 与 legacy xingtu_url 独立', idCand.data.xingtu_url === 'https://a.com/legacy' && idCand.data.xingtu_id === '007123456')
+    check('xingtu_id 可为 null（新建不传）', (await callRoute(createCandidate, { body: { name: '无ID达人' } })).data.xingtu_id === null)
+    check('空字符串 -> null', (await callRoute(createCandidate, { body: { name: '空ID达人', xingtu_id: '   ' } })).data.xingtu_id === null)
+    check('xingtu_id 超长 -> 400', (await callRoute(createCandidate, { body: { name: 'x', xingtu_id: 'a'.repeat(101) } })).status === 400)
+    await callRoute(patchCandidate, { params: { id: String(idCand.data.id) }, body: { distilled_description: 'AI(I)' } })
+    const idUpdated = await callRoute(patchCandidate, { params: { id: String(idCand.data.id) }, body: { xingtu_id: '999888' } })
+    check('PATCH xingtu_id 可更新', idUpdated.status === 200 && idUpdated.data.xingtu_id === '999888')
+    check('修改 xingtu_id 不清空 distilled_description', idUpdated.data.distilled_description === 'AI(I)')
+    const idCleared = await callRoute(patchCandidate, { params: { id: String(idCand.data.id) }, body: { xingtu_id: '' } })
+    check('PATCH xingtu_id 空串 -> null', idCleared.data.xingtu_id === null)
+    check('清空 xingtu_id 不影响 legacy xingtu_url', idCleared.data.xingtu_url === 'https://a.com/legacy')
+    check('legacy xingtu_url 不自动解析为 xingtu_id', idCleared.data.xingtu_url === 'https://a.com/legacy' && idCleared.data.xingtu_id === null)
+    check('xingtu_id 不接受非字符串 / 非数字（对象）', (await callRoute(patchCandidate, { params: { id: String(idCand.data.id) }, body: { xingtu_id: { a: 1 } } })).status === 400)
+
+    // 大 ID / 前导 0 round-trip：GET detail 必须逐字符一致；只改 xingtu_id 不动其它字段
+    const BIG_ID = '7663552982146875442'
+    const LEAD_ZERO_ID = '001234567890'
+    const bigCand = await callRoute(createCandidate, {
+      body: { name: '大ID达人', description: '备注B', profile_url: 'https://p.example', xingtu_id: BIG_ID }
+    })
+    await callRoute(patchCandidate, { params: { id: String(bigCand.data.id) }, body: { distilled_description: 'AI(B)' } })
+    const snapForBig = await callRoute(saveCandidateSnapshot, {
+      params: { id: String(bigCand.data.id) },
+      body: { observed_at: OBSERVED_AT, plays: [play('1万'), play('2万')] }
+    })
+    const bigPatched = await callRoute(patchCandidate, { params: { id: String(bigCand.data.id) }, body: { xingtu_id: BIG_ID } })
+    const bigDetail = await callRoute(detailCandidate, { params: { id: String(bigCand.data.id) } })
+    check('大 ID round-trip 逐字符一致（PATCH + GET detail）', bigPatched.data.xingtu_id === BIG_ID && bigDetail.data.xingtu_id === BIG_ID, String(bigDetail.data?.xingtu_id))
+    check('大 ID 仍为字符串类型（未被数字化）', typeof bigDetail.data.xingtu_id === 'string')
+    const leadPatched = await callRoute(patchCandidate, { params: { id: String(bigCand.data.id) }, body: { xingtu_id: LEAD_ZERO_ID } })
+    const leadDetail = await callRoute(detailCandidate, { params: { id: String(bigCand.data.id) } })
+    check('前导 0 round-trip 保留', leadPatched.data.xingtu_id === LEAD_ZERO_ID && leadDetail.data.xingtu_id === LEAD_ZERO_ID, String(leadDetail.data?.xingtu_id))
+    check('只改 xingtu_id：name / profile_url / description 不变', leadPatched.data.name === '大ID达人' && leadPatched.data.profile_url === 'https://p.example' && leadPatched.data.description === '备注B')
+    check('只改 xingtu_id：candidate_id 不变', leadPatched.data.id === bigCand.data.id)
+    check('只改 xingtu_id：不清空 distilled_description', leadPatched.data.distilled_description === 'AI(B)')
+    check('只改 xingtu_id：snapshot 不受影响', db.prepare('SELECT COUNT(*) AS n FROM creator_recent_snapshots WHERE candidate_id = ?').get(bigCand.data.id).n === 1 && db.prepare('SELECT creator FROM creator_recent_snapshots WHERE id = ?').get(snapForBig.data.id).creator === '大ID达人')
+
+    // 源码级：xingtu_id 读取器只做 String()，绝不 Number / parseInt（避免大整数精度丢失）
+    const candRouteSrc = fs.readFileSync(path.join(root, 'backend/routes/creatorCandidates.js'), 'utf8')
+    const idReaderSrc = candRouteSrc.slice(
+      candRouteSrc.indexOf('function readOptionalXingtuId'),
+      candRouteSrc.indexOf('function findCandidateRow')
+    )
+    check('xingtu_id 读取器使用 String(value)', /String\(value\)/.test(idReaderSrc))
+    check('xingtu_id 读取器无 Number / parseInt / 一元加号', !/Number\(|parseInt\(|unary|\+\s*value/.test(idReaderSrc))
+    check('schema 中 xingtu_id 为 TEXT（非 INTEGER）', /xingtu_id TEXT/.test(fs.readFileSync(path.join(root, 'backend/db.js'), 'utf8')))
+
+    // 改名语义：candidate_id 稳定 / 旧 snapshot 保留旧名 / 新 snapshot 用新名 / latest 仍按 id
+    const renameCand2 = await callRoute(createCandidate, { body: { name: '改名前', description: '备注R' } })
+    await callRoute(patchCandidate, { params: { id: String(renameCand2.data.id) }, body: { distilled_description: 'AI(R)' } })
+    const oldSnap = await callRoute(saveCandidateSnapshot, {
+      params: { id: String(renameCand2.data.id) },
+      body: { observed_at: OBSERVED_AT, plays: [play('1万'), play('2万')] }
+    })
+    const renamed2 = await callRoute(patchCandidate, { params: { id: String(renameCand2.data.id) }, body: { name: '改名后' } })
+    check('改名：candidate_id 不变', renamed2.data.id === renameCand2.data.id)
+    check('改名：不清空 distilled_description', renamed2.data.distilled_description === 'AI(R)')
+    check('改名：旧 snapshot.creator 保留旧名（不 UPDATE）', db.prepare('SELECT creator FROM creator_recent_snapshots WHERE id = ?').get(oldSnap.data.id).creator === '改名前')
+    const newSnap = await callRoute(saveCandidateSnapshot, {
+      params: { id: String(renameCand2.data.id) },
+      body: { observed_at: '2026-09-30', plays: [play('3万'), play('4万')] }
+    })
+    check('改名：新增 snapshot 由服务端写入新 name', newSnap.data.creator === '改名后' && newSnap.data.candidate_id === renameCand2.data.id)
+    const renamedLatest = await callRoute(candidateLatest, { params: { id: String(renameCand2.data.id) } })
+    check('改名：latest 仍按 candidate_id 查询', renamedLatest.data.snapshot?.id === newSnap.data.id)
+    check('编辑资料不影响 Radar（候选不进 creator_records）', db.prepare('SELECT COUNT(*) AS n FROM creator_records WHERE nickname = ?').get('改名后').n === 0)
+
+    console.log('\n===== 12. 安全边界 =====')
     check('未发生任何外部网络请求', networkGuard.blocked.length === 0, JSON.stringify(networkGuard.blocked))
     const routeSource = fs.readFileSync(path.join(root, 'backend/routes/creatorCandidates.js'), 'utf8')
     check('Phase 1 路由不引用任何 AI 服务', !/deepseek|callProviderVision|extract-creator-screenshot/i.test(routeSource))

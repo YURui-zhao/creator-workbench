@@ -26,8 +26,15 @@ const router = Router()
 const NAME_MAX = 100
 const CREATOR_TYPE_MAX = 50
 const PROFILE_URL_MAX = 500
+const XINGTU_URL_MAX = 500
+// 星图 ID：字符串存储（不假设纯数字，避免未来格式变化 / 前导 0 丢失）
+const XINGTU_ID_MAX = 100
 const DESCRIPTION_MAX = 500
+// AI 整理文本上限（派生字段，非事实来源）
+const DISTILLED_MAX = 4000
 const STATUS_VALUES = ['active', 'archived']
+// 只要求合法 http / https URL，不强绑固定域名（避免星图 URL 结构变化导致误拦）
+const HTTP_URL_RE = /^https?:\/\/[^\s]+$/i
 
 function ok(res, data) {
   res.json({ code: 200, data, msg: 'success' })
@@ -84,6 +91,36 @@ function readStatus(value, errors) {
   return text
 }
 
+/** 可选 URL：nullable；非空时 trim 且必须是 http/https；超长 / 非法 → 明确报错 */
+function readOptionalUrl(value, field, maxLength, errors) {
+  const text = readOptionalText(value, field, maxLength, errors)
+  if (text === null) return null
+  if (!HTTP_URL_RE.test(text)) {
+    errors.push(`${field} 必须是合法的 http / https 链接`)
+    return null
+  }
+  return text
+}
+
+/**
+ * 星图 ID：nullable；trim；空串规范为 null；字符串存储（绝不转 number，保留前导 0 / 未来格式）。
+ * 宽容接受数字型输入（转为字符串），但绝不反向把字符串当作数字处理。
+ */
+function readOptionalXingtuId(value, errors) {
+  if (value === null || value === undefined) return null
+  if (typeof value !== 'string' && typeof value !== 'number') {
+    errors.push('xingtu_id 必须是字符串')
+    return null
+  }
+  const text = String(value).trim()
+  if (text === '') return null
+  if (text.length > XINGTU_ID_MAX) {
+    errors.push(`xingtu_id 长度不能超过 ${XINGTU_ID_MAX}`)
+    return null
+  }
+  return text
+}
+
 function findCandidateRow(id) {
   const numId = Number(id)
   if (!Number.isInteger(numId) || numId <= 0) return null
@@ -97,7 +134,10 @@ function toPublicCandidate(row) {
     name: row.name,
     creator_type: row.creator_type ?? null,
     profile_url: row.profile_url ?? null,
+    xingtu_url: row.xingtu_url ?? null,
+    xingtu_id: row.xingtu_id ?? null,
     description: row.description ?? null,
+    distilled_description: row.distilled_description ?? null,
     status: row.status,
     created_at: row.created_at,
     updated_at: row.updated_at
@@ -118,17 +158,25 @@ router.post('/', (req, res) => {
   const name = readName(body.name, errors)
   const creatorType = readOptionalText(body.creator_type, 'creator_type', CREATOR_TYPE_MAX, errors)
   const profileUrl = readOptionalText(body.profile_url, 'profile_url', PROFILE_URL_MAX, errors)
+  const xingtuUrl = readOptionalUrl(body.xingtu_url, 'xingtu_url', XINGTU_URL_MAX, errors)
+  const xingtuId = readOptionalXingtuId(body.xingtu_id, errors)
   const description = readOptionalText(body.description, 'description', DESCRIPTION_MAX, errors)
+  const distilled = readOptionalText(
+    body.distilled_description,
+    'distilled_description',
+    DISTILLED_MAX,
+    errors
+  )
   const status =
     body.status === undefined || body.status === null ? 'active' : readStatus(body.status, errors)
   if (errors.length) return fail(res, 400, errors[0])
 
   const info = db
     .prepare(
-      `INSERT INTO creator_candidates (name, creator_type, profile_url, description, status)
-       VALUES (?, ?, ?, ?, ?)`
+      `INSERT INTO creator_candidates (name, creator_type, profile_url, xingtu_url, xingtu_id, description, distilled_description, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .run(name, creatorType, profileUrl, description, status)
+    .run(name, creatorType, profileUrl, xingtuUrl, xingtuId, description, distilled, status)
 
   ok(res, toPublicCandidate(findCandidateRow(info.lastInsertRowid)))
 })
@@ -173,6 +221,7 @@ router.patch('/:id', (req, res) => {
   const fields = []
   const params = []
   const errors = []
+  const hasOwn = (key) => Object.prototype.hasOwnProperty.call(body, key)
 
   if ('name' in body) {
     const name = readName(body.name, errors)
@@ -189,10 +238,35 @@ router.patch('/:id', (req, res) => {
     fields.push('profile_url = ?')
     params.push(readOptionalText(body.profile_url, 'profile_url', PROFILE_URL_MAX, errors))
   }
-  if ('description' in body) {
-    fields.push('description = ?')
-    params.push(readOptionalText(body.description, 'description', DESCRIPTION_MAX, errors))
+  if (hasOwn('xingtu_url')) {
+    fields.push('xingtu_url = ?')
+    params.push(readOptionalUrl(body.xingtu_url, 'xingtu_url', XINGTU_URL_MAX, errors))
   }
+  // 星图 ID（正式字段，字符串；空串规范为 null；与 description 无关，不影响 distilled_description）
+  if (hasOwn('xingtu_id')) {
+    fields.push('xingtu_id = ?')
+    params.push(readOptionalXingtuId(body.xingtu_id, errors))
+  }
+
+  // description（人工备注）是唯一事实来源；比较「实际是否变化」用于过期蒸馏清理
+  const currentDescription = row.description ?? null
+  const hasDescription = hasOwn('description')
+  const nextDescription = hasDescription
+    ? readOptionalText(body.description, 'description', DESCRIPTION_MAX, errors)
+    : currentDescription
+  if (hasDescription) {
+    fields.push('description = ?')
+    params.push(nextDescription)
+  }
+  const descriptionChanged = hasDescription && nextDescription !== currentDescription
+
+  // distilled_description 是派生字段：显式提供则直接写入
+  const hasDistilled = hasOwn('distilled_description')
+  if (hasDistilled) {
+    fields.push('distilled_description = ?')
+    params.push(readOptionalText(body.distilled_description, 'distilled_description', DISTILLED_MAX, errors))
+  }
+
   if ('status' in body) {
     const status = readStatus(body.status, errors)
     if (status !== null) {
@@ -201,6 +275,13 @@ router.patch('/:id', (req, res) => {
     }
   }
   if (errors.length) return fail(res, 400, errors[0])
+
+  // 关键一致性：人工备注真正改变、且本次没有提供新的蒸馏结果时，自动清除过期派生文本。
+  // 只清派生文本，不删除任何 candidate / snapshot 历史；备注未变化则不清空。
+  if (descriptionChanged && !hasDistilled) {
+    fields.push('distilled_description = ?')
+    params.push(null)
+  }
   if (!fields.length) return fail(res, 400, '没有可更新的字段')
 
   fields.push('updated_at = CURRENT_TIMESTAMP')

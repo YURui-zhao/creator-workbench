@@ -904,4 +904,93 @@ router.post('/extract-creator-screenshot', async (req, res) => {
   }
 })
 
+// ---------- Phase 2.1：人工备注 AI 整理（只整理用户提供的备注，不添加任何外部事实） ----------
+const MAX_CREATOR_NOTE_LENGTH = 2000
+
+// 固定任务 prompt：前端不能传入任意 system prompt（路由只读取 description）
+export function buildDistillSystemPrompt() {
+  return `
+你是「达人投放工作台」的备注整理助手。用户会提供一段自己写的达人人人工备注。
+
+你唯一的任务：把这段人工备注整理成简洁的结构化要点。
+
+必须遵守：
+1. 只允许基于用户提供的备注内容整理，禁止添加任何外部事实、常识推断或你没被告知的信息。
+2. 人工备注是「用户的观察 / 判断」，不是系统已验证的事实。整理时必须保留来源限定，例如：
+   - 原文「商单保证50w」→ 整理为「人工备注认为商单播放约 50 万」
+   - 原文「平时百万播放」→ 整理为「人工观察认为日常通常在百万量级」
+   - 原文「价格很便宜」→ 整理为「人工备注判断价格相对实惠」
+   绝对不要改写成「商单播放 50 万」「稳定百万播放」「价格具有优势」等确定性事实。
+3. 不做任何「值得投 / 不值得投」的判断，不输出推荐分。
+4. 输出 2~5 个简短要点，围绕：达人定位 / 内容特点、人工备注中的播放表现、人工备注中的商业合作 / 价格信息、需要后续数据验证的部分。
+5. 只输出一个严格 JSON 对象，不要输出解释、Markdown 代码块或多余文字：
+{"points": ["要点1", "要点2"]}
+`
+}
+
+// 只把 description 作为用户输入发送（数据最小化）
+export function buildDistillUserText(description) {
+  return String(description ?? '')
+}
+
+// 解析 AI 返回：只接受 { points: string[] }；非法结构直接抛错，不做猜测修复
+export function parseDistillResult(content) {
+  let parsed
+  try {
+    parsed = parseAiResult(content)
+  } catch {
+    throw new DeepSeekError('AI 返回内容不是合法 JSON，备注整理失败，请重试', 502)
+  }
+  const rawPoints = Array.isArray(parsed?.points)
+    ? parsed.points
+    : typeof parsed?.points === 'string'
+      ? [parsed.points]
+      : []
+  const points = rawPoints
+    .map((item) => (typeof item === 'string' ? item.trim() : ''))
+    .filter(Boolean)
+    .slice(0, 5)
+  if (!points.length) {
+    throw new DeepSeekError('AI 未返回可用的整理要点，请重试', 502)
+  }
+  return { points, text: points.join('\n') }
+}
+
+/**
+ * 整理人工备注（可注入 callFn，便于测试完全离线）
+ * @param {string} description 用户人工备注（唯一输入）
+ * @param {Function} [callFn] 默认 callDeepSeek
+ * @param {{ provider?: string, model?: string, apiKey?: string }} [options]
+ */
+export async function distillCreatorNote(description, callFn = callDeepSeek, options = {}) {
+  const content = await callFn(buildDistillSystemPrompt(), buildDistillUserText(description), options)
+  return parseDistillResult(content)
+}
+
+/**
+ * POST /api/ai/distill-creator-note
+ * 入参：{ description: string }（只发送这一段人工备注，数据最小化）
+ * 出参：{ points: string[], text: string }（AI 整理文本，不是系统验证事实）
+ * 说明：固定任务 prompt；不发送 creator_records / 近期播放 / Decision / 其他达人数据；
+ *      AI 不可用时返回明确错误，但不影响 candidate 数据。
+ */
+router.post('/distill-creator-note', async (req, res) => {
+  const body = req.body && !Array.isArray(req.body) ? req.body : {}
+  const description = typeof body.description === 'string' ? body.description.trim() : ''
+  if (!description) return fail(res, 400, 'description 不能为空')
+  if (description.length > MAX_CREATOR_NOTE_LENGTH) {
+    return fail(res, 400, `人工备注长度不能超过 ${MAX_CREATOR_NOTE_LENGTH}`)
+  }
+  try {
+    const result = await distillCreatorNote(description, callDeepSeek, aiOptions(req))
+    ok(res, result)
+  } catch (err) {
+    if (err instanceof DeepSeekError || err.isDeepSeekError) {
+      return fail(res, err.status || 502, err.message)
+    }
+    console.error('[ai] 备注整理异常')
+    return fail(res, 500, 'AI 备注整理服务异常，请稍后重试')
+  }
+})
+
 export default router

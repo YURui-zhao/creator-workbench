@@ -15,6 +15,7 @@ import {
   Space,
   Statistic,
   Tag,
+  Tooltip,
   Typography,
   message
 } from 'antd'
@@ -22,12 +23,19 @@ import { PlusOutlined, ReloadOutlined, UserAddOutlined } from '@ant-design/icons
 import {
   createCreatorCandidate,
   getCandidateLatestSnapshot,
-  listCreatorCandidates
+  listCreatorCandidates,
+  updateCreatorCandidate
 } from '../../api/creatorCandidates'
+import { distillCreatorNote, getAiStatus } from '../../api/ai'
+import { getAiConfig } from '../../utils/aiConfig.js'
 import { getErrorMessage } from '../../utils/request'
 import { formatInteger, formatPlays } from '../../utils/format'
 import { TREND_LABELS_FULL } from '../../utils/recentPerformanceSave.js'
 import { buildCreatorPlaybookAssessment } from '../../utils/creatorPlaybookRules.js'
+import {
+  applyCandidateEditValues,
+  applyXingtuIdFormValues
+} from '../../utils/creatorCandidateForm.js'
 import RecentPerformanceAssistantModal from '../../components/RecentPerformanceAssistantModal'
 
 const PLACEHOLDER = '-'
@@ -71,7 +79,22 @@ export default function CreatorPlaybook() {
   const [createOpen, setCreateOpen] = useState(false)
   const [creating, setCreating] = useState(false)
   const [assistantOpen, setAssistantOpen] = useState(false)
+  // AI 是否可用（仅控制「AI整理备注」按钮；不影响 candidate / snapshot 等其它能力）
+  const [aiReady, setAiReady] = useState(false)
+  // AI 整理备注：预览态（不自动写库）
+  const [distilling, setDistilling] = useState(false)
+  const [distillPreview, setDistillPreview] = useState(null)
+  const [savingDistill, setSavingDistill] = useState(false)
+  // 资料维护：星图 ID 就地更新 / 编辑资料（都复用同一 PATCH，不新增 API）
+  const [xingtuEditOpen, setXingtuEditOpen] = useState(false)
+  const [savingXingtu, setSavingXingtu] = useState(false)
+  const [editOpen, setEditOpen] = useState(false)
+  const [savingEdit, setSavingEdit] = useState(false)
+  // 冻结「正在编辑的 candidate」：回填只认这个对象，不受列表刷新 / selected 变化影响
+  const [editingCandidate, setEditingCandidate] = useState(null)
   const [form] = Form.useForm()
+  const [xingtuForm] = Form.useForm()
+  const [editForm] = Form.useForm()
 
   const loadCandidates = useCallback(async () => {
     setListLoading(true)
@@ -117,9 +140,34 @@ export default function CreatorPlaybook() {
     loadSnapshot(selectedId)
   }, [selectedId, loadSnapshot])
 
+  // AI 可用性：会话 Key（本地）或后端环境变量任一可用即可；查询失败不影响页面其它能力
+  useEffect(() => {
+    let active = true
+    if (Boolean(getAiConfig()?.apiKey)) {
+      setAiReady(true)
+      return undefined
+    }
+    getAiStatus()
+      .then((res) => {
+        if (active) setAiReady(Boolean(res?.data?.available))
+      })
+      .catch(() => {
+        if (active) setAiReady(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [selectedId])
+
+  // 切换候选时清空未保存的 AI 整理预览
+  useEffect(() => {
+    setDistillPreview(null)
+  }, [selectedId])
+
   const selected = candidates.find((item) => item.id === selectedId) || null
 
   const handleCreate = async () => {
+    if (creating) return
     let values
     try {
       values = await form.validateFields()
@@ -132,6 +180,7 @@ export default function CreatorPlaybook() {
         name: values.name,
         creator_type: values.creator_type || null,
         profile_url: values.profile_url || null,
+        xingtu_id: values.xingtu_id || null,
         description: values.description || null
       })
       const created = res?.data
@@ -140,10 +189,124 @@ export default function CreatorPlaybook() {
       form.resetFields()
       await loadCandidates()
       if (created?.id) setSelectedId(created.id)
-    } catch (error) {
-      message.error(getErrorMessage(error))
+    } catch {
+      // 失败提示由 request 响应拦截器统一给出，这里不再重复 toast
     } finally {
       setCreating(false)
+    }
+  }
+
+  // 只整理已有的人工备注（只在用户显式点击时调用；AI 失败不影响 candidate 数据）
+  const handleDistill = async () => {
+    if (!selected) return
+    const note = String(selected.description ?? '').trim()
+    if (!note) return
+    if (distilling) return
+    setDistilling(true)
+    setDistillPreview(null)
+    try {
+      const res = await distillCreatorNote(note)
+      setDistillPreview(res?.data || null)
+    } catch {
+      // 失败提示由 request 响应拦截器统一给出，这里不再重复 toast
+    } finally {
+      setDistilling(false)
+    }
+  }
+
+  // 用户明确点击「保存整理结果」后才写库（distilled_description 是派生字段）
+  const handleSaveDistill = async () => {
+    if (!selected || !distillPreview?.text) return
+    if (savingDistill) return
+    setSavingDistill(true)
+    try {
+      await updateCreatorCandidate(selected.id, { distilled_description: distillPreview.text })
+      message.success('已保存 AI 整理结果')
+      setDistillPreview(null)
+      await loadCandidates()
+    } catch {
+      // 失败提示由 request 响应拦截器统一给出，这里不再重复 toast
+    } finally {
+      setSavingDistill(false)
+    }
+  }
+
+  // 星图 ID 就地更新（只 PATCH xingtu_id；不动 candidate_id / snapshot / description / AI整理）
+  const openXingtuEdit = () => {
+    setEditingCandidate(selected)
+    setXingtuEditOpen(true)
+  }
+
+  const handleSaveXingtu = async () => {
+    if (!editingCandidate) return
+    if (savingXingtu) return
+    let values
+    try {
+      values = await xingtuForm.validateFields()
+    } catch {
+      return
+    }
+    setSavingXingtu(true)
+    try {
+      await updateCreatorCandidate(editingCandidate.id, { xingtu_id: values.xingtu_id || null })
+      message.success('星图 ID 已更新')
+      setXingtuEditOpen(false)
+      setEditingCandidate(null)
+      await loadCandidates()
+    } catch {
+      // 失败提示由 request 响应拦截器统一给出，这里不再重复 toast
+    } finally {
+      setSavingXingtu(false)
+    }
+  }
+
+  // 复制星图 ID（clipboard API 失败时明确报错，绝不静默假成功）
+  const handleCopyXingtuId = async () => {
+    const text = String(selected?.xingtu_id ?? '').trim()
+    if (!text) return
+    try {
+      if (!navigator?.clipboard?.writeText) throw new Error('clipboard unavailable')
+      await navigator.clipboard.writeText(text)
+      message.success('星图 ID 已复制')
+    } catch {
+      message.error('复制失败，请手动复制星图 ID')
+    }
+  }
+
+  // 编辑资料（复用同一 PATCH；description 变化时后端会自动清空过期 AI 整理）
+  const openEdit = () => {
+    setEditingCandidate(selected)
+    setEditOpen(true)
+  }
+
+  const handleSaveEdit = async () => {
+    if (!editingCandidate) return
+    if (savingEdit) return
+    let values
+    try {
+      values = await editForm.validateFields()
+    } catch {
+      return
+    }
+    setSavingEdit(true)
+    try {
+      await updateCreatorCandidate(editingCandidate.id, {
+        name: values.name,
+        creator_type: values.creator_type || null,
+        profile_url: values.profile_url || null,
+        xingtu_id: values.xingtu_id || null,
+        description: values.description || null
+      })
+      message.success('资料已更新')
+      setEditOpen(false)
+      setEditingCandidate(null)
+      // 备注若变化，后端已清空过期 AI 整理；同时丢弃未保存的 AI 预览，避免展示过期结果
+      setDistillPreview(null)
+      await loadCandidates()
+    } catch {
+      // 失败提示由 request 响应拦截器统一给出，这里不再重复 toast
+    } finally {
+      setSavingEdit(false)
     }
   }
 
@@ -250,6 +413,10 @@ export default function CreatorPlaybook() {
                   </Typography.Text>
                   <Typography.Text type="secondary">{selected.creator_type || '未分类'}</Typography.Text>
                   {selected.status === 'archived' && <Tag>已归档</Tag>}
+                  {/* 次级操作：编辑资料（不抢「录入近期表现」的主 CTA 层级） */}
+                  <Button type="link" size="small" onClick={openEdit}>
+                    编辑资料
+                  </Button>
                 </Space>
               }
               extra={
@@ -261,14 +428,30 @@ export default function CreatorPlaybook() {
               <Descriptions size="small" column={2} style={{ marginBottom: 8 }}>
                 <Descriptions.Item label="主页链接">
                   {selected.profile_url ? (
-                    <a href={selected.profile_url} target="_blank" rel="noreferrer">
-                      {selected.profile_url}
+                    <a href={selected.profile_url} target="_blank" rel="noopener noreferrer">
+                      查看主页
                     </a>
                   ) : (
                     PLACEHOLDER
                   )}
                 </Descriptions.Item>
-                <Descriptions.Item label="备注">{selected.description || PLACEHOLDER}</Descriptions.Item>
+                <Descriptions.Item label="星图 ID">
+                  <Space size={4} wrap>
+                    {selected.xingtu_id ? (
+                      <Typography.Text>{selected.xingtu_id}</Typography.Text>
+                    ) : (
+                      <Typography.Text type="secondary">{PLACEHOLDER}</Typography.Text>
+                    )}
+                    {selected.xingtu_id && (
+                      <Button type="link" size="small" onClick={handleCopyXingtuId}>
+                        复制
+                      </Button>
+                    )}
+                    <Button type="link" size="small" onClick={openXingtuEdit}>
+                      {selected.xingtu_id ? '更新 ID' : '补充 ID'}
+                    </Button>
+                  </Space>
+                </Descriptions.Item>
                 <Descriptions.Item label="创建时间">
                   {String(selected.created_at || '').slice(0, 16) || PLACEHOLDER}
                 </Descriptions.Item>
@@ -276,6 +459,64 @@ export default function CreatorPlaybook() {
               </Descriptions>
 
               <Divider style={{ margin: '8px 0 12px' }} />
+
+              {/* 人工备注：source of truth（AI 只整理，绝不覆盖） */}
+              <div>
+                <Space size={8} wrap align="center">
+                  <Typography.Text strong>人工备注</Typography.Text>
+                  {Boolean(String(selected.description ?? '').trim()) && (
+                    <Tooltip title={aiReady ? '' : '连接 AI 后可整理备注'}>
+                      <Button
+                        size="small"
+                        disabled={!aiReady}
+                        loading={distilling}
+                        onClick={handleDistill}
+                      >
+                        AI整理备注
+                      </Button>
+                    </Tooltip>
+                  )}
+                </Space>
+                <Typography.Paragraph style={{ marginTop: 6, marginBottom: 0, whiteSpace: 'pre-wrap' }}>
+                  {selected.description || PLACEHOLDER}
+                </Typography.Paragraph>
+              </div>
+
+              {/* AI 整理预览（未保存）：明确与人工备注区分，不自动写库 */}
+              {distillPreview && (
+                <div style={{ marginTop: 10, padding: 8, background: 'rgba(0,0,0,0.02)', borderRadius: 4 }}>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    AI整理（预览，未保存）
+                  </Typography.Text>
+                  <ul style={{ margin: '4px 0 8px', paddingLeft: 20 }}>
+                    {distillPreview.points.map((point) => (
+                      <li key={point}>{point}</li>
+                    ))}
+                  </ul>
+                  <Space size={8}>
+                    <Button size="small" type="primary" loading={savingDistill} onClick={handleSaveDistill}>
+                      保存整理结果
+                    </Button>
+                    <Button size="small" onClick={() => setDistillPreview(null)}>
+                      放弃
+                    </Button>
+                  </Space>
+                </div>
+              )}
+
+              {/* 已保存的 AI 整理结果（派生文本，与人工备注分开展示） */}
+              {selected.distilled_description && (
+                <div style={{ marginTop: 10 }}>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    AI整理
+                  </Typography.Text>
+                  <Typography.Paragraph style={{ marginTop: 4, marginBottom: 0, whiteSpace: 'pre-wrap' }}>
+                    {selected.distilled_description}
+                  </Typography.Paragraph>
+                </div>
+              )}
+
+              <Divider style={{ margin: '12px 0' }} />
 
               {snapshotLoading ? (
                 <Typography.Text type="secondary">加载近期表现…</Typography.Text>
@@ -421,7 +662,87 @@ export default function CreatorPlaybook() {
           <Form.Item name="profile_url" label="主页链接（可选）">
             <Input placeholder="https://..." maxLength={500} />
           </Form.Item>
+          <Form.Item name="xingtu_id" label="星图 ID（可选）">
+            <Input placeholder="星图 ID" maxLength={100} />
+          </Form.Item>
           <Form.Item name="description" label="简短备注（可选）">
+            <Input.TextArea placeholder="来源 / 判断线索等" maxLength={500} autoSize={{ minRows: 2, maxRows: 4 }} />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      {/* 星图 ID 就地更新（轻量 Modal，只改 xingtu_id） */}
+      <Modal
+        title={editingCandidate?.xingtu_id ? '更新星图 ID' : '补充星图 ID'}
+        open={xingtuEditOpen}
+        onCancel={() => {
+          setXingtuEditOpen(false)
+          setEditingCandidate(null)
+        }}
+        afterOpenChange={(open) => {
+          // 必须等 Modal 真正打开、Form 已挂载后再回填；否则 setFieldsValue 会被丢弃
+          if (!open) return
+          applyXingtuIdFormValues(xingtuForm, editingCandidate)
+        }}
+        onOk={handleSaveXingtu}
+        confirmLoading={savingXingtu}
+        okText="保存"
+        cancelText="取消"
+        destroyOnClose
+      >
+        <Form form={xingtuForm} layout="vertical" preserve={false}>
+          <Form.Item
+            name="xingtu_id"
+            label="星图 ID"
+            extra="星图平台中的达人 ID / 业务查询标识；留空表示不填写"
+          >
+            <Input placeholder="星图 ID" maxLength={100} />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      {/* 编辑资料（复用同一 PATCH；不改 candidate_id / created_at / snapshot / AI整理） */}
+      <Modal
+        title="编辑资料"
+        open={editOpen}
+        onCancel={() => {
+          setEditOpen(false)
+          setEditingCandidate(null)
+        }}
+        afterOpenChange={(open) => {
+          // 必须等 Modal 真正打开、Form 已挂载后再回填；否则 setFieldsValue 会被丢弃
+          if (!open) return
+          applyCandidateEditValues(editForm, editingCandidate)
+        }}
+        onOk={handleSaveEdit}
+        confirmLoading={savingEdit}
+        okText="保存"
+        cancelText="取消"
+        destroyOnClose
+      >
+        <Form form={editForm} layout="vertical" preserve={false}>
+          <Form.Item
+            name="name"
+            label="达人名称"
+            rules={[{ required: true, message: '请填写达人名称' }]}
+            extra="改名不影响 candidate_id；已保存的历史快照保留创建时的旧名称"
+          >
+            <Input placeholder="达人名称（允许重名）" maxLength={100} />
+          </Form.Item>
+          <Form.Item name="creator_type" label="达人类型（可选）">
+            <Input placeholder="如 美妆 / 数码 / 生活" maxLength={50} />
+          </Form.Item>
+          <Form.Item name="profile_url" label="达人主页链接（可选）">
+            <Input placeholder="https://..." maxLength={500} />
+          </Form.Item>
+          <Form.Item name="xingtu_id" label="星图 ID（可选）">
+            <Input placeholder="星图 ID" maxLength={100} />
+          </Form.Item>
+          <Form.Item
+            name="description"
+            label="人工备注（可选）"
+            extra="备注变化后，旧的 AI 整理结果会自动失效"
+          >
             <Input.TextArea placeholder="来源 / 判断线索等" maxLength={500} autoSize={{ minRows: 2, maxRows: 4 }} />
           </Form.Item>
         </Form>

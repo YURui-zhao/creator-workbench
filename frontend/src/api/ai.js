@@ -76,3 +76,20 @@ export function extractCreatorScreenshot(images) {
     { timeout: 60000, headers: buildAiHeaders() }
   )
 }
+
+/**
+ * 人工备注 AI 整理（Phase 2.1）：只发送 description，遵循数据最小化
+ * 入参：description（用户人工备注，唯一输入）
+ * 返回：{ code, data: { points: string[], text: string }, msg }
+ * 说明：
+ * - 只在用户显式点击「AI整理备注」后调用，页面加载 / 保存 candidate 都不触发
+ * - 结果只是「基于人工备注整理的文本」，不是系统验证事实；不自动写库
+ * - AI 未连接时后端返回明确错误，不影响 candidate 数据与页面正常使用
+ */
+export function distillCreatorNote(description) {
+  return request.post(
+    '/ai/distill-creator-note',
+    { description },
+    { timeout: 60000, headers: buildAiHeaders() }
+  )
+}

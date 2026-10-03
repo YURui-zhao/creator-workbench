@@ -208,7 +208,14 @@ db.exec(`
     name TEXT NOT NULL,
     creator_type TEXT,
     profile_url TEXT,
+    -- Phase 2.1：星图商单页链接，与 profile_url（达人内容主页）永久分开，不复用字段
+    -- Phase 2.2 起前台不再新增 / 编辑；保留为 legacy compatibility field（不 DROP、不解析）
+    xingtu_url TEXT,
+    -- Phase 2.2：星图平台达人 ID / 业务查询标识（字符串存储，不做 URL 解析）
+    xingtu_id TEXT,
     description TEXT,
+    -- Phase 2.1：基于 description 生成的 AI 整理文本（人工备注仍是唯一事实来源）
+    distilled_description TEXT,
     status TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -244,6 +251,28 @@ if (!snapshotColumns.includes('candidate_id')) {
 db.exec(
   'CREATE INDEX IF NOT EXISTS idx_recent_snapshots_candidate ON creator_recent_snapshots(candidate_id, created_at)'
 )
+
+// Phase 2.1：为既有 creator_candidates 安全补充 xingtu_url / distilled_description
+// 说明：
+//   · 只在列不存在时 ALTER TABLE，不覆盖任何已有候选
+//   · 旧候选保持 NULL，由 UI 显示为空 / 不显示入口
+const candidateColumns = db
+  .prepare('PRAGMA table_info(creator_candidates)')
+  .all()
+  .map((column) => column.name)
+if (!candidateColumns.includes('xingtu_url')) {
+  db.exec('ALTER TABLE creator_candidates ADD COLUMN xingtu_url TEXT')
+  console.log('[db] 已为 creator_candidates 添加 xingtu_url 列（旧候选保持 NULL）')
+}
+if (!candidateColumns.includes('distilled_description')) {
+  db.exec('ALTER TABLE creator_candidates ADD COLUMN distilled_description TEXT')
+  console.log('[db] 已为 creator_candidates 添加 distilled_description 列（旧候选保持 NULL）')
+}
+// Phase 2.2：正式字段「星图 ID」；xingtu_url 保留为 legacy（不 DROP、不迁移、不解析）
+if (!candidateColumns.includes('xingtu_id')) {
+  db.exec('ALTER TABLE creator_candidates ADD COLUMN xingtu_id TEXT')
+  console.log('[db] 已为 creator_candidates 添加 xingtu_id 列（旧候选保持 NULL）')
+}
 
 // 首次启动写入示例项目（前端工作台展示用）
 const projectCount = db.prepare('SELECT COUNT(*) AS n FROM projects').get().n

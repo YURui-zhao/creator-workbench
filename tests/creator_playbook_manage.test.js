@@ -1,0 +1,128 @@
+#!/usr/bin/env node
+// Creator Playbook 资料维护 UX 回归测试（源码级 + 契约级）
+//
+// 运行方式：node tests/creator_playbook_manage.test.js
+// 特性：纯静态检查 + 前端源码契约检查，不启动服务、不打开浏览器、不写数据库、不访问网络。
+//
+// 覆盖：星图商单页就地更新 / 编辑资料入口、复用现有 PATCH（不新增重复 API）、
+//       取消不写库、只改资料不清空 AI 整理、各保存动作恰好一次成功反馈。
+const fs = require('node:fs')
+const path = require('node:path')
+
+const root = path.resolve(__dirname, '..')
+
+let passCount = 0
+let failCount = 0
+const failures = []
+
+function check(label, cond, extra = '') {
+  if (cond) {
+    passCount += 1
+    console.log(`PASS  ${label}${extra ? `  ${extra}` : ''}`)
+  } else {
+    failCount += 1
+    failures.push(`${label}${extra ? `  ${extra}` : ''}`)
+    console.log(`FAIL  ${label}${extra ? `  ${extra}` : ''}`)
+  }
+}
+
+function main() {
+  const pagePath = path.join(root, 'frontend/src/pages/CreatorPlaybook/index.jsx')
+  const apiPath = path.join(root, 'frontend/src/api/creatorCandidates.js')
+  const page = fs.readFileSync(pagePath, 'utf8')
+  const api = fs.readFileSync(apiPath, 'utf8')
+
+  console.log('===== 1. 星图 ID 就地更新 =====')
+  check('详情区显示「星图 ID」', /label="星图 ID"/.test(page))
+  check('不再提供「查看星图」跳转', !/查看星图/.test(page))
+  check('前台不再出现 xingtu_url', !/xingtu_url/.test(page))
+  check('已有 ID 时显示「复制 / 更新 ID」', /复制/.test(page) && /更新 ID/.test(page))
+  check('无 ID 时显示「补充 ID」', /补充 ID/.test(page))
+  check('星图 Modal 标题随状态区分', /更新星图 ID/.test(page) && /补充星图 ID/.test(page))
+  const xingtuModal = page.slice(
+    page.indexOf('{/* 星图 ID 就地更新'),
+    page.indexOf('{/* 编辑资料（复用同一 PATCH')
+  )
+  check('星图 Modal 是轻量单字段表单', (xingtuModal.match(/<Form\.Item/g) || []).length === 1, String((xingtuModal.match(/<Form\.Item/g) || []).length))
+  check('星图 Modal 只提交 xingtu_id（用冻结的 editingCandidate.id）', /updateCreatorCandidate\(editingCandidate\.id, \{ xingtu_id:/.test(page))
+  check('星图 Modal 字段为 xingtu_id', /name="xingtu_id"/.test(xingtuModal))
+
+  console.log('\n===== 2. 编辑资料 =====')
+  check('顶部存在「编辑资料」次级入口', /编辑资料/.test(page) && /<Button type="link" size="small" onClick=\{openEdit\}>/.test(page))
+  const editModal = page.slice(page.indexOf('{/* 编辑资料（复用同一 PATCH'))
+  check('编辑资料可改 name / creator_type / profile_url / xingtu_id / description', ['name="name"', 'name="creator_type"', 'name="profile_url"', 'name="xingtu_id"', 'name="description"']
+    .every((field) => editModal.includes(field)))
+  check('编辑资料不再编辑 xingtu_url', !/name="xingtu_url"/.test(editModal) && !/xingtu_url/.test(editModal))
+  check('编辑资料不出现 candidate_id / created_at / AI整理 字段', !/name="candidate_id"|name="created_at"|name="distilled_description"/.test(editModal))
+  check('「录入近期表现」仍是主 CTA（type="primary"）', /<Button type="primary" onClick=\{\(\) => setAssistantOpen\(true\)\}>/.test(page))
+  check('「编辑资料」是次级按钮（type="link"）', /<Button type="link" size="small" onClick=\{openEdit\}>/.test(page))
+
+  console.log('\n===== 3. 复用现有 PATCH（不新增重复 API） =====')
+  const apiExports = [...api.matchAll(/export function (\w+)/g)].map((m) => m[1]).sort()
+  check(
+    '候选 API 模块未新增重复接口',
+    JSON.stringify(apiExports) === JSON.stringify([
+      'createCreatorCandidate', 'getCandidateLatestSnapshot', 'getCreatorCandidate',
+      'listCreatorCandidates', 'saveCandidateRecentSnapshot', 'updateCreatorCandidate'
+    ].sort()),
+    JSON.stringify(apiExports)
+  )
+  check('页面复用 updateCreatorCandidate（PATCH）', /updateCreatorCandidate\(/.test(page))
+  check('页面未直接使用 axios / 未新增路由', !/axios|request\.(patch|post)\(/.test(page))
+  const updateCalls = (page.match(/updateCreatorCandidate\(/g) || []).length
+  check('仅在三处保存动作里调用 PATCH', updateCalls === 3, String(updateCalls))
+
+  console.log('\n===== 4. 取消不写库 =====')
+  const onCancelBlocks = [...page.matchAll(/onCancel=\{\(\) => \{([\s\S]*?)\}\}/g)].map((m) => m[1])
+  check('存在两个块状 onCancel（星图 / 编辑资料）', onCancelBlocks.length >= 2, String(onCancelBlocks.length))
+  check('onCancel 不触发任何写库请求', onCancelBlocks.every((block) => !/updateCreatorCandidate|createCreatorCandidate|axios/.test(block)))
+
+  console.log('\n===== 4b. 编辑资料回填（BUG 1 修复） =====')
+  check('页面引入回填纯函数', /applyCandidateEditValues/.test(page) && /applyXingtuIdFormValues/.test(page))
+  check(
+    '编辑资料在 afterOpenChange(open=true) 回填（Modal 真正打开、Form 已挂载）',
+    /afterOpenChange=\{\(open\) => \{[\s\S]{0,200}?if \(!open\) return[\s\S]{0,200}?applyCandidateEditValues\(editForm, editingCandidate\)/.test(page)
+  )
+  check(
+    '星图 ID Modal 同样在 afterOpenChange 回填',
+    /afterOpenChange=\{\(open\) => \{[\s\S]{0,200}?if \(!open\) return[\s\S]{0,200}?applyXingtuIdFormValues\(xingtuForm, editingCandidate\)/.test(page)
+  )
+  check('回填使用冻结的 editingCandidate，而非依赖 selected', /const \[editingCandidate, setEditingCandidate\] = useState\(null\)/.test(page) && /setEditingCandidate\(selected\)/.test(page))
+  check('openEdit / openXingtuEdit 只设置 editingCandidate + open，不再 setFieldsValue', /const openEdit = \(\) => \{\s*setEditingCandidate\(selected\)\s*setEditOpen\(true\)\s*\}/.test(page) && /const openXingtuEdit = \(\) => \{\s*setEditingCandidate\(selected\)\s*setXingtuEditOpen\(true\)\s*\}/.test(page))
+  check('不用 setTimeout / requestAnimationFrame workaround', !/setTimeout|requestAnimationFrame/.test(page))
+  check('保存 / 取消后清空 editingCandidate', (page.match(/setEditingCandidate\(null\)/g) || []).length >= 4)
+  check('编辑资料 Form.Item name 为 snake_case 5 项', ['name="name"', 'name="creator_type"', 'name="profile_url"', 'name="xingtu_id"', 'name="description"'].every((f) => page.includes(f)))
+
+  console.log('\n===== 4c. 单次失败最多一个错误提示 + 防重复提交 =====')
+  check('页面不再重复调用请求级 message.error（避免与拦截器叠两条）', !/message\.error\(getErrorMessage/.test(page))
+  check('仅保留复制失败的本地错误提示', (page.match(/message\.error\(/g) || []).length === 1)
+  for (const guard of ['if (savingEdit) return', 'if (savingXingtu) return', 'if (savingDistill) return', 'if (creating) return', 'if (distilling) return']) {
+    check(`提交前有重入保护：${guard}`, page.includes(guard))
+  }
+  check('三个 Modal 均用 confirmLoading 阻止重复点击', (page.match(/confirmLoading=\{/g) || []).length >= 3)
+  check('保存动作的 confirmLoading 绑定 saving 状态', /confirmLoading=\{savingEdit\}/.test(page) && /confirmLoading=\{savingXingtu\}/.test(page))
+
+  console.log('\n===== 5. 提示 / 语义 =====')
+  const successCount = (page.match(/message\.success\(/g) || []).length
+  check('每个动作各一次成功提示（创建 / AI整理 / 星图ID / 复制 / 资料）', successCount === 5, String(successCount))
+  check('复制使用 clipboard API，失败时明确报错（不静默假成功）', /navigator\.clipboard\.writeText/.test(page) && /复制失败/.test(page))
+  check('编辑资料保存成功后刷新候选（loadCandidates）', /await updateCreatorCandidate\(editingCandidate\.id, \{[\s\S]{0,300}?await loadCandidates\(\)/.test(page))
+  check('编辑资料保存后清空未保存的 AI 预览', /setDistillPreview\(null\)[\s\S]{0,80}?await loadCandidates\(\)/.test(page))
+
+  console.log('\n===== 6. 既有能力未被破坏 =====')
+  check('仍复用 RecentPerformanceAssistantModal（候选模式）', /<RecentPerformanceAssistantModal/.test(page) && /candidateId=\{selected\?\.id \?\? null\}/.test(page))
+  check('仍复用 Rule Engine（页面不重算规则）', /buildCreatorPlaybookAssessment\(snapshot\)/.test(page))
+  check('AI 整理仍标注为派生（AI整理）', /AI整理/.test(page))
+}
+
+main()
+
+const total = passCount + failCount
+const rate = total ? ((passCount / total) * 100).toFixed(1) : '0.0'
+console.log('\n================ 测试汇总 ================')
+console.log(`用例总数：${total}　通过：${passCount}　失败：${failCount}　通过率：${rate}%`)
+if (failCount > 0) {
+  console.log('\n失败用例：')
+  failures.forEach((item) => console.log(`  - ${item}`))
+}
+process.exitCode = failCount > 0 ? 1 : 0

@@ -23,6 +23,7 @@ import { PlusOutlined, ReloadOutlined, UserAddOutlined } from '@ant-design/icons
 import {
   createCreatorCandidate,
   getCandidateLatestSnapshot,
+  getCandidatePriceReference,
   listCreatorCandidates,
   updateCreatorCandidate
 } from '../../api/creatorCandidates'
@@ -60,6 +61,83 @@ const renderEstimateRange = (estimate) =>
     ? '暂无（无商单样本）'
     : `${formatPrice(estimate.low)} ～ ${formatPrice(estimate.high)}`
 
+// Phase 3B：历史价格参考空态文案（与后端 reason_code 一一对应）
+const PRICE_REF_MESSAGES = {
+  no_snapshot: '先录入近期表现后，才能生成历史价格参考。',
+  no_sponsored_sample: '暂无商单样本，暂不生成历史价格参考。日常播放仅作为辅助，不直接换算商单价格。',
+  high_scale_not_supported: '当前属于高量级达人。现有高量级历史样本较少，V0.1 暂不生成历史价格参考。'
+}
+
+// 历史价格参考渲染（严格使用后端返回顺序，前端不再排序；不显示相似度）
+function renderPriceReference(priceRef, loading) {
+  if (loading) return <Typography.Text type="secondary">加载历史价格参考…</Typography.Text>
+  if (!priceRef) return <Typography.Text type="secondary">-</Typography.Text>
+  if (!priceRef.available) {
+    return (
+      <Typography.Text type="secondary">
+        {PRICE_REF_MESSAGES[priceRef.reason_code] || priceRef.message || '暂不生成历史价格参考。'}
+      </Typography.Text>
+    )
+  }
+  const cases = Array.isArray(priceRef.cases) ? priceRef.cases : []
+  if (cases.length === 0) {
+    return <Typography.Text type="secondary">暂无符合当前口径的历史价格案例。</Typography.Text>
+  }
+  const summary = priceRef.summary
+  return (
+    <Space direction="vertical" size={8} style={{ display: 'flex' }}>
+      <Row gutter={[12, 12]}>
+        <Col xs={12} sm={8} lg={6}>
+          <Statistic title="商单中位目标" value={formatPlays(priceRef.target?.sponsored_median_play)} />
+        </Col>
+        {summary && (
+          <>
+            <Col xs={12} sm={8} lg={6}>
+              <Statistic title="历史案例成交中位" value={formatPrice(summary.cost_median) ?? '-'} />
+            </Col>
+            <Col xs={12} sm={8} lg={6}>
+              <Statistic
+                title="案例成交范围"
+                value={`${formatPrice(summary.cost_min) ?? '-'} – ${formatPrice(summary.cost_max) ?? '-'}`}
+              />
+            </Col>
+            <Col xs={12} sm={8} lg={6}>
+              <Statistic title="案例最终 CPM 中位" value={summary.final_cpm_median ?? '-'} />
+            </Col>
+          </>
+        )}
+      </Row>
+      {!summary && (
+        <Typography.Text type="secondary">
+          历史可参考案例较少，仅展示个案，不形成价格区间。
+        </Typography.Text>
+      )}
+      <List
+        size="small"
+        dataSource={cases}
+        renderItem={(item) => (
+          <List.Item style={{ paddingLeft: 0, paddingRight: 0 }}>
+            <Space direction="vertical" size={2} style={{ display: 'flex' }}>
+              <Space size={6} wrap>
+                <Typography.Text strong>{item.creator}</Typography.Text>
+                <Typography.Text type="secondary">{item.creator_type || '未分类'}</Typography.Text>
+                {item.same_creator_type && <Tag>同类型</Tag>}
+              </Space>
+              <Typography.Text type="secondary">
+                累计播放 {formatPlays(item.cumulative_play)} · 实际合作 {formatPrice(item.actual_cost) ?? '-'} · 最终 CPM{' '}
+                {item.final_cpm ?? '-'}
+              </Typography.Text>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                与当前商单中位相差 {formatPlays(item.play_distance)}
+              </Typography.Text>
+            </Space>
+          </List.Item>
+        )}
+      />
+    </Space>
+  )
+}
+
 /**
  * 新达人判断（V3-alpha.3 Playbook Phase 1）
  *
@@ -76,6 +154,9 @@ export default function CreatorPlaybook() {
   const [selectedId, setSelectedId] = useState(null)
   const [snapshot, setSnapshot] = useState(null)
   const [snapshotLoading, setSnapshotLoading] = useState(false)
+  // Phase 3B：历史价格参考（只读，后端按 candidate_id 派生 target）
+  const [priceRef, setPriceRef] = useState(null)
+  const [priceRefLoading, setPriceRefLoading] = useState(false)
   const [createOpen, setCreateOpen] = useState(false)
   const [creating, setCreating] = useState(false)
   const [assistantOpen, setAssistantOpen] = useState(false)
@@ -139,6 +220,27 @@ export default function CreatorPlaybook() {
   useEffect(() => {
     loadSnapshot(selectedId)
   }, [selectedId, loadSnapshot])
+
+  // 历史价格参考：随选中候选变化重新拉取（只读；后端自行派生 target，前端不提交）
+  const loadPriceReference = useCallback(async (candidateId) => {
+    if (!candidateId) {
+      setPriceRef(null)
+      return
+    }
+    setPriceRefLoading(true)
+    try {
+      const res = await getCandidatePriceReference(candidateId)
+      setPriceRef(res?.data || null)
+    } catch {
+      setPriceRef(null)
+    } finally {
+      setPriceRefLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    loadPriceReference(selectedId)
+  }, [selectedId, loadPriceReference])
 
   // AI 可用性：会话 Key（本地）或后端环境变量任一可用即可；查询失败不影响页面其它能力
   useEffect(() => {
@@ -632,6 +734,17 @@ export default function CreatorPlaybook() {
                   </div>
                 </Space>
               )}
+
+              <Divider style={{ margin: '12px 0' }} />
+
+              {/* Phase 3B：历史价格参考（只读历史事实，与 CPM15-20 经验估价并列，不融合成"建议价"） */}
+              <div>
+                <Typography.Text strong>历史价格参考</Typography.Text>
+                <Typography.Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 4 }}>
+                  基于过去真实投放记录，按商单播放量接近度检索。仅展示历史事实，不代表推荐价格。
+                </Typography.Text>
+                <div style={{ marginTop: 8 }}>{renderPriceReference(priceRef, priceRefLoading)}</div>
+              </div>
             </Card>
           )}
         </Col>
@@ -756,7 +869,11 @@ export default function CreatorPlaybook() {
         creatorOptions={selected ? [selected.name] : []}
         mode="update"
         onCancel={() => setAssistantOpen(false)}
-        onSaved={() => loadSnapshot(selectedId)}
+        onSaved={() => {
+          // 保存近期表现后同时刷新 snapshot 与历史价格参考
+          loadSnapshot(selectedId)
+          loadPriceReference(selectedId)
+        }}
       />
     </div>
   )

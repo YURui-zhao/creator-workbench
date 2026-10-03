@@ -6,6 +6,8 @@ import {
   toPublicSnapshot,
   validateSnapshotPayload
 } from './recentSnapshots.js'
+// 复用既有内容类型分组统计（sponsored / organic / unknown 中位数），不复制第二套算法
+import { medianOf } from '../utils/recentPerformanceStats.js'
 
 /**
  * 候选达人身份层（V3-alpha.3 Playbook Phase 1）
@@ -35,6 +37,16 @@ const DISTILLED_MAX = 4000
 const STATUS_VALUES = ['active', 'archived']
 // 只要求合法 http / https URL，不强绑固定域名（避免星图 URL 结构变化导致误拦）
 const HTTP_URL_RE = /^https?:\/\/[^\s]+$/i
+
+// Price Reference V0.1（Phase 3B）冻结参数
+const PRICE_REF_MAX_CASES = 5
+const PRICE_REF_MIN_CASES_FOR_SUMMARY = 3
+const PRICE_REF_BASE_SCALE_MAX = 100000
+
+const round2 = (value) =>
+  value === null || value === undefined || !Number.isFinite(Number(value))
+    ? null
+    : Math.round(Number(value) * 100) / 100
 
 function ok(res, data) {
   res.json({ code: 200, data, msg: 'success' })
@@ -333,6 +345,118 @@ router.get('/:id/recent-snapshots/latest', (req, res) => {
     candidate_id: row.id,
     creator: row.name,
     snapshot: snapshot ? toPublicSnapshot(snapshot) : null
+  })
+})
+
+/**
+ * GET /api/creator-candidates/:id/price-reference
+ * 历史价格参考（Phase 3B，只读）：
+ *   · target 由后端从 candidate latest snapshot 的 sponsored_median_play 派生，前端不能提交 target
+ *   · 历史案例是 record-level（每条真实投放 = 1 个案例），按 |累计播放 - target| 升序 + record_id 稳定排序
+ *   · 只返回历史事实（成交价 / 累计播放 / final CPM），不含推荐价 / 评分 / 是否投放结论
+ *   · final_cpm 只用 second_week_play（累计播放），绝不用 first_play
+ */
+router.get('/:id/price-reference', (req, res) => {
+  const row = findCandidateRow(req.params.id)
+  if (!row) return fail(res, 404, `候选达人不存在（id=${req.params.id}）`)
+
+  const unavailable = (reasonCode, message, target = null) =>
+    ok(res, { available: false, reason_code: reasonCode, message, target })
+
+  // 1) candidate latest snapshot（沿用既有 candidate latest 语义，绝不按名称匹配）
+  const snapshotRow = getLatestSnapshotByCandidate(row.id)
+  if (!snapshotRow) {
+    return unavailable('no_snapshot', '先录入近期表现后，才能生成历史价格参考。')
+  }
+  // 复用 toPublicSnapshot 里的内容类型分组统计（sponsored_count / sponsored_median_play）
+  const snapshot = toPublicSnapshot(snapshotRow)
+  const sponsoredCount = Number(snapshot?.sponsored_count ?? 0)
+  const sponsoredMedian = snapshot?.sponsored_median_play
+  const target = {
+    sponsored_median_play: sponsoredMedian ?? null,
+    sponsored_count: sponsoredCount
+  }
+  const NO_SPONSORED_MESSAGE =
+    '暂无商单样本，暂不生成历史价格参考。日常播放仅作为辅助，不直接换算商单价格。'
+
+  // 2) 启用条件：必须有商单样本且商单中位有效（绝不用 organic / overall / mean 替代 target）
+  if (sponsoredCount < 1) return unavailable('no_sponsored_sample', NO_SPONSORED_MESSAGE, target)
+  if (
+    sponsoredMedian === null ||
+    sponsoredMedian === undefined ||
+    !Number.isFinite(Number(sponsoredMedian))
+  ) {
+    return unavailable('no_sponsored_sample', NO_SPONSORED_MESSAGE, target)
+  }
+  // 3) 高量级 V0.1 不支持（不做 10-20w / 20-50w / 50w+ 细分）
+  if (Number(sponsoredMedian) >= PRICE_REF_BASE_SCALE_MAX) {
+    return unavailable(
+      'high_scale_not_supported',
+      '当前属于高量级达人。现有高量级历史样本较少，V0.1 暂不生成历史价格参考。',
+      target
+    )
+  }
+  const targetPlay = Number(sponsoredMedian)
+
+  // 4) 历史 case pool（record-level，每条 creator_record = 1 个案例）
+  const records = db
+    .prepare(
+      'SELECT id, nickname, creator_type, total_cost, first_play, second_week_play FROM creator_records'
+    )
+    .all()
+  const candidateType = row.creator_type ?? null
+
+  const cases = records
+    .filter((r) => {
+      const sw = r.second_week_play
+      if (sw === null || sw === undefined || Number(sw) <= 0) return false
+      // latest < first = anomaly（仅当 first 有有效观测时判定）
+      if (r.first_play !== null && r.first_play !== undefined && Number(sw) < Number(r.first_play)) {
+        return false
+      }
+      if (r.total_cost === null || r.total_cost === undefined) return false
+      // 基础量级池（>=10w 留给后续阶段）
+      return Number(sw) < PRICE_REF_BASE_SCALE_MAX
+    })
+    .map((r) => {
+      const cumulative = Number(r.second_week_play)
+      const cost = Number(r.total_cost)
+      return {
+        record_id: r.id,
+        creator: r.nickname,
+        creator_type: r.creator_type ?? null,
+        cumulative_play: cumulative,
+        actual_cost: cost,
+        final_cpm: round2((cost / cumulative) * 1000),
+        play_distance: Math.abs(cumulative - targetPlay),
+        // 仅展示元数据，不参与排序
+        same_creator_type: Boolean(candidateType) && r.creator_type === candidateType
+      }
+    })
+    .sort((a, b) => a.play_distance - b.play_distance || a.record_id - b.record_id)
+
+  const selected = cases.slice(0, PRICE_REF_MAX_CASES)
+
+  // 5) 历史事实摘要：只基于「当前选中的案例」，不是整个基础池；不足 3 条不给区间
+  let summary = null
+  if (selected.length >= PRICE_REF_MIN_CASES_FOR_SUMMARY) {
+    const costs = selected.map((c) => c.actual_cost)
+    const cpms = selected.map((c) => c.final_cpm)
+    summary = {
+      cost_median: round2(medianOf(costs)),
+      cost_min: Math.min(...costs),
+      cost_max: Math.max(...costs),
+      final_cpm_median: round2(medianOf(cpms))
+    }
+  }
+
+  ok(res, {
+    available: true,
+    target: { sponsored_median_play: targetPlay, sponsored_count: sponsoredCount },
+    pool: { eligible_case_count: cases.length, selected_case_count: selected.length },
+    summary,
+    insufficient_for_range: summary === null,
+    cases: selected
   })
 })
 

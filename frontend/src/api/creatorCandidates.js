@@ -39,3 +39,11 @@ export function saveCandidateRecentSnapshot(candidateId, payload) {
 export function getCandidateLatestSnapshot(candidateId) {
   return request.get(`/creator-candidates/${candidateId}/recent-snapshots/latest`)
 }
+
+/**
+ * 历史价格参考（Phase 3B，只读）：后端按 candidate_id 取 latest snapshot 派生 target，
+ * 前端不提交 target；返回 { available, reason_code?, target, pool?, summary?, cases? }。
+ */
+export function getCandidatePriceReference(candidateId) {
+  return request.get(`/creator-candidates/${candidateId}/price-reference`)
+}

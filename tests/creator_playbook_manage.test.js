@@ -62,8 +62,9 @@ function main() {
   check(
     '候选 API 模块未新增重复接口',
     JSON.stringify(apiExports) === JSON.stringify([
-      'createCreatorCandidate', 'getCandidateLatestSnapshot', 'getCreatorCandidate',
-      'listCreatorCandidates', 'saveCandidateRecentSnapshot', 'updateCreatorCandidate'
+      'createCreatorCandidate', 'getCandidateLatestSnapshot', 'getCandidatePriceReference',
+      'getCreatorCandidate', 'listCreatorCandidates', 'saveCandidateRecentSnapshot',
+      'updateCreatorCandidate'
     ].sort()),
     JSON.stringify(apiExports)
   )
@@ -113,6 +114,15 @@ function main() {
   check('仍复用 RecentPerformanceAssistantModal（候选模式）', /<RecentPerformanceAssistantModal/.test(page) && /candidateId=\{selected\?\.id \?\? null\}/.test(page))
   check('仍复用 Rule Engine（页面不重算规则）', /buildCreatorPlaybookAssessment\(snapshot\)/.test(page))
   check('AI 整理仍标注为派生（AI整理）', /AI整理/.test(page))
+
+  console.log('\n===== 7. 历史价格参考（Phase 3B） =====')
+  check('页面调用 getCandidatePriceReference（只读 API）', /getCandidatePriceReference\(candidateId\)/.test(page))
+  check('新增「历史价格参考」区域且与 CPM15-20 并列', /历史价格参考/.test(page) && /CPM15-20 基础估价/.test(page))
+  check('文案明确「不代表推荐价格」', /仅展示历史事实，不代表推荐价格/.test(page))
+  check('前端不再二次排序（直接使用后端 cases 顺序）', /dataSource=\{cases\}/.test(page) && !/cases\.sort\(|\.sort\(\(a, b\) => a\.play_distance/.test(page))
+  check('同类型仅作 Tag 提示', /item\.same_creator_type && <Tag>同类型<\/Tag>/.test(page))
+  check('无相似度展示（不渲染相似度文案 / 分数）', !/similarity|相似度[：:]|相似度\s*\{/.test(page) && !/item\.similarity/.test(page))
+  check('空态文案齐全（无商单 / 高量级 / 无案例）', /暂无商单样本，暂不生成历史价格参考/.test(page) && /V0.1 暂不生成历史价格参考/.test(page) && /暂无符合当前口径的历史价格案例/.test(page))
 }
 
 main()

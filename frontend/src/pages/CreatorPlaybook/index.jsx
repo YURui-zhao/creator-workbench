@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import {
+  Alert,
   Button,
   Card,
   Col,
@@ -26,6 +27,7 @@ import {
 import { getErrorMessage } from '../../utils/request'
 import { formatInteger, formatPlays } from '../../utils/format'
 import { TREND_LABELS_FULL } from '../../utils/recentPerformanceSave.js'
+import { buildCreatorPlaybookAssessment } from '../../utils/creatorPlaybookRules.js'
 import RecentPerformanceAssistantModal from '../../components/RecentPerformanceAssistantModal'
 
 const PLACEHOLDER = '-'
@@ -35,6 +37,20 @@ const formatPrice = (value) =>
 
 const renderMedian = (value) =>
   value === null || value === undefined ? PLACEHOLDER : formatPlays(value)
+
+const ESTIMATE_CONFIDENCE_LABELS = {
+  normal: '常规置信',
+  low: '样本较少，仅供参考',
+  none: '暂无依据'
+}
+
+const STABILITY_TAG_COLORS = { stable: 'green', volatile: 'orange', unknown: 'default' }
+
+// 只做展示格式化：估价区间由 rule engine 给出，页面不重算
+const renderEstimateRange = (estimate) =>
+  estimate.low === null || estimate.high === null
+    ? '暂无（无商单样本）'
+    : `${formatPrice(estimate.low)} ～ ${formatPrice(estimate.high)}`
 
 /**
  * 新达人判断（V3-alpha.3 Playbook Phase 1）
@@ -136,6 +152,8 @@ export default function CreatorPlaybook() {
     const observed = String(snapshot.observed_at ?? '').trim()
     return /^\d{4}-\d{2}-\d{2}$/.test(observed) ? observed : '观察日期未知'
   })()
+  // 量化判断全部由纯函数规则引擎给出（页面只负责展示，不重复计算业务规则）
+  const assessment = snapshot ? buildCreatorPlaybookAssessment(snapshot) : null
 
   return (
     <div>
@@ -267,53 +285,110 @@ export default function CreatorPlaybook() {
                   description="尚未录入近期表现，点击右上角「录入近期表现」"
                 />
               ) : (
-                <Space direction="vertical" size={12} style={{ display: 'flex' }}>
-                  <Row gutter={[12, 12]}>
-                    <Col xs={12} sm={8} lg={6}>
-                      <Statistic title="整体中位播放" value={renderMedian(snapshot.median_play)} />
-                    </Col>
-                    <Col xs={12} sm={8} lg={6}>
-                      <Statistic
-                        title="P25 / P75"
-                        value={`${renderMedian(snapshot.p25_play)} / ${renderMedian(snapshot.p75_play)}`}
-                      />
-                    </Col>
-                    <Col xs={12} sm={8} lg={6}>
-                      <Statistic
-                        title="趋势"
-                        value={TREND_LABELS_FULL[snapshot.trend_label] || '样本不足'}
-                      />
-                    </Col>
-                    <Col xs={12} sm={8} lg={6}>
-                      <Statistic title="有效内容数" value={formatInteger(snapshot.valid_count ?? 0)} />
-                    </Col>
-                  </Row>
+                <Space direction="vertical" size={16} style={{ display: 'flex' }}>
+                  {/* 第一层：近期数据（核心事实，直接来自 snapshot） */}
+                  <div>
+                    <Typography.Text strong>近期数据</Typography.Text>
+                    <Row gutter={[12, 12]} style={{ marginTop: 8 }}>
+                      <Col xs={12} sm={8} lg={6}>
+                        <Statistic title="整体中位播放" value={renderMedian(snapshot.median_play)} />
+                      </Col>
+                      <Col xs={12} sm={8} lg={6}>
+                        <Statistic title="整体平均播放" value={renderMedian(assessment.metrics.meanPlay)} />
+                      </Col>
+                      <Col xs={12} sm={8} lg={6}>
+                        <Statistic
+                          title="P25 / P75"
+                          value={`${renderMedian(snapshot.p25_play)} / ${renderMedian(snapshot.p75_play)}`}
+                        />
+                      </Col>
+                      <Col xs={12} sm={8} lg={6}>
+                        <Statistic
+                          title="趋势"
+                          value={TREND_LABELS_FULL[snapshot.trend_label] || '样本不足'}
+                        />
+                      </Col>
+                      <Col xs={12} sm={8} lg={6}>
+                        <Statistic title="有效内容数" value={formatInteger(snapshot.valid_count ?? 0)} />
+                      </Col>
+                      <Col xs={12} sm={8} lg={6}>
+                        <Statistic
+                          title="商单中位 / 条数"
+                          value={`${renderMedian(snapshot.sponsored_median_play)} / ${formatInteger(snapshot.sponsored_count ?? 0)}`}
+                        />
+                      </Col>
+                      <Col xs={12} sm={8} lg={6}>
+                        <Statistic
+                          title="日常中位 / 条数"
+                          value={`${renderMedian(snapshot.organic_median_play)} / ${formatInteger(snapshot.organic_count ?? 0)}`}
+                        />
+                      </Col>
+                      <Col xs={12} sm={8} lg={6}>
+                        <Statistic title="未识别条数" value={formatInteger(snapshot.unknown_count ?? 0)} />
+                      </Col>
+                    </Row>
+                  </div>
 
                   <Divider style={{ margin: '4px 0' }} />
 
-                  <Row gutter={[12, 12]}>
-                    <Col xs={12} sm={8} lg={6}>
-                      <Statistic
-                        title="商单数量 / 中位"
-                        value={`${formatInteger(snapshot.sponsored_count ?? 0)} / ${renderMedian(snapshot.sponsored_median_play)}`}
+                  {/* 第二层：量化判断（可解释维度，人工决定是否投放） */}
+                  <div>
+                    <Space size={8} wrap align="baseline">
+                      <Typography.Text strong>量化判断</Typography.Text>
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        仅量化呈现，是否投放由人工决定
+                      </Typography.Text>
+                    </Space>
+                    <Space size={8} wrap style={{ display: 'flex', marginTop: 8 }}>
+                      <Tag>{assessment.scale.label}</Tag>
+                      <Tag>{assessment.commercialDensity.label}</Tag>
+                      <Tag color={STABILITY_TAG_COLORS[assessment.stability.code]}>
+                        {assessment.stability.label}
+                      </Tag>
+                      {assessment.highPlaySignal.active && (
+                        <Tag color="gold">{assessment.highPlaySignal.label}</Tag>
+                      )}
+                    </Space>
+                    <Space direction="vertical" size={2} style={{ display: 'flex', marginTop: 8 }}>
+                      <Typography.Text type="secondary">{assessment.stability.explanation}</Typography.Text>
+                      <Typography.Text type="secondary">
+                        估价基准：{assessment.performanceBasis.explanation}
+                      </Typography.Text>
+                    </Space>
+                  </div>
+
+                  <Divider style={{ margin: '4px 0' }} />
+
+                  {/* 第三层：价格分寸（CPM15-20 估价锚点 + 万元风险） */}
+                  <div>
+                    <Typography.Text strong>价格分寸</Typography.Text>
+                    <Row gutter={[12, 12]} style={{ marginTop: 8 }}>
+                      <Col xs={24} sm={12} lg={8}>
+                        <Statistic title="CPM15-20 基础估价" value={renderEstimateRange(assessment.estimate)} />
+                      </Col>
+                      <Col xs={24} sm={12} lg={8}>
+                        <Statistic
+                          title="估价置信"
+                          value={ESTIMATE_CONFIDENCE_LABELS[assessment.estimate.confidence] || PLACEHOLDER}
+                        />
+                      </Col>
+                      <Col xs={24} sm={12} lg={8}>
+                        <Statistic title="星图刊例价" value={formatPrice(snapshot.xingtu_price) ?? '暂无'} />
+                      </Col>
+                    </Row>
+                    <Typography.Text type="secondary" style={{ display: 'block', marginTop: 6 }}>
+                      {assessment.estimate.explanation}
+                    </Typography.Text>
+                    {assessment.risk.highAmount && (
+                      <Alert
+                        type="warning"
+                        showIcon
+                        style={{ marginTop: 8 }}
+                        message="万元以上高金额"
+                        description={assessment.risk.explanation}
                       />
-                    </Col>
-                    <Col xs={12} sm={8} lg={6}>
-                      <Statistic
-                        title="日常数量 / 中位"
-                        value={`${formatInteger(snapshot.organic_count ?? 0)} / ${renderMedian(snapshot.organic_median_play)}`}
-                      />
-                    </Col>
-                    <Col xs={12} sm={8} lg={6}>
-                      <Statistic title="未分类数量" value={formatInteger(snapshot.unknown_count ?? 0)} />
-                    </Col>
-                    <Col xs={12} sm={8} lg={6}>
-                      <Statistic
-                        title="星图刊例价"
-                        value={formatPrice(snapshot.xingtu_price) ?? '暂无'}
-                      />
-                    </Col>
-                  </Row>
+                    )}
+                  </div>
                 </Space>
               )}
             </Card>

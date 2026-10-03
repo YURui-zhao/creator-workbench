@@ -62,9 +62,10 @@ function main() {
   check(
     '候选 API 模块未新增重复接口',
     JSON.stringify(apiExports) === JSON.stringify([
-      'createCandidateDecision', 'createCreatorCandidate', 'getCandidateLatestSnapshot',
-      'getCandidatePriceReference', 'getCreatorCandidate', 'listCandidateDecisions',
-      'listCreatorCandidates', 'saveCandidateRecentSnapshot', 'updateCreatorCandidate'
+      'createCandidateDecision', 'createCandidatePostQuoteDecision', 'createCreatorCandidate',
+      'getCandidateLatestSnapshot', 'getCandidatePriceReference', 'getCreatorCandidate',
+      'listCandidateDecisions', 'listCreatorCandidates', 'saveCandidateRecentSnapshot',
+      'updateCreatorCandidate'
     ].sort()),
     JSON.stringify(apiExports)
   )
@@ -105,7 +106,7 @@ function main() {
 
   console.log('\n===== 5. 提示 / 语义 =====')
   const successCount = (page.match(/message\.success\(/g) || []).length
-  check('每个动作各一次成功提示（创建 / AI整理 / 星图ID / 复制 / 资料 / 决定）', successCount === 6, String(successCount))
+  check('每个动作各一次成功提示（创建 / AI整理 / 星图ID / 复制 / 资料 / 决定 / 报价决定）', successCount === 7, String(successCount))
   check('复制使用 clipboard API，失败时明确报错（不静默假成功）', /navigator\.clipboard\.writeText/.test(page) && /复制失败/.test(page))
   check('编辑资料保存成功后刷新候选（loadCandidates）', /await updateCreatorCandidate\(editingCandidate\.id, \{[\s\S]{0,300}?await loadCandidates\(\)/.test(page))
   check('编辑资料保存后清空未保存的 AI 预览', /setDistillPreview\(null\)[\s\S]{0,80}?await loadCandidates\(\)/.test(page))
@@ -138,6 +139,16 @@ function main() {
   check('多条历史可折叠查看', /查看历史决定（/.test(page) && /historyExpanded/.test(page))
   check('决定文案单一来源（消费 human_decision_label，不本地映射）', /human_decision_label/.test(page) && !/contact:\s*'继续联系'/.test(page))
   check('页面不做推荐 / 不自动选择 / 不出现评分字段', !/shouldInvest|recommendation_score|推荐决定|建议选择/.test(page))
+
+  console.log('\n===== 10. 报价阶段（Phase 4D） =====')
+  check('页面调用 candidate post-quote API', /createCandidatePostQuoteDecision\(selected\.id,/.test(page))
+  check('继续联系后主 CTA「记录当前报价」', /reviewContactConfirmed \? \(/.test(page) && /记录当前报价/.test(page))
+  check('无 contact 时保留次级入口「已有报价，直接记录」', /已有报价，直接记录/.test(page))
+  check('四个报价决策（直接推进 / 小额测试 / 继续议价 / 暂缓）无默认选中', /直接推进/.test(page) && /小额测试/.test(page) && /继续议价/.test(page) && /暂缓/.test(page) && /useState\(null\)[\s\S]{0,60}postQuoteDecision|const \[postQuoteDecision, setPostQuoteDecision\] = useState\(null\)/.test(page))
+  check('报价 Modal：当前报价 + 决策 + 备注', /当前报价/.test(page) && /决策（请主动选择）/.test(page) && /okText="记录报价决策"/.test(page))
+  check('保存后展示最近报价阶段事实', /最近报价阶段/.test(page) && /报价位置：/.test(page) && /折/.test(page))
+  check('报价位置文案为事实描述', /低于经验区间/.test(page) && /位于经验区间/.test(page) && /高于经验区间/.test(page))
+  check('不自动弹窗（默认 false）', /const \[postQuoteOpen, setPostQuoteOpen\] = useState\(false\)/.test(page))
 }
 
 main()

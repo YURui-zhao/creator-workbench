@@ -236,7 +236,7 @@ async function main() {
     const histLatest = await callRoute(historyLatest, { query: { creator: '历史达人' } })
     check('legacy latest 行为不变', histLatest.data?.snapshot?.id === histSave.data.id)
     const routeSet = candidateRouter.stack.filter((l) => l.route).map((l) => `${Object.keys(l.route.methods)[0].toUpperCase()} ${l.route.path}`).sort().join(' | ')
-    check('候选路由集合新增 price-reference（只读 GET）', routeSet === 'GET / | GET /:id | GET /:id/decisions | GET /:id/price-reference | GET /:id/recent-snapshots/latest | PATCH /:id | POST / | POST /:id/decisions | POST /:id/recent-snapshots', routeSet)
+    check('候选路由集合新增 price-reference（只读 GET）', routeSet === 'GET / | GET /:id | GET /:id/decisions | GET /:id/price-reference | GET /:id/recent-snapshots/latest | PATCH /:id | POST / | POST /:id/decisions | POST /:id/post-quote-decisions | POST /:id/recent-snapshots', routeSet)
     check('未发生任何外部网络请求', networkGuard.blocked.length === 0, JSON.stringify(networkGuard.blocked))
     check('隔离库位于临时目录（未触碰真实 workbench.db）', process.env.WORKBENCH_DB_PATH.startsWith(os.tmpdir()))
   } finally {

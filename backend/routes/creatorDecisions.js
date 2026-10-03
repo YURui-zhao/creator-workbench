@@ -16,11 +16,16 @@ export const POST_QUOTE_DECISIONS = ['repurchase', 'small_test', 'negotiate', 'p
 // Phase 4B：候选达人判断阶段（独立 workflow context，不改动上面三个既有 enum）
 export const CANDIDATE_REVIEW_STAGE = 'candidate_review'
 export const CANDIDATE_REVIEW_DECISIONS = ['contact', 'observe', 'hold']
+// Phase 4D：candidate 的 post_quote 阶段（candidate 第一次投放，用 proceed 取代语义错误的 repurchase）
+export const CANDIDATE_POST_QUOTE_DECISIONS = ['proceed', 'small_test', 'negotiate', 'pause']
 export const IP_JUDGEMENTS = ['strong', 'medium', 'weak', 'unknown']
 export const SYSTEM_CONTEXT_VERSION = 'decision-context-v1'
 // Phase 4B：候选 decision 的版本标识（不冒充旧 creator-pricing-v1 / decision-context-v1）
 export const CANDIDATE_REVIEW_PRICING_VERSION = 'creator-playbook-pricing-v0.1'
 export const CANDIDATE_REVIEW_SYSTEM_CONTEXT_VERSION = 'candidate-review-v0.1'
+// Phase 4D：候选报价阶段决策的版本标识
+export const CANDIDATE_POST_QUOTE_PRICING_VERSION = 'creator-playbook-postquote-v0.1'
+export const CANDIDATE_POST_QUOTE_SYSTEM_CONTEXT_VERSION = 'candidate-postquote-v0.1'
 export const MAX_NOTE_LENGTH = 500
 export const MAX_QUOTE_RAW_LENGTH = 60
 
@@ -34,7 +39,9 @@ export const HUMAN_DECISION_LABELS = {
   pause: '暂缓',
   // Phase 4B：candidate_review 的三个决定（与旧 contact_now / skip_for_now 语义不同）
   contact: '继续联系',
-  hold: '暂不推进'
+  hold: '暂不推进',
+  // Phase 4D：candidate post_quote 的「直接推进」（旧历史达人仍用 repurchase）
+  proceed: '直接推进'
 }
 
 export const IP_JUDGEMENT_LABELS = {

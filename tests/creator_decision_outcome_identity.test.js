@@ -144,9 +144,10 @@ async function main() {
       )
     const DECISION_AT = '2026-10-03 12:00:00'
     const decLegacy = mkDecision('旧达人', null, 'post_quote', 'repurchase', DECISION_AT)
-    const decA = mkDecision('同名候选', candA, 'post_quote', 'repurchase', DECISION_AT)
-    const decB = mkDecision('同名候选', candB, 'post_quote', 'repurchase', DECISION_AT)
-    const decR = mkDecision('旧候选名', candR, 'post_quote', 'repurchase', DECISION_AT)
+    // Phase 4D：candidate 的 post_quote 合法决策集为 proceed / small_test（repurchase 属旧历史达人）
+    const decA = mkDecision('同名候选', candA, 'post_quote', 'proceed', DECISION_AT)
+    const decB = mkDecision('同名候选', candB, 'post_quote', 'proceed', DECISION_AT)
+    const decR = mkDecision('旧候选名', candR, 'post_quote', 'proceed', DECISION_AT)
     const decCandidateReview = mkDecision('同名候选', candA, 'candidate_review', 'contact', DECISION_AT)
 
     console.log('\n===== 3. 路由：eligibility 不放宽 =====')
@@ -173,7 +174,7 @@ async function main() {
     check('同名歧义 + identity_confirmed=true -> identity 通过', ambiguousConfirmed.status === 200 && ambiguousConfirmed.data?.outcome?.record_id === recSame)
     // 另一个同名 candidate（B）同样不能被自动归属：名称一致也必须显式确认
     // （identity 校验在 UNIQUE 检查之前，因此这里返回的是歧义标记而非 409 重复关联）
-    const decBAmbig = mkDecision('同名候选', candB, 'post_quote', 'repurchase', DECISION_AT)
+    const decBAmbig = mkDecision('同名候选', candB, 'post_quote', 'proceed', DECISION_AT)
     const bAmbig = await callRoute(postOutcome, { params: { id: String(decBAmbig) }, body: { record_id: recSame } })
     check('同名 candidate B 不自动归属（409 + 需人工确认）', bAmbig.status === 409 && bAmbig.data?.requires_identity_confirmation === true)
 
@@ -182,17 +183,17 @@ async function main() {
     const renameLink = await callRoute(postOutcome, { params: { id: String(decR) }, body: { record_id: recNew } })
     check('candidate 改名后（frozen 旧名 / record 新名）-> identity 通过', renameLink.status === 200 && renameLink.data?.outcome?.record_id === recNew)
 
-    const candMismatchDec = mkDecision('旧候选名', candR, 'post_quote', 'repurchase', DECISION_AT)
+    const candMismatchDec = mkDecision('旧候选名', candR, 'post_quote', 'proceed', DECISION_AT)
     const mismatchNoConfirm = await callRoute(postOutcome, { params: { id: String(candMismatchDec) }, body: { record_id: recElse } })
     check('candidate 名称不同 + 未确认 -> 409 + requires_identity_confirmation', mismatchNoConfirm.status === 409 && mismatchNoConfirm.data?.requires_identity_confirmation === true)
     const mismatchConfirmed = await callRoute(postOutcome, { params: { id: String(candMismatchDec) }, body: { record_id: recElse, identity_confirmed: true } })
     check('candidate 名称不同 + identity_confirmed=true -> identity 通过', mismatchConfirmed.status === 200 && mismatchConfirmed.data?.outcome?.record_id === recElse)
 
     console.log('\n===== 6. identity / timing 两个独立确认 =====')
-    const decTiming = mkDecision('旧候选名', candR, 'post_quote', 'repurchase', DECISION_AT)
+    const decTiming = mkDecision('旧候选名', candR, 'post_quote', 'proceed', DECISION_AT)
     const timingOnly = await callRoute(postOutcome, { params: { id: String(decTiming) }, body: { record_id: recTimingSame } })
     check('仅 timing 问题：identity 通过但需 timing_confirmed', timingOnly.status === 400 && /timing_confirmed/.test(String(timingOnly.msg)))
-    const decBoth = mkDecision('旧候选名', candR, 'post_quote', 'repurchase', DECISION_AT)
+    const decBoth = mkDecision('旧候选名', candR, 'post_quote', 'proceed', DECISION_AT)
     const bothIdentityOnly = await callRoute(postOutcome, { params: { id: String(decBoth) }, body: { record_id: recTimingElse, identity_confirmed: true } })
     check('identity+timing 同时需要：只 identity=true -> 仍失败', bothIdentityOnly.status === 400 && /timing_confirmed/.test(String(bothIdentityOnly.msg)))
     const bothTimingOnly = await callRoute(postOutcome, { params: { id: String(decBoth) }, body: { record_id: recTimingElse, timing_confirmed: true } })
@@ -206,7 +207,7 @@ async function main() {
     const beforeCandidate = JSON.stringify(db.prepare('SELECT * FROM creator_candidates WHERE id = ?').get(candA))
     const dupDecision = await callRoute(postOutcome, { params: { id: String(decNew) }, body: { record_id: recNew } })
     check('UNIQUE(decision_id)：同一 decision 再次关联 -> 409', dupDecision.status === 409)
-    const decOtherForRec = mkDecision('同名候选', candB, 'post_quote', 'repurchase', DECISION_AT)
+    const decOtherForRec = mkDecision('同名候选', candB, 'post_quote', 'proceed', DECISION_AT)
     const dupRecord = await callRoute(postOutcome, { params: { id: String(decOtherForRec) }, body: { record_id: recSame } })
     check('UNIQUE(record_id)：同一 record 关联第二个 decision -> 409', dupRecord.status === 409)
     check('不 UPDATE creator_decisions', JSON.stringify(db.prepare('SELECT * FROM creator_decisions WHERE id = ?').get(decNew)) === beforeDecision)
@@ -237,7 +238,7 @@ async function main() {
     check('metadata 区分 current / frozen', srcOf('新名字') === 'current' && srcOf('旧候选名') === 'frozen')
     check('metadata 不表示已确认身份（仅来源说明）', !/confirmed|verified|same_creator/i.test(JSON.stringify(poolR.data?.candidates?.[0] || {})))
     // current === frozen -> 只查一次，不重复
-    const decSameName = mkDecision('同名候选', candA, 'post_quote', 'repurchase', DECISION_AT)
+    const decSameName = mkDecision('同名候选', candA, 'post_quote', 'proceed', DECISION_AT)
     const poolSame = await callRoute(outcomeCandidates, { params: { id: String(decSameName) } })
     const sameIds = (poolSame.data?.candidates || []).map((c) => c.record_id)
     check('current === frozen 时不重复返回记录', new Set(sameIds).size === sameIds.length && sameIds.every((id) => id === recSame))
@@ -246,7 +247,7 @@ async function main() {
     const poolLegacy = await callRoute(outcomeCandidates, { params: { id: String(decLegacy) } })
     check('旧达人 pool 行为不变（只含旧达人记录、无 metadata 字段）', poolLegacy.data?.candidates?.every((c) => c.creator === '旧达人' && !('identity_name_source' in c)))
     // 出现在 pool 中并不绕过 POST identity guard
-    const decFromPool = mkDecision('旧候选名', candR, 'post_quote', 'repurchase', DECISION_AT)
+    const decFromPool = mkDecision('旧候选名', candR, 'post_quote', 'proceed', DECISION_AT)
     const fromPool = await callRoute(postOutcome, { params: { id: String(decFromPool) }, body: { record_id: recOldName } })
     check('出现在候选池中仍不绕过身份 guard（frozen-only 名称 -> 409）', fromPool.status === 409 && fromPool.data?.requires_identity_confirmation === true)
     check('未发生任何外部网络请求', blocked.length === 0, JSON.stringify(blocked))

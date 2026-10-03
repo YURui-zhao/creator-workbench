@@ -11,6 +11,9 @@ import { meanOf, medianOf } from '../utils/recentPerformanceStats.js'
 import { TARGET_CPM } from '../utils/creatorBusinessRules.js'
 // Phase 4B：candidate_review 阶段枚举 / 版本标识 / 公开映射（单一来源在 decision 模块）
 import {
+  CANDIDATE_POST_QUOTE_DECISIONS,
+  CANDIDATE_POST_QUOTE_PRICING_VERSION,
+  CANDIDATE_POST_QUOTE_SYSTEM_CONTEXT_VERSION,
   CANDIDATE_REVIEW_DECISIONS,
   CANDIDATE_REVIEW_PRICING_VERSION,
   CANDIDATE_REVIEW_STAGE,
@@ -18,6 +21,8 @@ import {
   MAX_NOTE_LENGTH,
   toPublicDecision
 } from './creatorDecisions.js'
+// 复用既有报价原文解析器（不复制第二套解析逻辑）
+import { parsePriceText } from '../utils/screenshotValues.js'
 
 /**
  * 候选达人身份层（V3-alpha.3 Playbook Phase 1）
@@ -521,10 +526,27 @@ function buildCandidateRecentEvidence(candidateId, snapshot) {
 }
 
 /**
- * Phase 4B：candidate_review decision 的价格证据（CPM15-20 与 TARGET_CPM=30 明确分开）
- * historical_price_reference 复用 Phase 3B 的同一实现，只冻结 summary / target / selected record ids。
+ * Phase 4D：报价相对 Playbook 经验区间的位置（纯事实描述，不是推荐结论）
+ *   · 区间不存在 -> unavailable
  */
-function buildCandidatePricingEvidence(snapshot, priceReference) {
+function buildCurrentQuoteAssessment(currentQuote, estimate) {
+  const estimateLow = estimate?.estimate_low ?? null
+  const estimateHigh = estimate?.estimate_high ?? null
+  let position = 'unavailable'
+  if (estimateLow !== null && estimateHigh !== null) {
+    if (currentQuote < estimateLow) position = 'below_playbook_range'
+    else if (currentQuote > estimateHigh) position = 'above_playbook_range'
+    else position = 'within_playbook_range'
+  }
+  return { current_quote: currentQuote, estimate_low: estimateLow, estimate_high: estimateHigh, position }
+}
+
+/**
+ * Phase 4B / 4D：candidate decision 的价格证据（CPM15-20 与 TARGET_CPM=30 明确分开）
+ * historical_price_reference 复用 Phase 3B 的同一实现，只冻结 summary / target / selected record ids。
+ * 传入 currentQuote 时追加报价事实（current_quote / 位置 / 星图折扣比例）；不传则保持 Phase 4B 原结构。
+ */
+function buildCandidatePricingEvidence(snapshot, priceReference, { currentQuote = null } = {}) {
   const sponsoredCount = Number(snapshot.sponsored_count ?? 0)
   const sponsoredMedian = snapshot.sponsored_median_play ?? null
   const estimate = {
@@ -542,7 +564,7 @@ function buildCandidatePricingEvidence(snapshot, priceReference) {
     estimate.confidence = sponsoredCount >= 3 ? 'normal' : 'low'
   }
   const xingtuPrice = snapshot.xingtu_price ?? null
-  return {
+  const base = {
     playbook_estimate: estimate,
     xingtu_price: xingtuPrice,
     high_amount_risk: xingtuPrice !== null && Number(xingtuPrice) > PLAYBOOK_HIGH_AMOUNT_THRESHOLD,
@@ -554,6 +576,15 @@ function buildCandidatePricingEvidence(snapshot, priceReference) {
       summary: priceReference?.summary ?? null,
       selected_record_ids: (priceReference?.cases || []).map((item) => item.record_id)
     }
+  }
+  if (currentQuote === null) return base
+  return {
+    ...base,
+    current_quote: currentQuote,
+    current_quote_assessment: buildCurrentQuoteAssessment(currentQuote, estimate),
+    // 事实比例：当前报价 / 星图刊例价；xingtu_price null 或 0 时为 null（不除 0）
+    quote_to_xingtu_ratio:
+      xingtuPrice !== null && Number(xingtuPrice) > 0 ? round2(currentQuote / Number(xingtuPrice)) : null
   }
 }
 
@@ -609,6 +640,77 @@ router.post('/:id/decisions', (req, res) => {
       TARGET_CPM,
       CANDIDATE_REVIEW_PRICING_VERSION,
       CANDIDATE_REVIEW_SYSTEM_CONTEXT_VERSION
+    )
+
+  const saved = db.prepare('SELECT * FROM creator_decisions WHERE id = ?').get(info.lastInsertRowid)
+  ok(res, toPublicDecision(saved, null, null))
+})
+
+/**
+ * POST /api/creator-candidates/:id/post-quote-decisions
+ * candidate 报价阶段人工决定（append-only）：
+ *   · 必须有 latest snapshot（post_quote 是正式价格判断阶段，需要冻结当时依据）
+ *   · current_quote_raw 必填且可确定性解析（0 是真实报价；负数 / 非法文本拒绝）
+ *   · human_decision 只接受 proceed / small_test / negotiate / pause（candidate 不允许 repurchase）
+ *   · creator / candidate_id / decision_stage / snapshot_id / evidence / 版本全部由服务端决定
+ */
+router.post('/:id/post-quote-decisions', (req, res) => {
+  const row = findCandidateRow(req.params.id)
+  if (!row) return fail(res, 404, `候选达人不存在（id=${req.params.id}）`)
+  const body = req.body
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return fail(res, 400, '请求体必须是对象')
+  }
+  const humanDecision = String(body.human_decision ?? '').trim()
+  if (!CANDIDATE_POST_QUOTE_DECISIONS.includes(humanDecision)) {
+    return fail(res, 400, `human_decision 必须为：${CANDIDATE_POST_QUOTE_DECISIONS.join(' / ')}`)
+  }
+  // current_quote：必填；复用既有确定性解析器（不复制第二套）
+  const quoteRawInput = typeof body.current_quote_raw === 'string' ? body.current_quote_raw.trim() : ''
+  if (!quoteRawInput) return fail(res, 400, '当前报价（current_quote_raw）不能为空')
+  const parsedQuote = parsePriceText(quoteRawInput)
+  if (parsedQuote.value === null) {
+    return fail(res, 400, '当前报价无法确定性解析，请按「¥2400 / 2400元 / 2,400」等形式填写')
+  }
+  const errors = []
+  const decisionNote = readOptionalText(body.decision_note, 'decision_note', MAX_NOTE_LENGTH, errors)
+  if (errors.length) return fail(res, 400, errors[0])
+  const currentQuote = parsedQuote.value
+  const currentQuoteRaw = parsedQuote.raw_text ?? quoteRawInput
+
+  // snapshot 必须存在：由服务端按 candidate_id 取 latest（前端不能提交 snapshot_id）
+  const snapshotRow = getLatestSnapshotByCandidate(row.id)
+  if (!snapshotRow) {
+    return fail(res, 400, '请先录入近期表现，再记录报价阶段决策。')
+  }
+  const snapshot = toPublicSnapshot(snapshotRow)
+  const priceReference = buildPriceReference(row)
+  const recentEvidence = buildCandidateRecentEvidence(row.id, snapshot)
+  const pricingEvidence = buildCandidatePricingEvidence(snapshot, priceReference, { currentQuote })
+
+  const info = db
+    .prepare(
+      `INSERT INTO creator_decisions (
+         creator, candidate_id, decision_stage, snapshot_id, current_quote_raw, current_quote, ip_judgement,
+         human_decision, decision_note, historical_evidence_json, recent_evidence_json,
+         pricing_evidence_json, target_cpm, pricing_version, system_context_version
+       ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      row.name,
+      row.id,
+      'post_quote',
+      snapshotRow.id,
+      currentQuoteRaw,
+      currentQuote,
+      humanDecision,
+      decisionNote,
+      JSON.stringify({ has_prior_collaboration: false }),
+      JSON.stringify(recentEvidence),
+      JSON.stringify(pricingEvidence),
+      TARGET_CPM,
+      CANDIDATE_POST_QUOTE_PRICING_VERSION,
+      CANDIDATE_POST_QUOTE_SYSTEM_CONTEXT_VERSION
     )
 
   const saved = db.prepare('SELECT * FROM creator_decisions WHERE id = ?').get(info.lastInsertRowid)

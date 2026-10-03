@@ -60,3 +60,12 @@ export function createCandidateDecision(candidateId, payload) {
 export function listCandidateDecisions(candidateId) {
   return request.get(`/creator-candidates/${candidateId}/decisions`)
 }
+
+/**
+ * candidate 报价阶段人工决定（Phase 4D，append-only）
+ * 只提交 { current_quote_raw, human_decision, decision_note? }；
+ * creator / candidate_id / decision_stage / snapshot_id / evidence 由服务端决定。
+ */
+export function createCandidatePostQuoteDecision(candidateId, payload) {
+  return request.post(`/creator-candidates/${candidateId}/post-quote-decisions`, payload)
+}

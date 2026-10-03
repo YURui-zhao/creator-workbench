@@ -22,6 +22,7 @@ import {
 import { PlusOutlined, ReloadOutlined, UserAddOutlined } from '@ant-design/icons'
 import {
   createCandidateDecision,
+  createCandidatePostQuoteDecision,
   createCreatorCandidate,
   getCandidateLatestSnapshot,
   getCandidatePriceReference,
@@ -76,6 +77,22 @@ const CANDIDATE_REVIEW_OPTIONS = [
   { value: 'observe', label: '继续观察' },
   { value: 'hold', label: '暂不推进' }
 ]
+
+// Phase 4D：candidate 报价阶段（candidate 第一次投放，用「直接推进」而非「复投」）
+const CANDIDATE_POST_QUOTE_OPTIONS = [
+  { value: 'proceed', label: '直接推进' },
+  { value: 'small_test', label: '小额测试' },
+  { value: 'negotiate', label: '继续议价' },
+  { value: 'pause', label: '暂缓' }
+]
+
+// 报价相对 Playbook 经验区间的位置（纯事实描述）
+const QUOTE_POSITION_LABELS = {
+  below_playbook_range: '低于经验区间',
+  within_playbook_range: '位于经验区间',
+  above_playbook_range: '高于经验区间',
+  unavailable: '经验区间不可用'
+}
 
 // 历史价格参考渲染（严格使用后端返回顺序，前端不再排序；不显示相似度）
 function renderPriceReference(priceRef, loading) {
@@ -173,6 +190,12 @@ export default function CreatorPlaybook() {
   const [decisionNote, setDecisionNote] = useState('')
   const [savingDecision, setSavingDecision] = useState(false)
   const [historyExpanded, setHistoryExpanded] = useState(false)
+  // Phase 4D：报价阶段决策（不自动弹出；无默认选中）
+  const [postQuoteOpen, setPostQuoteOpen] = useState(false)
+  const [postQuoteAmount, setPostQuoteAmount] = useState('')
+  const [postQuoteDecision, setPostQuoteDecision] = useState(null)
+  const [postQuoteNote, setPostQuoteNote] = useState('')
+  const [savingPostQuote, setSavingPostQuote] = useState(false)
   const [createOpen, setCreateOpen] = useState(false)
   const [creating, setCreating] = useState(false)
   const [assistantOpen, setAssistantOpen] = useState(false)
@@ -284,6 +307,10 @@ export default function CreatorPlaybook() {
     setHistoryExpanded(false)
     setPendingDecision(null)
     setDecisionNote('')
+    setPostQuoteOpen(false)
+    setPostQuoteAmount('')
+    setPostQuoteDecision(null)
+    setPostQuoteNote('')
   }, [selectedId])
 
   // AI 可用性：会话 Key（本地）或后端环境变量任一可用即可；查询失败不影响页面其它能力
@@ -488,6 +515,41 @@ export default function CreatorPlaybook() {
   })()
   // 量化判断全部由纯函数规则引擎给出（页面只负责展示，不重复计算业务规则）
   const assessment = snapshot ? buildCreatorPlaybookAssessment(snapshot) : null
+  // Phase 4D：最近一次 review / 报价阶段决策（decisions 已按时间倒序）
+  const latestReviewDecision = decisions.find((item) => item.decision_stage === 'candidate_review') || null
+  const latestPostQuoteDecision = decisions.find((item) => item.decision_stage === 'post_quote') || null
+  const reviewContactConfirmed = latestReviewDecision?.human_decision === 'contact'
+
+  // 报价阶段：必须由用户主动点击后打开，无默认选中
+  const openPostQuote = () => {
+    setPostQuoteAmount('')
+    setPostQuoteDecision(null)
+    setPostQuoteNote('')
+    setPostQuoteOpen(true)
+  }
+
+  const handleSavePostQuote = async () => {
+    if (!selected || !postQuoteDecision || savingPostQuote) return
+    if (!postQuoteAmount.trim()) {
+      message.warning('请填写当前报价')
+      return
+    }
+    setSavingPostQuote(true)
+    try {
+      await createCandidatePostQuoteDecision(selected.id, {
+        current_quote_raw: postQuoteAmount.trim(),
+        human_decision: postQuoteDecision.value,
+        decision_note: postQuoteNote.trim() ? postQuoteNote.trim() : null
+      })
+      message.success('报价阶段决策已记录')
+      setPostQuoteOpen(false)
+      await loadDecisions(selected.id)
+    } catch {
+      // 失败提示由 request 响应拦截器统一给出，这里不再重复 toast
+    } finally {
+      setSavingPostQuote(false)
+    }
+  }
 
   return (
     <div>
@@ -883,6 +945,67 @@ export default function CreatorPlaybook() {
                     )}
                   </div>
                 )}
+
+                {/* Phase 4D：报价阶段（继续联系后的自然 next step；同时保留直接记录入口，不制造流程死锁） */}
+                <div style={{ marginTop: 12 }}>
+                  <Space size={8} wrap align="center">
+                    {reviewContactConfirmed ? (
+                      <Button type="primary" ghost onClick={openPostQuote}>
+                        记录当前报价
+                      </Button>
+                    ) : (
+                      <Button onClick={openPostQuote}>已有报价，直接记录</Button>
+                    )}
+                    {!snapshot && (
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        需先录入近期表现
+                      </Typography.Text>
+                    )}
+                  </Space>
+
+                  {latestPostQuoteDecision && (
+                    <div style={{ marginTop: 10 }}>
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        最近报价阶段
+                      </Typography.Text>
+                      <Space direction="vertical" size={2} style={{ display: 'flex', marginTop: 4 }}>
+                        <Typography.Text>
+                          当前报价：{formatPrice(latestPostQuoteDecision.current_quote) ?? '-'}
+                          {latestPostQuoteDecision.pricing_evidence?.xingtu_price !== null &&
+                          latestPostQuoteDecision.pricing_evidence?.xingtu_price !== undefined
+                            ? ` · 星图刊例：${formatPrice(latestPostQuoteDecision.pricing_evidence.xingtu_price)}`
+                            : ''}
+                          {typeof latestPostQuoteDecision.pricing_evidence?.quote_to_xingtu_ratio === 'number'
+                            ? ` · 当前报价约 ${(latestPostQuoteDecision.pricing_evidence.quote_to_xingtu_ratio * 10).toFixed(1)} 折`
+                            : ''}
+                        </Typography.Text>
+                        {latestPostQuoteDecision.pricing_evidence?.playbook_estimate && (
+                          <Typography.Text type="secondary">
+                            Playbook 估价：
+                            {renderEstimateRange({
+                              low: latestPostQuoteDecision.pricing_evidence.playbook_estimate.estimate_low,
+                              high: latestPostQuoteDecision.pricing_evidence.playbook_estimate.estimate_high
+                            })}
+                            {' · 报价位置：'}
+                            {QUOTE_POSITION_LABELS[
+                              latestPostQuoteDecision.pricing_evidence.current_quote_assessment?.position
+                            ] || '-'}
+                          </Typography.Text>
+                        )}
+                        <Typography.Text type="secondary">
+                          人工决定：
+                          {latestPostQuoteDecision.human_decision_label || latestPostQuoteDecision.human_decision} ·{' '}
+                          {String(latestPostQuoteDecision.created_at || '').slice(0, 16)}
+                        </Typography.Text>
+                        {latestPostQuoteDecision.decision_note && (
+                          <Typography.Text type="secondary">
+                            备注：{latestPostQuoteDecision.decision_note}
+                          </Typography.Text>
+                        )}
+                      </Space>
+                    </div>
+                  )}
+                </div>
               </div>
             </Card>
           )}
@@ -1027,6 +1150,59 @@ export default function CreatorPlaybook() {
               maxLength={500}
               autoSize={{ minRows: 2, maxRows: 4 }}
               placeholder="记录判断依据 / 后续动作"
+            />
+          </div>
+        </Space>
+      </Modal>
+
+      {/* Phase 4D：报价阶段决策（无默认选中；不自动弹出） */}
+      <Modal
+        title="记录报价阶段决策"
+        open={postQuoteOpen}
+        onCancel={() => {
+          setPostQuoteOpen(false)
+          setPostQuoteAmount('')
+          setPostQuoteDecision(null)
+          setPostQuoteNote('')
+        }}
+        onOk={handleSavePostQuote}
+        confirmLoading={savingPostQuote}
+        okText="记录报价决策"
+        cancelText="取消"
+        destroyOnClose
+      >
+        <Space direction="vertical" size={10} style={{ display: 'flex' }}>
+          <div>
+            <Typography.Text type="secondary">当前报价</Typography.Text>
+            <Input
+              value={postQuoteAmount}
+              onChange={(event) => setPostQuoteAmount(event.target.value)}
+              placeholder="如 ¥3000 / 3000元 / 3,000"
+              maxLength={60}
+            />
+          </div>
+          <div>
+            <Typography.Text type="secondary">决策（请主动选择）</Typography.Text>
+            <Space size={8} wrap style={{ display: 'flex', marginTop: 6 }}>
+              {CANDIDATE_POST_QUOTE_OPTIONS.map((option) => (
+                <Button
+                  key={option.value}
+                  type={postQuoteDecision?.value === option.value ? 'primary' : 'default'}
+                  onClick={() => setPostQuoteDecision(option)}
+                >
+                  {option.label}
+                </Button>
+              ))}
+            </Space>
+          </div>
+          <div>
+            <Typography.Text type="secondary">决策备注（可选）</Typography.Text>
+            <Input.TextArea
+              value={postQuoteNote}
+              onChange={(event) => setPostQuoteNote(event.target.value)}
+              maxLength={500}
+              autoSize={{ minRows: 2, maxRows: 4 }}
+              placeholder="记录报价来源 / 判断依据"
             />
           </div>
         </Space>

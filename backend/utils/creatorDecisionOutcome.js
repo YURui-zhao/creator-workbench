@@ -22,7 +22,10 @@ import { TARGET_CPM } from './creatorBusinessRules.js'
 
 // 只有「已拿到报价 且 决定实际投放」的决策才允许关联真实投放结果
 export const OUTCOME_ELIGIBLE_STAGES = ['post_quote']
+// 旧历史达人（candidate_id = NULL）：保持原样，不接受 candidate 专用的 proceed
 export const OUTCOME_ELIGIBLE_DECISIONS = ['repurchase', 'small_test']
+// Phase 4D：candidate（candidate_id 非空）第一次投放，用 proceed 取代语义错误的 repurchase
+export const CANDIDATE_OUTCOME_ELIGIBLE_DECISIONS = ['proceed', 'small_test']
 
 // latest 观测状态（事实，不含评价）
 export const LATEST_STATUS = {
@@ -63,7 +66,12 @@ export function isDecisionEligibleForOutcome(decision) {
   if (!OUTCOME_ELIGIBLE_STAGES.includes(decision.decision_stage)) {
     return { eligible: false, reason: '该决策未进入实际投放阶段' }
   }
-  if (!OUTCOME_ELIGIBLE_DECISIONS.includes(decision.human_decision)) {
+  // 合法决策集按身份来源区分：旧历史达人 / candidate（candidate_review 仍全部不 eligible）
+  const isCandidateDecision = decision.candidate_id !== null && decision.candidate_id !== undefined
+  const allowed = isCandidateDecision
+    ? CANDIDATE_OUTCOME_ELIGIBLE_DECISIONS
+    : OUTCOME_ELIGIBLE_DECISIONS
+  if (!allowed.includes(decision.human_decision)) {
     return { eligible: false, reason: '该决策未进入实际投放阶段' }
   }
   return { eligible: true, reason: null }

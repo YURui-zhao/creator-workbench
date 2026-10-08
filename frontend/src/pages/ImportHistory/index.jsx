@@ -37,7 +37,9 @@ const ITEM_STATUS = {
   success: { text: '成功', color: 'success' },
   fail: { text: '失败', color: 'error' },
   skip: { text: '跳过', color: 'default' },
-  duplicate: { text: '重复', color: 'warning' }
+  duplicate: { text: '重复', color: 'warning' },
+  // Existing Record Update V0.1：真实完成的已有记录更新（不再伪装成 duplicate）
+  updated: { text: '更新', color: 'processing' }
 }
 
 // created_at 由 SQLite CURRENT_TIMESTAMP 写入（UTC 时间字符串），展示时统一转换为浏览器本地时间（精确到分钟）
@@ -268,6 +270,16 @@ export default function ImportHistory() {
       width: 90,
       align: 'right',
       render: (value) => <Tag color="success">{formatInteger(value)}</Tag>
+    },
+    {
+      // Existing Record Update V0.1：本批次完成更新的已有记录数（0 表示纯新增批次）
+      title: '更新已有',
+      dataIndex: 'update_count',
+      width: 100,
+      align: 'right',
+      render: (value) => (
+        <Tag color={value ? 'processing' : 'default'}>{formatInteger(value)}</Tag>
+      )
     },
     {
       title: '失败',
@@ -559,9 +571,12 @@ export default function ImportHistory() {
               <Descriptions.Item label="总条数">
                 {formatInteger(detail.batch.total_count)}
               </Descriptions.Item>
-              <Descriptions.Item label="成功 / 失败 / 跳过 / 重复">
+              <Descriptions.Item label="成功 / 更新 / 失败 / 跳过 / 重复">
                 <Space size={6} wrap>
                   <Tag color="success">成功 {formatInteger(detail.batch.success_count)}</Tag>
+                  <Tag color={detail.batch.update_count ? 'processing' : 'default'}>
+                    更新 {formatInteger(detail.batch.update_count)}
+                  </Tag>
                   <Tag color={detail.batch.fail_count ? 'error' : 'default'}>
                     失败 {formatInteger(detail.batch.fail_count)}
                   </Tag>

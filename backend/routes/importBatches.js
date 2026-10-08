@@ -33,6 +33,7 @@ const BATCH_COLUMNS = [
 // success_count 是导入当时成功写入的条数，record_count 会随记录被删除而减少）
 const BATCH_SELECT = `SELECT ${BATCH_COLUMNS.join(', ')},
   (SELECT COUNT(*) FROM import_batch_records br WHERE br.batch_id = import_batches.id) AS record_count
+  ,(SELECT COUNT(*) FROM import_batch_record_updates bu WHERE bu.batch_id = import_batches.id) AS update_count
   FROM import_batches`
 
 // 「删除历史」被拒绝时的统一提示（批次仍有关联投放记录）
@@ -40,6 +41,26 @@ const HISTORY_DELETE_BLOCKED_MSG =
   '该批次仍有关联投放记录，请先撤销导入；如需保留投放数据，请手动删除对应记录后再删除历史。'
 // 「撤销导入」在无可撤销记录时的友好提示
 const ROLLBACK_EMPTY_MSG = '该批次当前没有可撤销的投放记录。'
+
+// 撤销更新时的乐观并发冲突提示（导入后又发生了新的更新，不能覆盖后续事实）
+function updateRollbackConflictMessage(recordId, after, current) {
+  return `撤销冲突：记录 #${recordId} 的累计播放量在本次导入后又被修改（本批次更新为 ${after}，当前 ${current}）。为避免覆盖后续事实，已取消本次撤销。`
+}
+
+const UPDATE_FIELD_LABEL = { second_week_play: '累计播放量' }
+
+// 读取 JSON 数字（保留 null / 0 的区别）；非法返回 null
+function parseJsonNumber(raw) {
+  if (raw === null || raw === undefined) return null
+  try {
+    const value = JSON.parse(raw)
+    if (value === null) return null
+    const num = Number(value)
+    return Number.isFinite(num) ? num : null
+  } catch {
+    return null
+  }
+}
 
 /**
  * GET /api/import/batches
@@ -129,20 +150,40 @@ router.get('/batches/:id', (req, res) => {
     .prepare('SELECT COUNT(*) AS n FROM import_batch_records WHERE batch_id = ?')
     .get(id).n
 
+  // Existing Record Update V0.1：本批次对已有记录做过的字段级更新（审计）
+  const updates = db
+    .prepare(
+      `SELECT id, record_id, field_name, before_value_json, after_value_json, created_at
+       FROM import_batch_record_updates
+       WHERE batch_id = ?
+       ORDER BY record_id ASC, id ASC`
+    )
+    .all(id)
+    .map((row) => ({
+      ...row,
+      field_label: UPDATE_FIELD_LABEL[row.field_name] || row.field_name,
+      before_value: parseJsonNumber(row.before_value_json),
+      after_value: parseJsonNumber(row.after_value_json)
+    }))
+
   const summary = items.reduce(
     (acc, item) => {
       const key = String(item.status || '').toLowerCase()
       if (Object.prototype.hasOwnProperty.call(acc, key)) acc[key] += 1
       return acc
     },
-    { success: 0, fail: 0, skip: 0, duplicate: 0 }
+    { success: 0, fail: 0, skip: 0, duplicate: 0, updated: 0 }
   )
+  // 行列明细里没有 updated 行时，用审计表兜底（保证「更新 M」始终可展示）
+  if (summary.updated === 0) summary.updated = updates.length
 
   ok(res, {
     batch,
     items,
     records,
+    updates,
     record_count: recordCount,
+    update_count: updates.length,
     item_summary: summary
   })
 })
@@ -161,41 +202,93 @@ router.post('/batches/:id/rollback', (req, res) => {
   const batch = db.prepare(`${BATCH_SELECT} WHERE id = ?`).get(id)
   if (!batch) return fail(res, 404, '导入批次不存在')
 
-  const result = db.transaction((batchId) => {
-    // 该批次当前的全部关联（可能指向已被手动删除的记录）
-    const mappings = db
-      .prepare('SELECT record_id FROM import_batch_records WHERE batch_id = ?')
-      .all(batchId)
-    const removeRecord = db.prepare('DELETE FROM creator_records WHERE id = ?')
-    let deletedCount = 0
-    for (const mapping of mappings) {
-      const info = removeRecord.run(mapping.record_id)
-      if (info.changes > 0) deletedCount += 1
-    }
-    const clearedMappingCount = db
-      .prepare('DELETE FROM import_batch_records WHERE batch_id = ?')
-      .run(batchId).changes
-    const itemsKept = db
-      .prepare('SELECT COUNT(*) AS n FROM import_batch_items WHERE batch_id = ?')
-      .get(batchId).n
-    return {
-      scannedMappingCount: mappings.length,
-      deletedCount,
-      clearedMappingCount,
-      itemsKept
-    }
-  })(id)
+  const selectPlay = db.prepare('SELECT id, second_week_play FROM creator_records WHERE id = ?')
+  const updatePlay = db.prepare('UPDATE creator_records SET second_week_play = ? WHERE id = ?')
+  const conflict = (message) => {
+    const error = new Error(message)
+    error.statusCode = 409
+    throw error
+  }
+
+  let result
+  try {
+    result = db.transaction((batchId) => {
+      // ① 先撤销字段级更新（只有当「当前值 == 本批次写入的 after」时才允许恢复 after → before）
+      const audits = db
+        .prepare(
+          `SELECT record_id, field_name, before_value_json, after_value_json
+           FROM import_batch_record_updates WHERE batch_id = ? ORDER BY id ASC`
+        )
+        .all(batchId)
+      let revertedUpdateCount = 0
+      let skippedUpdateCount = 0
+      for (const audit of audits) {
+        if (audit.field_name !== 'second_week_play') continue
+        const record = selectPlay.get(audit.record_id)
+        // 记录已被手动删除：无法恢复，跳过（与旧行为一致，不因数量不符而失败）
+        if (!record) {
+          skippedUpdateCount += 1
+          continue
+        }
+        const current =
+          record.second_week_play === null || record.second_week_play === undefined
+            ? null
+            : Number(record.second_week_play)
+        const before = parseJsonNumber(audit.before_value_json)
+        const after = parseJsonNumber(audit.after_value_json)
+        if (current === after) {
+          updatePlay.run(before, audit.record_id)
+          revertedUpdateCount += 1
+        } else if (current === before) {
+          // 已经恢复过（幂等）：不重复写，也不当作冲突
+          skippedUpdateCount += 1
+        } else {
+          conflict(updateRollbackConflictMessage(audit.record_id, after, current))
+        }
+      }
+
+      // ② 删除该批次当前仍关联的新增记录（旧逻辑保持不变）
+      const mappings = db
+        .prepare('SELECT record_id FROM import_batch_records WHERE batch_id = ?')
+        .all(batchId)
+      const removeRecord = db.prepare('DELETE FROM creator_records WHERE id = ?')
+      let deletedCount = 0
+      for (const mapping of mappings) {
+        const info = removeRecord.run(mapping.record_id)
+        if (info.changes > 0) deletedCount += 1
+      }
+      const clearedMappingCount = db
+        .prepare('DELETE FROM import_batch_records WHERE batch_id = ?')
+        .run(batchId).changes
+      const itemsKept = db
+        .prepare('SELECT COUNT(*) AS n FROM import_batch_items WHERE batch_id = ?')
+        .get(batchId).n
+      return {
+        scannedMappingCount: mappings.length,
+        deletedCount,
+        revertedUpdateCount,
+        skippedUpdateCount,
+        clearedMappingCount,
+        itemsKept
+      }
+    })(id)
+  } catch (error) {
+    if (error && error.statusCode) return fail(res, error.statusCode, error.message)
+    throw error
+  }
 
   ok(res, {
     batchId: id,
     deletedCount: result.deletedCount,
+    revertedUpdateCount: result.revertedUpdateCount,
+    skippedUpdateCount: result.skippedUpdateCount,
     clearedMappingCount: result.clearedMappingCount,
     scannedMappingCount: result.scannedMappingCount,
     itemsKept: result.itemsKept,
     recordCount: 0,
     message:
-      result.deletedCount > 0
-        ? `已撤销导入：删除 ${result.deletedCount} 条投放记录`
+      result.deletedCount > 0 || result.revertedUpdateCount > 0
+        ? `已撤销导入：删除 ${result.deletedCount} 条投放记录，恢复 ${result.revertedUpdateCount} 条已有记录的累计播放量`
         : ROLLBACK_EMPTY_MSG
   })
 })
@@ -219,6 +312,9 @@ router.delete('/batches/:id', (req, res) => {
 
   const result = db.transaction((batchId) => ({
     deletedItems: db.prepare('DELETE FROM import_batch_items WHERE batch_id = ?').run(batchId).changes,
+    deletedUpdates: db
+      .prepare('DELETE FROM import_batch_record_updates WHERE batch_id = ?')
+      .run(batchId).changes,
     deletedMappings: db
       .prepare('DELETE FROM import_batch_records WHERE batch_id = ?')
       .run(batchId).changes,

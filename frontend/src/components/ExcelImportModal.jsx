@@ -42,6 +42,8 @@ import {
   classifyImportRows,
   isPreviewEligible,
   RECORD_FACT_LABELS,
+  splitExistingChanges,
+  buildUpdateIntents,
   detectMappingConflicts,
   exportFailedRowsToExcel,
   parseRecordsExcel,
@@ -250,6 +252,8 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   const excludedRowsRef = useRef([])
   // Phase: record identity 分类结果（exact / noop / changed / uncertain / new），用于统计与明细展示
   const [identityReview, setIdentityReview] = useState(null)
+  // Existing Record Update V0.1：用户是否显式选择「同时更新已有记录」（mixed 场景默认不勾选）
+  const [includeUpdates, setIncludeUpdates] = useState(false)
   // 时间周期识别面板中手动「跳过该行」的行号，计入「跳过」统计
   const [skippedRowIndexes, setSkippedRowIndexes] = useState([])
 
@@ -271,18 +275,30 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   // AI 错误仅作为风险提示，不能自行改变本地校验决定的可导入范围。
   const aiErrors = useMemo(() => aiResults.filter((r) => r.level === 'error'), [aiResults])
 
-  // ---------- 导入结果统计（新记录 / 已有更新 / 已有无新信息 / 完全重复 / 失败 / 跳过） ----------
-  // 不可导入的行 = exact duplicate + noop + changed + uncertain（都不允许 POST 成新 record）
+  // ---------- Existing Record Update V0.1：把 existing_changed 拆成「可安全更新 / 需人工处理」 ----------
+  // safe_update 只允许 second_week_play 安全增长；其余（含下降 / 其它字段变化）一律 manual_review
+  const updatePlan = useMemo(
+    () => splitExistingChanges(identityReview?.existingChanged || []),
+    [identityReview]
+  )
+  const safeUpdateCount = updatePlan.safeUpdates.length
+  const manualReviewCount = updatePlan.manualReview.length
+  // ---------- 导入结果统计（新记录 / 可安全更新 / 需人工处理 / 无新信息 / 完全重复 / 失败 / 跳过） ----------
+  // 不进入本次导入的行 = exact duplicate + noop + 需人工处理的 changed + uncertain（都不允许 POST 成新 record）
   const excludedImportRows = useMemo(() => {
     if (!identityReview) return []
     const pick = (list, kind) => (list || []).map((item) => ({ rowIndex: item.row.rowIndex, reason: item.reason, kind }))
     return [
       ...pick(identityReview.exactDuplicates, 'exact_duplicate'),
       ...pick(identityReview.existingNoop, 'existing_noop'),
-      ...pick(identityReview.existingChanged, 'existing_changed'),
+      ...(updatePlan.manualReview || []).map((item) => ({
+        rowIndex: item.row.rowIndex,
+        reason: `需人工处理（不自动更新）：${item.update?.reason || ''}`,
+        kind: 'manual_review'
+      })),
       ...pick(identityReview.identityUncertain, 'identity_uncertain')
     ]
-  }, [identityReview])
+  }, [identityReview, updatePlan])
   const duplicateIndexes = useMemo(
     () => new Set(excludedImportRows.map((item) => item.rowIndex)),
     [excludedImportRows]
@@ -305,7 +321,8 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   const importStats = useMemo(
     () => ({
       新记录: identityReview ? identityReview.newRecords.length : importRows.length,
-      已有记录更新: identityReview ? identityReview.existingChanged.length : 0,
+      可安全更新: updatePlan.safeUpdates.length,
+      需人工处理: updatePlan.manualReview.length,
       已有记录无新增信息: identityReview ? identityReview.existingNoop.length : 0,
       完全重复: identityReview ? identityReview.exactDuplicates.length : 0,
       需确认: confirmationRows.length,
@@ -314,7 +331,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
       跳过: (preview?.blankRows || 0) + (preview?.repeatedHeaderRows || 0) + skippedRowIndexes.length,
       需人工确认身份: identityReview ? identityReview.identityUncertain.length : 0
     }),
-    [importRows.length, confirmationRows.length, failedRows.length, preview, skippedRowIndexes.length, identityReview]
+    [importRows.length, confirmationRows.length, failedRows.length, preview, skippedRowIndexes.length, identityReview, updatePlan]
   )
   const blankRowIndexes = preview?.blankRowIndexes || []
   const headerRowIndexes = preview?.headerRowIndexes || []
@@ -323,6 +340,16 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   )?.sourceCycleConflictOrigin)
 
   const importableRows = importRows
+
+  // Existing Record Update V0.1：是否应用已有记录更新
+  //   · mixed（有新增）→ 必须由用户显式勾选「同时更新」，默认只导入新增
+  //   · update-only（无新增）→ 主 CTA「更新已有记录」本身就是显式确认（点击后还有二次确认）
+  const hasNewRecords = importableRows.length > 0
+  const applyUpdates = hasNewRecords ? includeUpdates : safeUpdateCount > 0
+  const updateIntents = useMemo(
+    () => (applyUpdates ? buildUpdateIntents(updatePlan.safeUpdates) : []),
+    [applyUpdates, updatePlan]
+  )
 
   // 下载失败明细（行号 / 错误字段 / 原始值 / 错误原因），无失败数据时给出提示
   const handleDownloadFailedRows = () => {
@@ -361,6 +388,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     setManualEditError('')
     manualForm.resetFields()
     setIdentityReview(null)
+    setIncludeUpdates(false)
     setSkippedRowIndexes([])
     excludedRowsRef.current = []
     sourceFileRef.current = null
@@ -878,6 +906,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
       // 自动判定无效数据：与库中已有记录重复、文件内重复的行剔除
       excludedRowsRef.current = []
       setIdentityReview(null)
+      setIncludeUpdates(false)
       setSkippedRowIndexes([])
       let classification = null
       try {
@@ -960,6 +989,27 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   }
 
   // ---------- 确认导入（导入修正后的数据） ----------
+  /**
+   * 二次确认：只要本次会写入已有记录（update），就必须由用户显式确认后才能调用后端。
+   * 绝不在上传文件后自动更新。
+   */
+  const handleConfirmClick = () => {
+    if (!updateIntents.length) {
+      handleConfirm()
+      return
+    }
+    const hasNew = importableRows.length > 0
+    Modal.confirm({
+      title: hasNew ? '确认导入并更新已有记录？' : '确认更新已有记录？',
+      content: hasNew
+        ? `将导入 ${importableRows.length} 条新记录，并更新 ${updateIntents.length} 条已有投放记录的累计播放量。系统会记录更新前的值，并支持批次回滚。`
+        : `将更新 ${updateIntents.length} 条已有投放记录的累计播放量。系统会记录更新前的值，并支持批次回滚。`,
+      okText: hasNew ? '导入并更新' : '确认更新',
+      cancelText: '取消',
+      onOk: () => handleConfirm()
+    })
+  }
+
   const handleConfirm = async () => {
     // 安全兜底：存在未确认的字段映射时，绝不允许正式导入（避免「假成功」）
     if (mappingReview) {
@@ -967,7 +1017,8 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
       return
     }
     // AI 结果只提示风险；正式导入资格由确定性本地校验决定。
-    if (!importableRows.length) return
+    // Existing Record Update V0.1：update-only 场景允许「只更新已有记录」（无新增导入）。
+    if (!importableRows.length && !updateIntents.length) return
     const locallyChecked = reapplyDedupeExclusion(applyTimeCycleMapping(preview, {}))
     const checkedByIndex = new Map(locallyChecked.validRows.map((row) => [row.rowIndex, row]))
     if (importableRows.some((row) => !checkedByIndex.has(row.rowIndex))) {
@@ -984,19 +1035,27 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
           record
       )
       // 导入批次元数据（写入导入历史）：文件名 + 本次成功/失败/跳过/重复统计 + 行级明细
-      // 说明（本阶段）：后端 import_batch_items.status 仅允许 success/fail/skip/duplicate，
-      //   exact_duplicate / existing_noop / existing_changed 统一记为 duplicate（都属于「已有记录，本次不新增」），
-      //   identity_uncertain 记为 skip（身份待人工确认，未导入）。批量口径与 import_batches 计数保持一致。
-      const existingMatchedCount = identityReview
-        ? identityReview.exactDuplicates.length + identityReview.existingNoop.length + identityReview.existingChanged.length
+      // 说明：后端 status 允许 success / fail / skip / duplicate / updated。
+      //   exact_duplicate / existing_noop 记为 duplicate（已有记录，本次不新增）；
+      //   真实完成的字段更新记为 updated；需人工处理的更新 / 身份待确认记为 skip。
+      //   批量口径与 import_batches 计数保持一致。
+      const duplicateCount = identityReview
+        ? identityReview.exactDuplicates.length + identityReview.existingNoop.length
         : 0
       const identityUncertainCount = identityReview ? identityReview.identityUncertain.length : 0
       const batchMeta = {
         fileName: preview?.fileName || '',
-        totalCount: payload.length + confirmationRows.length + failedRows.length + excludedImportRows.length + importStats.跳过,
+        totalCount:
+          payload.length +
+          updateIntents.length +
+          confirmationRows.length +
+          failedRows.length +
+          excludedImportRows.length +
+          importStats.跳过,
         failCount: failedRows.length,
-        skipCount: importStats.跳过 + confirmationRows.length + identityUncertainCount,
-        duplicateCount: existingMatchedCount,
+        skipCount:
+          importStats.跳过 + confirmationRows.length + identityUncertainCount + manualReviewCount,
+        duplicateCount,
         items: [
           ...importableRows
             .filter((row) => row.manualCorrection || row.sourceCycleConfirmed || row.aiSuggestionAdopted)
@@ -1021,14 +1080,26 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
             status: 'fail',
             reason: item.reason || '本地校验或 AI 校验未通过'
           })),
+          // 真实完成的已有记录更新（不再伪装成 duplicate）
+          ...updateIntents.map((intent) => ({
+            rowIndex: null,
+            status: 'updated',
+            reason: `更新已有记录 #${intent.record_id} 的累计播放量：${
+              intent.expected_before === null ? '（未观察）' : intent.expected_before
+            } → ${intent.desired_after}`
+          })),
           ...excludedImportRows.map((item) => ({
             rowIndex: item.rowIndex,
-            status: item.kind === 'identity_uncertain' ? 'skip' : 'duplicate',
-            reason: item.kind === 'existing_changed'
-              ? `同一条已有记录，本次检测到数据变化（本阶段不自动写入）：${item.reason || ''}`
-              : item.kind === 'existing_noop'
-                ? `同一条已有记录，Excel 未提供更强的新信息，未导入：${item.reason || ''}`
-                : item.reason || '与已有记录重复，未导入'
+            status:
+              item.kind === 'identity_uncertain' || item.kind === 'manual_review'
+                ? 'skip'
+                : 'duplicate',
+            reason:
+              item.kind === 'manual_review'
+                ? item.reason || '需人工处理，未自动写入'
+                : item.kind === 'existing_noop'
+                  ? `同一条已有记录，Excel 未提供更强的新信息，未导入：${item.reason || ''}`
+                  : item.reason || '与已有记录重复，未导入'
           })),
           ...skippedRowIndexes.map((rowIndex) => ({
             rowIndex,
@@ -1037,8 +1108,10 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
           }))
         ]
       }
-      const res = await batchCreateRecords(payload, batchMeta)
+      // 前端只提交 record_id / expected_before / desired_after；field_name 由后端固定为 second_week_play
+      const res = await batchCreateRecords(payload, batchMeta, updateIntents)
       const batchId = res.data?.batchId
+      const updatedCount = res.data?.updatedCount || 0
       // 成功提示中提供「查看批次」快捷入口（跳转导入历史并自动展开该批次）
       if (batchId) {
         message.success({
@@ -1046,6 +1119,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
           content: (
             <span>
               成功导入 {res.data.count} 条记录
+              {updatedCount > 0 && `，更新 ${updatedCount} 条已有记录`}
               <a
                 style={{ marginLeft: 8 }}
                 onClick={() => {
@@ -1060,7 +1134,11 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
           )
         })
       } else {
-        message.success(`成功导入 ${res.data.count} 条记录`)
+        message.success(
+          updatedCount > 0
+            ? `成功导入 ${res.data.count} 条记录，更新 ${updatedCount} 条已有记录`
+            : `成功导入 ${res.data.count} 条记录`
+        )
       }
       if (failedRows.length) {
         message.warning(`${failedRows.length} 条本地校验失败数据已跳过`)
@@ -1226,9 +1304,16 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
 
   // ---------- 底部按钮 ----------
   // 预览可用性 ≠ 可新增导入：update-only / 全重复文件也要能进入预览查看分类。
-  // 无新记录时主操作不能是「确认导入（0 条）」，更不能 POST 空批次。
-  const hasNewRecords = importableRows.length > 0
-  const importLabel = hasNewRecords ? `确认导入（${importableRows.length} 条）` : '当前无新记录可导入'
+  // 无新记录时主操作不能显示 0 条「确认导入」，更不能 POST 空批次。
+  // Existing Record Update V0.1：可按用户选择执行「只导入新增 / 同时更新已有记录 / 只更新已有记录」。
+  const importLabel = hasNewRecords
+    ? applyUpdates && safeUpdateCount > 0
+      ? `导入 ${importableRows.length} 条新记录并更新 ${safeUpdateCount} 条已有记录`
+      : `确认导入（${importableRows.length} 条）`
+    : safeUpdateCount > 0
+      ? `更新已有记录（${safeUpdateCount} 条）`
+      : '当前无新记录可导入'
+  const confirmDisabled = importing || (!hasNewRecords && updateIntents.length === 0)
 
   const renderFooter = () => {
     if (!preview) {
@@ -1263,9 +1348,9 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
           </Button>
           <Button
             type="primary"
-            onClick={handleConfirm}
+            onClick={handleConfirmClick}
             loading={importing}
-            disabled={importableRows.length === 0}
+            disabled={confirmDisabled}
           >
             {importLabel}
           </Button>
@@ -1588,21 +1673,27 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
             }
           />
 
-          {/* update-only / 全重复文件：允许进入预览查看分类，但明确「没有可新增导入的记录」 */}
+          {/* update-only / 全重复文件：允许进入预览查看分类，并明确当前可执行的操作 */}
           {identityReview && identityReview.newRecords.length === 0 && (
             <Alert
-              type={identityReview.existingChanged.length > 0 ? 'warning' : 'info'}
+              type={safeUpdateCount > 0 ? 'warning' : 'info'}
               showIcon
               message={
-                identityReview.existingChanged.length > 0
-                  ? `当前无新记录可导入（检测到 ${identityReview.existingChanged.length} 条已有记录的数据变化）`
-                  : '未发现新记录或可更新数据。'
+                safeUpdateCount > 0
+                  ? `当前无新记录可导入；可安全更新 ${safeUpdateCount} 条已有记录`
+                  : manualReviewCount > 0
+                    ? `未发现新记录；${manualReviewCount} 条已有记录变化需人工处理`
+                    : '未发现新记录或可更新数据。'
               }
               description={
-                identityReview.existingChanged.length > 0 ? (
+                safeUpdateCount > 0 ? (
                   <div>
-                    本次没有可新增导入的记录；已有记录的变化只做识别与展示，本阶段不会自动写入。
-                    请在下方「已有记录的数据变化」中查看 diff。
+                    本次没有可新增导入的记录；可将下方「可安全更新已有记录」中的累计播放量写入已有记录。
+                    系统会记录更新前的值，并支持批次回滚；删除 / 其它字段变化不会自动写入。
+                  </div>
+                ) : manualReviewCount > 0 ? (
+                  <div>
+                    已有记录的变化均不满足安全更新条件（仅允许累计播放量安全增长），只做识别与展示，不会自动写入。
                   </div>
                 ) : (
                   <div>
@@ -1622,9 +1713,9 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
             </Typography.Text>
           </Divider>
 
-          {/* 本地统计：按 record identity 分类（新记录 / 已有更新 / 已有无新信息 / 完全重复 / 需人工确认身份 / 跳过 / 需确认 / 失败） */}
+          {/* 本地统计：按 record identity 分类（新记录 / 可安全更新 / 需人工处理 / 已有无新信息 / 完全重复 / 需人工确认身份 / 跳过 / 需确认 / 失败） */}
           <Row gutter={[12, 12]}>
-            <Col xs={12} md={8}>
+            <Col xs={12} md={6}>
               <Card size="small" styles={{ body: { padding: '12px 16px' } }}>
                 <Statistic
                   title="新记录（可导入）"
@@ -1633,16 +1724,25 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
                 />
               </Card>
             </Col>
-            <Col xs={12} md={8}>
+            <Col xs={12} md={6}>
               <Card size="small" styles={{ body: { padding: '12px 16px' } }}>
                 <Statistic
-                  title="已有记录更新"
-                  value={importStats.已有记录更新}
-                  valueStyle={{ color: importStats.已有记录更新 ? '#faad14' : undefined, fontSize: 22 }}
+                  title="可安全更新"
+                  value={importStats.可安全更新}
+                  valueStyle={{ color: importStats.可安全更新 ? '#faad14' : undefined, fontSize: 22 }}
                 />
               </Card>
             </Col>
-            <Col xs={12} md={8}>
+            <Col xs={12} md={6}>
+              <Card size="small" styles={{ body: { padding: '12px 16px' } }}>
+                <Statistic
+                  title="需人工处理"
+                  value={importStats.需人工处理}
+                  valueStyle={{ color: importStats.需人工处理 ? '#faad14' : undefined, fontSize: 22 }}
+                />
+              </Card>
+            </Col>
+            <Col xs={12} md={6}>
               <Card size="small" styles={{ body: { padding: '12px 16px' } }}>
                 <Statistic
                   title="已有记录无新增信息"
@@ -1770,32 +1870,26 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
             />
           )}
 
-          {/* 已有记录数据变化：只识别 + 展示 diff，本阶段不写入（避免破坏 batch rollback 语义） */}
-          {identityReview && identityReview.existingChanged.length > 0 && (
+          {/* Existing Record Update V0.1：可安全更新（只允许累计播放量安全增长） */}
+          {updatePlan.safeUpdates.length > 0 && (
             <Alert
               type="warning"
               showIcon
-              message={`检测到 ${identityReview.existingChanged.length} 条已有记录的数据变化（本阶段不自动写入）`}
+              message={`可安全更新已有记录（${updatePlan.safeUpdates.length}）`}
               description={
-                <div style={{ maxHeight: 240, overflow: 'auto' }}>
+                <div style={{ maxHeight: 260, overflow: 'auto' }}>
                   <div style={{ color: '#8c8c8c', marginBottom: 6 }}>
-                    这些行的视频链接与库中已有记录相同（同一条内容），仅数据有更新；
-                    本阶段只识别与展示，不会新增重复记录，也不会覆盖旧记录。
+                    这些行的视频链接与库中已有记录相同（同一条内容），且仅累计播放量安全增长；
+                    确认后只更新累计播放量，不会新增重复记录，也不会覆盖其它字段。
                   </div>
-                  {identityReview.existingChanged.map((item) => (
+                  {updatePlan.safeUpdates.map((item) => (
                     <div key={item.row.rowIndex} style={{ marginBottom: 8 }}>
                       <div>
-                        Excel 第{item.row.rowIndex}行：{item.row.nickname}；发布日期 {item.row.publish_date}；
-                        视频链接 {item.row.video_link}
+                        {item.row.nickname}；发布日期 {item.row.publish_date}；视频链接 {item.row.video_link}
                       </div>
-                      {(item.diffs || [])
-                        .filter((diff) => diff.change_type !== 'incoming_missing')
-                        .map((diff) => (
-                          <div key={diff.field} style={{ color: '#d46b08' }}>
-                            {RECORD_FACT_LABELS[diff.field] || diff.field}：{String(diff.existing_value ?? '')} →{' '}
-                            {String(diff.incoming_value ?? '')}
-                          </div>
-                        ))}
+                      <div style={{ color: '#d46b08' }}>
+                        累计播放量：{String(item.update.before ?? '（未观察）')} → {String(item.update.after)}
+                      </div>
                       {(item.diffs || [])
                         .filter((diff) => diff.change_type === 'incoming_missing')
                         .map((diff) => (
@@ -1807,9 +1901,45 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
                     </div>
                   ))}
                   <div style={{ color: '#8c8c8c', marginTop: 6 }}>
-                    已有记录更新暂不自动写入；将在确认更新机制后单独处理。
+                    更新前会记录当前值，支持按批次回滚；删除 / 其它字段变化不会自动写入。
                   </div>
                 </div>
+              }
+            />
+          )}
+
+          {/* Existing Record Update V0.1：不满足安全更新条件的已有记录变化 → 需人工处理 */}
+          {updatePlan.manualReview.length > 0 && (
+            <Alert
+              type="info"
+              showIcon
+              message={`${updatePlan.manualReview.length} 条已有记录变化需人工处理（不自动写入）`}
+              description={
+                <div style={{ maxHeight: 200, overflow: 'auto' }}>
+                  {updatePlan.manualReview.map((item) => (
+                    <div key={item.row.rowIndex} style={{ marginBottom: 6 }}>
+                      Excel 第{item.row.rowIndex}行：{item.row.nickname}；{item.update?.reason}
+                    </div>
+                  ))}
+                </div>
+              }
+            />
+          )}
+
+          {/* mixed：显式选择是否同时更新已有记录（默认不勾选，只导入新增） */}
+          {hasNewRecords && updatePlan.safeUpdates.length > 0 && (
+            <Alert
+              type="warning"
+              showIcon
+              message={
+                <Checkbox checked={includeUpdates} onChange={(e) => setIncludeUpdates(e.target.checked)}>
+                  同时更新 {updatePlan.safeUpdates.length} 条已有记录的累计播放量
+                </Checkbox>
+              }
+              description={
+                <span style={{ color: '#8c8c8c' }}>
+                  不勾选时只导入新增记录；勾选后会在同一批次内更新已有记录，并记录更新前的值以支持回滚。
+                </span>
               }
             />
           )}
@@ -1821,7 +1951,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
               showIcon
               message={`不导入 ${excludedImportRows.length} 条（完全重复 ${
                 importStats.完全重复
-              } 条 · 已有记录更新 ${importStats.已有记录更新} 条 · 已有无新增信息 ${
+              } 条 · 需人工处理 ${importStats.需人工处理} 条 · 已有无新增信息 ${
                 importStats.已有记录无新增信息
               } 条 · 身份待确认 ${importStats.需人工确认身份} 条）`}
               description={

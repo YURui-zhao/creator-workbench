@@ -73,9 +73,29 @@ db.exec(`
     reason TEXT
   );
 
+  -- Import 对已有投放记录的字段级更新审计（Existing Record Update V0.1）
+  -- 说明：
+  --   · 与新建记录分开：只记录「哪个批次、哪条记录、哪个字段、更新前/后」，
+  --     不复制 creator_records 的其它业务数据（creator_records 仍是事实来源）
+  --   · 无 FK，保持本库既有风格
+  --   · before/after 用 JSON 表达，保留 0 与 NULL 的区别（0 = 已观察真实 0，NULL = 未观察）
+  --   · 本阶段 field_name 实际只有 second_week_play
+  CREATE TABLE IF NOT EXISTS import_batch_record_updates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL,
+    record_id INTEGER NOT NULL,
+    field_name TEXT NOT NULL,
+    before_value_json TEXT,
+    after_value_json TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(batch_id, record_id, field_name)
+  );
+
   CREATE INDEX IF NOT EXISTS idx_import_batches_created_at ON import_batches(created_at);
   CREATE INDEX IF NOT EXISTS idx_import_batch_records_batch ON import_batch_records(batch_id);
   CREATE INDEX IF NOT EXISTS idx_import_batch_items_batch ON import_batch_items(batch_id);
+  CREATE INDEX IF NOT EXISTS idx_import_batch_updates_batch ON import_batch_record_updates(batch_id);
+  CREATE INDEX IF NOT EXISTS idx_import_batch_updates_record ON import_batch_record_updates(record_id);
 
   -- V3-alpha P2B：达人近期表现快照（append-only，只保存人工确认后的结构化数据）
   -- 说明：

@@ -197,22 +197,24 @@ async function main() {
   check('导入列表来自 newRecords', /result\.validRows = classification\.newRecords\.map\(\(item\) => item\.row\)/.test(modalSrc))
   check('excluded（exact/noop/changed/uncertain）不进 validRows / 不进 POST', /excludedRowsRef\.current = \[/.test(modalSrc) && /const excludedImportRows = useMemo/.test(modalSrc))
   check('不再使用 10 字段 fingerprint dedupe', !/dedupeImportRows|identityFingerprint/.test(modalSrc))
-  check('预览区分新记录 / 已有更新 / 无新增信息 / 完全重复', /新记录（可导入）/.test(modalSrc) && /已有记录更新/.test(modalSrc) && /已有记录无新增信息/.test(modalSrc) && /完全重复/.test(modalSrc))
+  check('预览区分新记录 / 可安全更新 / 需人工处理 / 无新增信息 / 完全重复',
+    /新记录（可导入）/.test(modalSrc) && /可安全更新/.test(modalSrc) && /需人工处理/.test(modalSrc) &&
+      /已有记录无新增信息/.test(modalSrc) && /完全重复/.test(modalSrc))
   check(
-    '已有记录更新只展示 diff，无更新按钮',
-    /检测到 \$\{identityReview\.existingChanged\.length\} 条已有记录的数据变化/.test(modalSrc) &&
-      /已有记录更新暂不自动写入/.test(modalSrc) &&
-      /不会新增重复记录，也不会覆盖旧记录/.test(modalSrc) &&
-      !/一键更新|更新旧记录|批量更新|覆盖已有记录/.test(modalSrc)
+    '已有记录更新拆分为「可安全更新 / 需人工处理」，且无整行覆盖入口',
+    /可安全更新已有记录（\$\{updatePlan\.safeUpdates\.length\}）/.test(modalSrc) &&
+      /条已有记录变化需人工处理（不自动写入）/.test(modalSrc) &&
+      !/一键更新|更新旧记录|批量更新|覆盖已有记录|整行覆盖/.test(modalSrc)
   )
   check(
     '预览仍保留 跳过 / 需确认 / 失败 统计卡片',
     /title="跳过"/.test(modalSrc) && /title="需确认"/.test(modalSrc) && /title="失败"/.test(modalSrc)
   )
   check(
-    '批次行级状态只用后端允许的 success/fail/skip/duplicate（不写入 changed/noop）',
+    '批次行级状态只用后端允许的 success/fail/skip/duplicate/updated（不写入 changed/noop）',
     !/status: 'changed'/.test(modalSrc) && !/status: 'noop'/.test(modalSrc) &&
-      /status: item\.kind === 'identity_uncertain' \? 'skip' : 'duplicate'/.test(modalSrc)
+      /status:\s*[\s\S]{0,120}?identity_uncertain[\s\S]{0,80}?'skip'/.test(modalSrc) &&
+      /status: 'updated'/.test(modalSrc)
   )
 
   console.log('\n===== 8. Preview 可用性 gate（update-only / 全重复文件不得被 Step 2 拦死） =====')
@@ -269,12 +271,15 @@ async function main() {
     /!isPreviewEligible\(\{/.test(modalSrc) && !/if \(!result\.validRows\.length && !result\.failedRows\.length/.test(modalSrc))
   check('无新记录时主操作不是「确认导入（0 条）」',
     /const hasNewRecords = importableRows\.length > 0/.test(modalSrc) &&
-      /hasNewRecords \? `确认导入（\$\{importableRows\.length\} 条）` : '当前无新记录可导入'/.test(modalSrc))
+      /`更新已有记录（\$\{safeUpdateCount\} 条）`/.test(modalSrc) &&
+      /'当前无新记录可导入'/.test(modalSrc) &&
+      !/确认导入（0 条）/.test(modalSrc))
   check('update-only 不会 POST 空新增批次（handleConfirm 提前返回 + 按钮禁用）',
-    /if \(!importableRows\.length\) return/.test(modalSrc) && /disabled=\{importableRows\.length === 0\}/.test(modalSrc))
+    /if \(!importableRows\.length && !updateIntents\.length\) return/.test(modalSrc) &&
+      /const confirmDisabled = importing \|\| \(!hasNewRecords && updateIntents\.length === 0\)/.test(modalSrc))
   check('Preview 展示准确的「无新记录 / 未发现新记录或可更新数据」状态',
     /未发现新记录或可更新数据。/.test(modalSrc) &&
-      /当前无新记录可导入（检测到 \$\{identityReview\.existingChanged\.length\} 条已有记录的数据变化）/.test(modalSrc))
+      /当前无新记录可导入；可安全更新 \$\{safeUpdateCount\} 条已有记录/.test(modalSrc))
 }
 
 main()

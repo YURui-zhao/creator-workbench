@@ -552,6 +552,114 @@ export function isPreviewEligible({
   return newCount + existingCount + failedCount + confirmationCount > 0
 }
 
+// ---------- Existing Record Update V0.1（安全更新已有记录） ----------
+//
+// 范围极窄：**只允许** second_week_play（累计播放量）且只允许安全增长。
+// 其它字段（total_cost / first_play / publish_date / creator_type / homepage / content_link）
+// 以及累计播放量下降，一律进入 manual_review，绝不自动覆盖。
+export const UPDATE_FIELD = 'second_week_play'
+
+/**
+ * 判定一条 existing_changed 是否属于「可安全更新」
+ * safe_update 条件（全部满足）：
+ *   1. identity 已通过 normalized video_link 唯一匹配（进入 existingChanged 即保证）
+ *   2. incoming second_week_play 是有限数字
+ *   3. incoming second_week_play >= 0
+ *   4. existing second_week_play 为 null/缺失，或 incoming > existing（只允许增长）
+ *   5. 若 effective first_play 是有效观测值：incoming >= first_play
+ *      （effective first_play = Excel 提供时用 Excel 值，否则沿用 DB 已有值）
+ *   6. 除 incoming_missing 外，不存在其它 effective changed/new_information 字段
+ *
+ * @returns {{ safe: boolean, reason: string, field: string, before: number|null, after: number|null }}
+ */
+export function evaluateImportUpdate(item = {}) {
+  const existingRow = item.existingRow || {}
+  const incomingRow = item.row || {}
+  const diffs = Array.isArray(item.diffs) ? item.diffs : []
+  const base = { field: UPDATE_FIELD, before: null, after: null }
+
+  // 条件 6：除累计播放量外还有其它真实变化 → 人工处理
+  const effective = diffs.filter((diff) => diff.change_type !== 'incoming_missing')
+  const otherChanges = effective.filter((diff) => diff.field !== UPDATE_FIELD)
+  if (otherChanges.length > 0) {
+    return {
+      ...base,
+      safe: false,
+      reason: `除累计播放量外还存在其它字段变化（${otherChanges
+        .map((diff) => RECORD_FACT_LABELS[diff.field] || diff.field)
+        .join('、')}），需人工处理`
+    }
+  }
+
+  const playDiff = effective.find((diff) => diff.field === UPDATE_FIELD)
+  if (!playDiff) {
+    return { ...base, safe: false, reason: '未检测到可安全更新的累计播放量变化，需人工处理' }
+  }
+
+  const after = normalizeFactValue(incomingRow[UPDATE_FIELD])
+  const beforeRaw = normalizeFactValue(existingRow[UPDATE_FIELD])
+  const before = beforeRaw === '' ? null : beforeRaw
+  // 条件 2 / 3：必须是有限数字且 >= 0
+  if (after === '' || typeof after !== 'number' || !Number.isFinite(after) || after < 0) {
+    return { ...base, before, safe: false, reason: '累计播放量不是有效的非负数字，需人工处理' }
+  }
+  // 条件 4：只允许增长（DB 为 null 时允许首次写入）
+  if (before !== null && !(after > before)) {
+    return {
+      ...base,
+      before,
+      after,
+      safe: false,
+      reason: '累计播放量未增长（不自动下调 / 不覆盖），需人工处理'
+    }
+  }
+  // 条件 5：更新后不得小于 7 日播放量（effective first_play）
+  const incomingFirst = normalizeFactValue(incomingRow.first_play)
+  const existingFirst = normalizeFactValue(existingRow.first_play)
+  const effectiveFirst = incomingFirst !== '' ? incomingFirst : existingFirst
+  if (effectiveFirst !== '' && typeof effectiveFirst === 'number' && Number.isFinite(effectiveFirst)) {
+    if (after < effectiveFirst) {
+      return {
+        ...base,
+        before,
+        after,
+        safe: false,
+        reason: '累计播放量小于7日播放量，需人工处理'
+      }
+    }
+  }
+  return { safe: true, reason: '仅累计播放量安全增长', field: UPDATE_FIELD, before, after }
+}
+
+/**
+ * 把 existing_changed 拆成「可安全更新」与「需人工处理」
+ * @returns {{ safeUpdates: Array, manualReview: Array }}
+ */
+export function splitExistingChanges(existingChanged = []) {
+  const safeUpdates = []
+  const manualReview = []
+  for (const item of Array.isArray(existingChanged) ? existingChanged : []) {
+    const verdict = evaluateImportUpdate(item)
+    if (verdict.safe) safeUpdates.push({ ...item, update: verdict })
+    else manualReview.push({ ...item, update: verdict })
+  }
+  return { safeUpdates, manualReview }
+}
+
+/**
+ * 由 safeUpdates 生成后端的更新意图（前端只提交 record_id / expected_before / desired_after；
+ * 绝不提交任意 field_name —— V0.1 后端固定更新 second_week_play）
+ */
+export function buildUpdateIntents(safeUpdates = []) {
+  return (Array.isArray(safeUpdates) ? safeUpdates : [])
+    .filter((item) => item?.existingRow?.id && item?.update?.safe)
+    .map((item) => ({
+      record_id: item.existingRow.id,
+      expected_before: item.update.before,
+      desired_after: item.update.after
+    }))
+}
+
 // ---------- 日期与单元格归一化 ----------
 function excelSerialToDate(serial) {
   const ms = Date.UTC(1899, 11, 30) + Math.floor(serial) * 86400000

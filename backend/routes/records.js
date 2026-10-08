@@ -2169,7 +2169,61 @@ router.get('/export', (req, res) => {
  * @param {number[]} insertedIds 本次入库的记录 ID
  * @returns {number|null} 批次 ID（无元数据时返回 null，不写日志）
  */
-function saveImportBatch(meta, successCount, insertedIds = []) {
+// Existing Record Update V0.1：导入阶段允许更新的字段（后端固定，不接受前端传 field_name）
+const IMPORT_UPDATE_FIELD = 'second_week_play'
+// 乐观并发冲突文案（preview 之后该记录的累计播放量又变了）
+const UPDATE_CONCURRENCY_MSG = '记录在预览后已发生变化，请刷新导入预览后重新确认。'
+
+// 把「未观察 / 空」统一成 null；数字（含数字字符串）保持数值；其余为非法
+function toNullableNumber(value) {
+  if (value === null || value === undefined) return null
+  if (typeof value === 'string' && value.trim() === '') return null
+  const num = Number(value)
+  return Number.isFinite(num) ? num : NaN
+}
+
+/**
+ * 解析并做「形状」校验导入更新意图（权威校验在事务内重新执行）
+ * 入参：updates: [{ record_id, expected_before, desired_after }]
+ * 注意：前端不提交 field_name —— V0.1 后端固定更新 second_week_play。
+ * @returns {{ intents?: Array, error?: string }}
+ */
+function parseImportUpdateIntents(raw) {
+  if (!Array.isArray(raw)) return { error: 'updates 必须是数组' }
+  if (raw.length > 1000) return { error: '单次批量导入的更新不能超过 1000 条' }
+  const intents = []
+  const seen = new Set()
+  for (let i = 0; i < raw.length; i++) {
+    const item = raw[i] && typeof raw[i] === 'object' ? raw[i] : {}
+    const recordId = Number(item.record_id)
+    if (!Number.isSafeInteger(recordId) || recordId <= 0) {
+      return { error: `第 ${i + 1} 条更新缺少合法的 record_id` }
+    }
+    if (seen.has(recordId)) return { error: '同一条记录不能在本次导入中重复更新' }
+    seen.add(recordId)
+    const expectedBefore = toNullableNumber(item.expected_before)
+    if (Number.isNaN(expectedBefore) || (expectedBefore !== null && expectedBefore < 0)) {
+      return { error: `第 ${i + 1} 条更新的 expected_before 非法` }
+    }
+    const desiredAfter = toNullableNumber(item.desired_after)
+    if (desiredAfter === null || Number.isNaN(desiredAfter) || desiredAfter < 0) {
+      return { error: `第 ${i + 1} 条更新的 desired_after 必须为 >= 0 的数字` }
+    }
+    intents.push({ recordId, expectedBefore, desiredAfter })
+  }
+  return { intents }
+}
+
+/**
+ * 写入导入批次日志 + 更新审计（在调用方的事务内执行，保证与 INSERT/UPDATE 原子）
+ * 注意：以实际入库条数作为 success_count，避免客户端统计与真实入库不一致
+ * @param {Object|null} meta 前端传入的批次元数据
+ * @param {number} successCount 实际新增入库条数
+ * @param {number[]} insertedIds 本次新增入库的记录 ID
+ * @param {Array} updateIntents 本次更新的意图 [{ recordId, expectedBefore, desiredAfter }]
+ * @returns {number|null} 批次 ID（无元数据时返回 null，不写日志）
+ */
+function writeImportBatch(meta, successCount, insertedIds = [], updateIntents = []) {
   if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return null
   const toCount = (value) => {
     const num = Number(value)
@@ -2195,41 +2249,64 @@ function saveImportBatch(meta, successCount, insertedIds = []) {
   const insertItem = db.prepare(
     'INSERT INTO import_batch_items (batch_id, row_index, status, reason) VALUES (?, ?, ?, ?)'
   )
-  const ALLOWED_STATUS = ['success', 'fail', 'skip', 'duplicate']
+  const insertUpdate = db.prepare(
+    `INSERT INTO import_batch_record_updates
+       (batch_id, record_id, field_name, before_value_json, after_value_json)
+     VALUES (?, ?, ?, ?, ?)`
+  )
+  // updated = 真实完成的已有记录更新（与 duplicate 区分，不再把 update 伪装成 duplicate）
+  const ALLOWED_STATUS = ['success', 'fail', 'skip', 'duplicate', 'updated']
   // 行级明细上限，避免超大文件写入过多日志
   const items = Array.isArray(meta.items) ? meta.items.slice(0, 2000) : []
 
-  const run = db.transaction(() => {
-    const info = insertBatch.run(fileName, totalCount, success, failCount, skipCount, duplicateCount)
-    const batchId = Number(info.lastInsertRowid)
-    for (const recordId of insertedIds) {
-      if (Number.isSafeInteger(recordId) && recordId > 0) insertMapping.run(batchId, recordId)
-    }
-    for (const item of items) {
-      const status = String(item?.status || '').toLowerCase()
-      const rowIndex = Number(item?.rowIndex)
-      insertItem.run(
-        batchId,
-        Number.isFinite(rowIndex) ? rowIndex : null,
-        ALLOWED_STATUS.includes(status) ? status : 'fail',
-        String(item?.reason ?? '').slice(0, 500)
-      )
-    }
-    return batchId
-  })
-  return run()
+  const info = insertBatch.run(fileName, totalCount, success, failCount, skipCount, duplicateCount)
+  const batchId = Number(info.lastInsertRowid)
+  for (const recordId of insertedIds) {
+    if (Number.isSafeInteger(recordId) && recordId > 0) insertMapping.run(batchId, recordId)
+  }
+  for (const item of items) {
+    const status = String(item?.status || '').toLowerCase()
+    const rowIndex = Number(item?.rowIndex)
+    insertItem.run(
+      batchId,
+      Number.isFinite(rowIndex) ? rowIndex : null,
+      ALLOWED_STATUS.includes(status) ? status : 'fail',
+      String(item?.reason ?? '').slice(0, 500)
+    )
+  }
+  // 更新审计：before/after 用 JSON 保留 null 与 0 的区别
+  for (const intent of updateIntents) {
+    insertUpdate.run(
+      batchId,
+      intent.recordId,
+      IMPORT_UPDATE_FIELD,
+      JSON.stringify(intent.expectedBefore),
+      JSON.stringify(intent.desiredAfter)
+    )
+  }
+  return batchId
 }
 
 // ---------- 6. 批量导入（必须先于 /:id 注册） ----------
 router.post('/batch', (req, res) => {
-  // 兼容两种请求体：数组（原有调用）与 { rows, batch }（带导入批次元数据）
+  // 兼容两种请求体：数组（原有调用）与 { rows, batch, updates }（带导入批次元数据 / 已有记录更新）
   const isWrapped = Boolean(req.body) && !Array.isArray(req.body) && Array.isArray(req.body.rows)
   const list = Array.isArray(req.body) ? req.body : isWrapped ? req.body.rows : null
   if (!Array.isArray(list)) {
     return fail(res, 400, '请求体必须是数组，或 { rows: 数组 }')
   }
-  if (list.length === 0) {
-    return ok(res, { count: 0 })
+  // 更新意图只随包装体提交；V0.1 后端固定更新 second_week_play，前端不传 field_name
+  const updatesRaw = isWrapped && req.body.updates !== undefined ? req.body.updates : []
+  if (updatesRaw !== null && !Array.isArray(updatesRaw)) {
+    return fail(res, 400, 'updates 必须是数组')
+  }
+  const { intents: updateIntents, error: updateError } = parseImportUpdateIntents(updatesRaw || [])
+  if (updateError) {
+    return fail(res, 400, updateError)
+  }
+  // 既没有新增也没有更新：保持旧行为（不写批次、不报错）
+  if (list.length === 0 && updateIntents.length === 0) {
+    return ok(res, { count: 0, ids: [], batchId: null, updatedCount: 0, updatedIds: [] })
   }
   if (list.length > 1000) {
     return fail(res, 400, '单次批量导入不能超过 1000 条')
@@ -2254,21 +2331,86 @@ router.post('/batch', (req, res) => {
     rows.push(toRow(clean))
   }
 
-  // 事务批量插入，保证性能与一致性
+  // 单事务：新增 INSERT + 批次日志 + 更新审计 + 已有记录 UPDATE
+  // 任一步失败（含乐观并发冲突）→ 整个批次回滚，绝不 partial success
   const insert = db.prepare(INSERT_SQL)
-  const insertedIds = []
-  const runAll = db.transaction((items) => {
+  const selectRecord = db.prepare(
+    'SELECT id, first_play, second_week_play FROM creator_records WHERE id = ?'
+  )
+  const updatePlay = db.prepare('UPDATE creator_records SET second_week_play = ? WHERE id = ?')
+
+  const conflict = (statusCode, message) => {
+    const error = new Error(message)
+    error.statusCode = statusCode
+    throw error
+  }
+
+  const runAll = db.transaction((items, intents) => {
+    const insertedIds = []
     for (const item of items) {
       const info = insert.run(...COLUMNS.map((col) => item[col]))
       insertedIds.push(Number(info.lastInsertRowid))
     }
+
+    // 先完成所有权威校验并通过后才写入（任一步失败 → 整个事务回滚）
+    const updatedIds = []
+    for (const intent of intents) {
+      // 1. 查记录（权威读取，不接受前端提交的 field_name / 其它字段）
+      const record = selectRecord.get(intent.recordId)
+      if (!record) {
+        conflict(409, `记录 #${intent.recordId} 不存在，无法更新（${UPDATE_CONCURRENCY_MSG}）`)
+      }
+      // 2. 乐观并发：当前值必须等于 preview 时的期望值
+      const currentRaw = record.second_week_play
+      const current =
+        currentRaw === null || currentRaw === undefined ? null : Number(currentRaw)
+      if (current !== intent.expectedBefore) {
+        conflict(409, UPDATE_CONCURRENCY_MSG)
+      }
+      // 3. desired_after 合法（>= 0）
+      if (!Number.isFinite(intent.desiredAfter) || intent.desiredAfter < 0) {
+        conflict(400, '累计播放量必须为 >= 0 的数字')
+      }
+      // 4. 业务规则：累计播放量只允许「安全增长」（后端独立复核，绝不只依赖前端 evaluateImportUpdate）
+      //    · current 为 null → 允许首次写入（>= 0 已在步骤 3 校验）
+      //    · current 为有限数 → desired_after 必须严格大于 current（下降 / 持平一律拒绝，走人工处理）
+      if (current !== null && intent.desiredAfter <= current) {
+        conflict(400, '累计播放量更新必须高于当前值；下降或持平请人工处理。')
+      }
+      // 5. 若 first_play 是有效观测值：更新后的累计播放量不得小于 7 日播放量
+      const firstRaw = record.first_play
+      const first = firstRaw === null || firstRaw === undefined ? null : Number(firstRaw)
+      if (first !== null && Number.isFinite(first) && intent.desiredAfter < first) {
+        conflict(400, PLAY_RANGE_ERROR)
+      }
+      // 6. 审计（before/after JSON，保留 null 与 0）+ 7. 更新
+      updatePlay.run(intent.desiredAfter, intent.recordId)
+      updatedIds.push(intent.recordId)
+    }
+
+    // 校验与更新全部通过后，再写批次日志 + 更新审计（无元数据时 batchId = null，旧调用方行为保持不变）
+    const batchId = isWrapped
+      ? writeImportBatch(req.body.batch, items.length, insertedIds, intents)
+      : null
+
+    return { insertedIds, updatedIds, batchId }
   })
-  runAll(rows)
 
-  // 导入完成后写入批次日志（仅当请求体带 batch 元数据时；旧调用方行为保持不变）
-  const batchId = isWrapped ? saveImportBatch(req.body.batch, rows.length, insertedIds) : null
+  let result
+  try {
+    result = runAll(rows, updateIntents)
+  } catch (error) {
+    if (error && error.statusCode) return fail(res, error.statusCode, error.message)
+    throw error
+  }
 
-  ok(res, { count: rows.length, ids: insertedIds, batchId })
+  ok(res, {
+    count: result.insertedIds.length,
+    ids: result.insertedIds,
+    batchId: result.batchId,
+    updatedCount: result.updatedIds.length,
+    updatedIds: result.updatedIds
+  })
 })
 
 // ---------- 批量操作（批量修改 / 批量删除，必须先于 /:id 注册） ----------

@@ -175,9 +175,17 @@ export function deleteRecord(id) {
  * @param {Object} [batch] 可选：导入批次元数据（文件名与本次导入统计，用于导入历史）
  *   { fileName, totalCount, failCount, skipCount, duplicateCount, items: [{ rowIndex, status, reason }] }
  *   不传时保持原有调用方式（仅导入，不写批次日志）
+ * @param {Array<Object>} [updates] 可选：已有记录的字段级更新意图
+ *   [{ record_id, expected_before, desired_after }]
+ *   注意：前端不提交 field_name —— V0.1 后端固定更新 second_week_play；
+ *   后端会重新校验（乐观并发：当前值必须等于 expected_before）
  */
-export function batchCreateRecords(list, batch) {
-  return request.post('/records/batch', batch ? { rows: list, batch } : list)
+export function batchCreateRecords(list, batch, updates) {
+  const hasUpdates = Array.isArray(updates) && updates.length > 0
+  if (!batch && !hasUpdates) return request.post('/records/batch', list)
+  const body = { rows: list, batch }
+  if (hasUpdates) body.updates = updates
+  return request.post('/records/batch', body)
 }
 
 /**

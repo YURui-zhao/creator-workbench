@@ -521,6 +521,37 @@ export function classifyImportRows(rows = [], existingRows = []) {
   return result
 }
 
+/**
+ * Preview 可用性判定（**与「可新增导入」严格区分**）
+ *
+ * update-only / 全重复文件仍然包含「可处理、可审查」的业务行，必须允许进入 Preview 查看分类结果，
+ * 否则用户会被 Step 2 的「文件中没有有效数据」误拦。
+ *
+ * 只有「完全没有业务行」（例如整份文件都是空行 / 解析失败）才判定为无有效数据。
+ *
+ * @param {Object} params
+ * @param {Object} [params.classification] classifyImportRows 的结果；缺省（拉取已有记录失败）时退化为解析行数
+ * @param {number} [params.parsedValidCount] 未分类时解析得到的有效行数
+ * @param {number} [params.failedCount] 本地校验失败行数
+ * @param {number} [params.confirmationCount] 需人工确认行数
+ * @returns {boolean}
+ */
+export function isPreviewEligible({
+  classification = null,
+  parsedValidCount = 0,
+  failedCount = 0,
+  confirmationCount = 0
+} = {}) {
+  const newCount = classification ? classification.newRecords.length : parsedValidCount
+  const existingCount = classification
+    ? classification.exactDuplicates.length +
+      classification.existingNoop.length +
+      classification.existingChanged.length +
+      classification.identityUncertain.length
+    : 0
+  return newCount + existingCount + failedCount + confirmationCount > 0
+}
+
 // ---------- 日期与单元格归一化 ----------
 function excelSerialToDate(serial) {
   const ms = Date.UTC(1899, 11, 30) + Math.floor(serial) * 86400000

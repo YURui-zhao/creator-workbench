@@ -50,7 +50,7 @@ const mkIncoming = (over = {}) => ({ ...mkExisting(), id: undefined, ...over })
 
 async function main() {
   const excel = await import(pathToFileURL(path.join(root, 'frontend/src/utils/excel.js')).href)
-  const { normalizeRecordIdentityLink, buildRecordFieldDiff, classifyImportRows } = excel
+  const { normalizeRecordIdentityLink, buildRecordFieldDiff, classifyImportRows, isPreviewEligible } = excel
 
   console.log('===== 1. normalizeRecordIdentityLink =====')
   check('trim + host 小写 + 去 www.', normalizeRecordIdentityLink('  https://WWW.IESdouyin.com/a/b/  ') === 'iesdouyin.com/a/b')
@@ -168,7 +168,10 @@ async function main() {
       }
     })
     const real = classifyImportRows(parsed.validRows, existing)
-    check('1008：31 exact_duplicate', real.exactDuplicates.length === 31, String(real.exactDuplicates.length))
+    // 冻结回归（DB 已由 42 条增长到 65 条：此前 23 条真正的新记录已成功导入，
+    //   因此本次重传同一文件时它们全部变为 exact_duplicate，new_record 归零）
+    const businessCount = parsed.validRows.length
+    check('1008：完全重复 = 54（原 31 精确重复 + 已导入的 23 条）', real.exactDuplicates.length === 54, String(real.exactDuplicates.length))
     check('1008：4 existing_noop（687/688/689/690）', real.existingNoop.length === 4 && real.existingNoop.every((x) => [687, 688, 689, 690].includes(x.existingRow.id)), JSON.stringify(real.existingNoop.map((x) => x.existingRow.id)))
     check('1008：7 existing_changed（715/716/718/719/720/721/722）', real.existingChanged.length === 7 && real.existingChanged.every((x) => [715, 716, 718, 719, 720, 721, 722].includes(x.existingRow.id)), JSON.stringify(real.existingChanged.map((x) => x.existingRow.id)))
     check('1008：715 的 first_play 差异为 incoming_missing（不算更新）', (() => {
@@ -176,9 +179,14 @@ async function main() {
       const fp = rec715?.diffs.find((d) => d.field === 'first_play')
       return fp?.change_type === 'incoming_missing' && rec715.diffs.some((d) => d.field === 'second_week_play' && d.change_type === 'changed_value')
     })())
-    check('1008：23 new_record', real.newRecords.length === 23, String(real.newRecords.length))
+    check('1008：0 new_record（重传时无新增）', real.newRecords.length === 0, String(real.newRecords.length))
     check('1008：12 blank', parsed.blankRows === 12, String(parsed.blankRows))
     check('1008：0 identity_uncertain', real.identityUncertain.length === 0)
+    check('1008：分类总数守恒（new+exact+noop+changed == 65 业务行）',
+      real.newRecords.length + real.exactDuplicates.length + real.existingNoop.length + real.existingChanged.length === businessCount &&
+      businessCount === 65,
+      `business=${businessCount}`)
+    check('1008：update-only（0 new）仍可进入 Preview', isPreviewEligible({ classification: real, failedCount: parsed.failedRows.length }) === true)
     db.close()
   } else {
     check('1008.xlsx / 真实库不可用 -> 跳过真实回归（等价 fixture 已覆盖）', true, 'skipped')
@@ -206,6 +214,67 @@ async function main() {
     !/status: 'changed'/.test(modalSrc) && !/status: 'noop'/.test(modalSrc) &&
       /status: item\.kind === 'identity_uncertain' \? 'skip' : 'duplicate'/.test(modalSrc)
   )
+
+  console.log('\n===== 8. Preview 可用性 gate（update-only / 全重复文件不得被 Step 2 拦死） =====')
+  // 用纯函数 isPreviewEligible 覆盖 gate 语义（Preview 可用性 ≠ 可新增导入）
+  const classifyFor = (incoming, existingRows) => classifyImportRows(incoming, existingRows)
+
+  // 场景 1：0 new + 7 changed -> 必须可进入 Preview
+  const existingChangedSet = []
+  const incomingChangedSet = []
+  for (let i = 0; i < 7; i += 1) {
+    const rec = mkExisting({ id: 500 + i, video_link: `https://iesdouyin.com/share/video/chg${i}`, second_week_play: 10000 })
+    existingChangedSet.push(rec)
+    incomingChangedSet.push({ ...rec, id: undefined, second_week_play: 20000 })
+  }
+  const c1 = classifyFor(incomingChangedSet, existingChangedSet)
+  check('场景1：0 new + 7 changed -> canPreview=true', c1.newRecords.length === 0 && c1.existingChanged.length === 7 && isPreviewEligible({ classification: c1 }) === true)
+
+  // 场景 2：0 new + 0 changed + 全重复 -> 仍可进入 Preview（展示「未发现新记录或可更新数据」）
+  const c2 = classifyFor(
+    [0, 1, 2].map((i) => mkExisting({ id: undefined, video_link: `https://iesdouyin.com/share/video/dup${i}` })),
+    [0, 1, 2].map((i) => mkExisting({ id: 700 + i, video_link: `https://iesdouyin.com/share/video/dup${i}` }))
+  )
+  check('场景2：0 new + 0 changed + 3 重复 -> canPreview=true（非「无有效数据」）',
+    c2.newRecords.length === 0 && c2.existingChanged.length === 0 && c2.exactDuplicates.length === 3 && isPreviewEligible({ classification: c2 }) === true)
+
+  // 场景 3：0 new + identity_uncertain -> 可进入 Preview 做人工确认
+  const c3 = classifyFor([mkExisting({ id: undefined, video_link: '' })], [mkExisting()])
+  check('场景3：0 new + identity_uncertain -> canPreview=true',
+    c3.newRecords.length === 0 && c3.identityUncertain.length === 1 && isPreviewEligible({ classification: c3 }) === true)
+
+  // 场景 4：23 new + 7 changed -> 混合模式仍可进入 Preview
+  const mixedExisting = [...existingChangedSet]
+  const mixedIncoming = [
+    ...incomingChangedSet,
+    ...Array.from({ length: 23 }, (_, i) => mkExisting({ id: undefined, video_link: `https://iesdouyin.com/share/video/new${i}` }))
+  ]
+  const c4 = classifyFor(mixedIncoming, mixedExisting)
+  check('场景4：23 new + 7 changed -> canPreview=true（原混合路径不受影响）',
+    c4.newRecords.length === 23 && c4.existingChanged.length === 7 && isPreviewEligible({ classification: c4 }) === true)
+
+  // 场景 5：完全没有业务行 -> 才判定「文件中没有有效数据」
+  const c5 = classifyFor([], [])
+  check('场景5：0 业务行 -> canPreview=false（唯一「无有效数据」情形）',
+    isPreviewEligible({ classification: c5, failedCount: 0, confirmationCount: 0 }) === false)
+  check('场景5b：parse 失败行 / 需确认行也算业务行 -> canPreview=true',
+    isPreviewEligible({ classification: null, parsedValidCount: 0, failedCount: 1 }) === true &&
+      isPreviewEligible({ classification: null, parsedValidCount: 0, confirmationCount: 2 }) === true)
+  check('场景5c：拉取已有记录失败（无 classification）时按解析行数判定',
+    isPreviewEligible({ classification: null, parsedValidCount: 23 }) === true &&
+      isPreviewEligible({ classification: null, parsedValidCount: 0 }) === false)
+
+  console.log('\n===== 9. update-only 语义（源码级） =====')
+  check('gate 使用 isPreviewEligible（不再用 !validRows.length 判「无有效数据」）',
+    /!isPreviewEligible\(\{/.test(modalSrc) && !/if \(!result\.validRows\.length && !result\.failedRows\.length/.test(modalSrc))
+  check('无新记录时主操作不是「确认导入（0 条）」',
+    /const hasNewRecords = importableRows\.length > 0/.test(modalSrc) &&
+      /hasNewRecords \? `确认导入（\$\{importableRows\.length\} 条）` : '当前无新记录可导入'/.test(modalSrc))
+  check('update-only 不会 POST 空新增批次（handleConfirm 提前返回 + 按钮禁用）',
+    /if \(!importableRows\.length\) return/.test(modalSrc) && /disabled=\{importableRows\.length === 0\}/.test(modalSrc))
+  check('Preview 展示准确的「无新记录 / 未发现新记录或可更新数据」状态',
+    /未发现新记录或可更新数据。/.test(modalSrc) &&
+      /当前无新记录可导入（检测到 \$\{identityReview\.existingChanged\.length\} 条已有记录的数据变化）/.test(modalSrc))
 }
 
 main()

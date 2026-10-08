@@ -40,6 +40,7 @@ import {
   isMappingReviewComplete,
   MAPPING_FIELD_OPTIONS,
   classifyImportRows,
+  isPreviewEligible,
   RECORD_FACT_LABELS,
   detectMappingConflicts,
   exportFailedRowsToExcel,
@@ -878,10 +879,11 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
       excludedRowsRef.current = []
       setIdentityReview(null)
       setSkippedRowIndexes([])
+      let classification = null
       try {
         const existing = await fetchAllRecords()
         // record identity：只有 newRecords 允许导入；其余（exact / noop / changed / uncertain）只识别不写入
-        const classification = classifyImportRows(result.validRows, existing)
+        classification = classifyImportRows(result.validRows, existing)
         setIdentityReview(classification)
         result.validRows = classification.newRecords.map((item) => item.row)
         excludedRowsRef.current = [
@@ -893,7 +895,15 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
       } catch {
         // 拉取已有记录失败时跳过 identity 分类（不阻断解析）
       }
-      if (!result.validRows.length && !result.failedRows.length && !result.confirmationRows?.length) {
+      // Preview 可用性 ≠ 可新增导入（见 isPreviewEligible 注释）
+      if (
+        !isPreviewEligible({
+          classification,
+          parsedValidCount: result.validRows.length,
+          failedCount: result.failedRows?.length || 0,
+          confirmationCount: result.confirmationRows?.length || 0
+        })
+      ) {
         message.warning('文件中没有有效数据')
         return false
       }
@@ -1215,7 +1225,10 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   }
 
   // ---------- 底部按钮 ----------
-  const importLabel = `确认导入（${importableRows.length} 条）`
+  // 预览可用性 ≠ 可新增导入：update-only / 全重复文件也要能进入预览查看分类。
+  // 无新记录时主操作不能是「确认导入（0 条）」，更不能 POST 空批次。
+  const hasNewRecords = importableRows.length > 0
+  const importLabel = hasNewRecords ? `确认导入（${importableRows.length} 条）` : '当前无新记录可导入'
 
   const renderFooter = () => {
     if (!preview) {
@@ -1574,6 +1587,32 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
               </>
             }
           />
+
+          {/* update-only / 全重复文件：允许进入预览查看分类，但明确「没有可新增导入的记录」 */}
+          {identityReview && identityReview.newRecords.length === 0 && (
+            <Alert
+              type={identityReview.existingChanged.length > 0 ? 'warning' : 'info'}
+              showIcon
+              message={
+                identityReview.existingChanged.length > 0
+                  ? `当前无新记录可导入（检测到 ${identityReview.existingChanged.length} 条已有记录的数据变化）`
+                  : '未发现新记录或可更新数据。'
+              }
+              description={
+                identityReview.existingChanged.length > 0 ? (
+                  <div>
+                    本次没有可新增导入的记录；已有记录的变化只做识别与展示，本阶段不会自动写入。
+                    请在下方「已有记录的数据变化」中查看 diff。
+                  </div>
+                ) : (
+                  <div>
+                    文件中的业务行均为已存在记录（完全重复 / 已有记录无新增信息）或需人工确认的行，
+                    本次没有可新增导入的记录。
+                  </div>
+                )
+              }
+            />
+          )}
 
           {/* ============ 阶段一：本地校验结果（解析 + 本地规则，与 AI 无关） ============ */}
           <Divider orientation="left" style={{ margin: '4px 0' }}>

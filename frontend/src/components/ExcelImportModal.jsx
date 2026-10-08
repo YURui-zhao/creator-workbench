@@ -39,7 +39,8 @@ import {
   IGNORE_FIELD,
   isMappingReviewComplete,
   MAPPING_FIELD_OPTIONS,
-  dedupeImportRows,
+  classifyImportRows,
+  RECORD_FACT_LABELS,
   detectMappingConflicts,
   exportFailedRowsToExcel,
   parseRecordsExcel,
@@ -246,8 +247,8 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   const [cycleNotes, setCycleNotes] = useState({})
   // 去重阶段剔除的行（行号 + 原因）：应用时间周期映射后需要继续保持排除
   const excludedRowsRef = useRef([])
-  // 重复行明细（与库中已有记录重复 / 文件内重复），用于统计与明细展示
-  const [duplicateRows, setDuplicateRows] = useState([])
+  // Phase: record identity 分类结果（exact / noop / changed / uncertain / new），用于统计与明细展示
+  const [identityReview, setIdentityReview] = useState(null)
   // 时间周期识别面板中手动「跳过该行」的行号，计入「跳过」统计
   const [skippedRowIndexes, setSkippedRowIndexes] = useState([])
 
@@ -269,10 +270,21 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   // AI 错误仅作为风险提示，不能自行改变本地校验决定的可导入范围。
   const aiErrors = useMemo(() => aiResults.filter((r) => r.level === 'error'), [aiResults])
 
-  // ---------- 导入结果统计（成功 / 失败 / 跳过 / 重复，基于解析结果计算） ----------
+  // ---------- 导入结果统计（新记录 / 已有更新 / 已有无新信息 / 完全重复 / 失败 / 跳过） ----------
+  // 不可导入的行 = exact duplicate + noop + changed + uncertain（都不允许 POST 成新 record）
+  const excludedImportRows = useMemo(() => {
+    if (!identityReview) return []
+    const pick = (list, kind) => (list || []).map((item) => ({ rowIndex: item.row.rowIndex, reason: item.reason, kind }))
+    return [
+      ...pick(identityReview.exactDuplicates, 'exact_duplicate'),
+      ...pick(identityReview.existingNoop, 'existing_noop'),
+      ...pick(identityReview.existingChanged, 'existing_changed'),
+      ...pick(identityReview.identityUncertain, 'identity_uncertain')
+    ]
+  }, [identityReview])
   const duplicateIndexes = useMemo(
-    () => new Set(duplicateRows.map((item) => item.rowIndex)),
-    [duplicateRows]
+    () => new Set(excludedImportRows.map((item) => item.rowIndex)),
+    [excludedImportRows]
   )
   const skippedIndexes = useMemo(() => new Set(skippedRowIndexes), [skippedRowIndexes])
   // 失败明细：排除重复行与手动跳过的行（各自单独统计，避免重复计数）
@@ -291,14 +303,17 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   )
   const importStats = useMemo(
     () => ({
-      成功: importRows.length,
+      新记录: identityReview ? identityReview.newRecords.length : importRows.length,
+      已有记录更新: identityReview ? identityReview.existingChanged.length : 0,
+      已有记录无新增信息: identityReview ? identityReview.existingNoop.length : 0,
+      完全重复: identityReview ? identityReview.exactDuplicates.length : 0,
       需确认: confirmationRows.length,
       失败: failedRows.length,
       // 跳过 = 空白行 + 重复表头行 + 时间周期面板中手动跳过的行
       跳过: (preview?.blankRows || 0) + (preview?.repeatedHeaderRows || 0) + skippedRowIndexes.length,
-      重复: duplicateRows.length
+      需人工确认身份: identityReview ? identityReview.identityUncertain.length : 0
     }),
-    [importRows.length, confirmationRows.length, failedRows.length, preview, skippedRowIndexes.length, duplicateRows.length]
+    [importRows.length, confirmationRows.length, failedRows.length, preview, skippedRowIndexes.length, identityReview]
   )
   const blankRowIndexes = preview?.blankRowIndexes || []
   const headerRowIndexes = preview?.headerRowIndexes || []
@@ -344,7 +359,7 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     setManualEditFromAi(false)
     setManualEditError('')
     manualForm.resetFields()
-    setDuplicateRows([])
+    setIdentityReview(null)
     setSkippedRowIndexes([])
     excludedRowsRef.current = []
     sourceFileRef.current = null
@@ -597,21 +612,15 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
 
   /**
    * applyTimeCycleMapping 会基于 allRows 重新计算有效行，
-   * 这里把去重阶段剔除的重复行重新排除，避免重复数据被放行
+   * 这里把 identity 阶段判为非新增的行重新排除，避免重复 / 更新行被放行成新 record。
+   * 注意：这些行不属于「失败」，因此不再合并进 failedRows（各自单独统计）。
    */
   const reapplyDedupeExclusion = (result) => {
     const excluded = excludedRowsRef.current
     if (!excluded.length) return result
     const excludedIndexes = new Set(excluded.map((item) => item.rowIndex))
     const validRows = result.validRows.filter((row) => !excludedIndexes.has(row.rowIndex))
-    const failedRows = []
-    const seen = new Set()
-    for (const item of [...result.failedRows, ...excluded]) {
-      if (seen.has(item.rowIndex)) continue
-      seen.add(item.rowIndex)
-      failedRows.push(item)
-    }
-    return { ...result, validRows, failedRows }
+    return { ...result, validRows }
   }
 
   const admitValidatedRow = async (checked, rowIndex) => {
@@ -624,17 +633,38 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
     } catch {
       // 与首次解析一致：拉取已有记录失败时仍执行文件内去重。
     }
-    const { duplicateRows: matches } = dedupeImportRows(
+    const classification = classifyImportRows(
       [candidate], [...existing, ...importRows.filter((row) => row.rowIndex !== rowIndex)]
     )
-    if (matches.length) {
-      const duplicate = matches[0]
-      excludedRowsRef.current = [...excludedRowsRef.current, duplicate]
-      setDuplicateRows((current) => [...current, duplicate])
+    if (!classification.newRecords.length) {
+      const notNew = [
+        ...classification.exactDuplicates,
+        ...classification.existingNoop,
+        ...classification.existingChanged,
+        ...classification.identityUncertain
+      ][0]
+      const excluded = { rowIndex, reason: notNew?.reason || '与已有记录相同，未导入' }
+      excludedRowsRef.current = [...excludedRowsRef.current, excluded]
+      setIdentityReview((current) => {
+        if (!current) return current
+        const next = {
+          newRecords: current.newRecords.filter((item) => item.row.rowIndex !== rowIndex),
+          exactDuplicates: [...current.exactDuplicates],
+          existingNoop: [...current.existingNoop],
+          existingChanged: [...current.existingChanged],
+          identityUncertain: [...current.identityUncertain]
+        }
+        if (notNew) {
+          const bucket = classification.exactDuplicates.includes(notNew) ? 'exactDuplicates'
+            : classification.existingNoop.includes(notNew) ? 'existingNoop'
+            : classification.existingChanged.includes(notNew) ? 'existingChanged' : 'identityUncertain'
+          next[bucket].push(notNew)
+        }
+        return next
+      })
       setPreview({
         ...checked,
-        validRows: checked.validRows.filter((row) => row.rowIndex !== rowIndex),
-        failedRows: [...checked.failedRows, duplicate]
+        validRows: checked.validRows.filter((row) => row.rowIndex !== rowIndex)
       })
       setImportRows((current) => current.filter((row) => row.rowIndex !== rowIndex))
       return false
@@ -846,17 +876,22 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
   const runImportPipeline = async (result) => {
       // 自动判定无效数据：与库中已有记录重复、文件内重复的行剔除
       excludedRowsRef.current = []
-      setDuplicateRows([])
+      setIdentityReview(null)
       setSkippedRowIndexes([])
       try {
         const existing = await fetchAllRecords()
-        const { uniqueRows, duplicateRows } = dedupeImportRows(result.validRows, existing)
-        result.validRows = uniqueRows
-        result.failedRows = [...result.failedRows, ...duplicateRows]
-        excludedRowsRef.current = duplicateRows
-        setDuplicateRows(duplicateRows)
+        // record identity：只有 newRecords 允许导入；其余（exact / noop / changed / uncertain）只识别不写入
+        const classification = classifyImportRows(result.validRows, existing)
+        setIdentityReview(classification)
+        result.validRows = classification.newRecords.map((item) => item.row)
+        excludedRowsRef.current = [
+          ...classification.exactDuplicates,
+          ...classification.existingNoop,
+          ...classification.existingChanged,
+          ...classification.identityUncertain
+        ].map((item) => ({ rowIndex: item.row.rowIndex, reason: item.reason }))
       } catch {
-        // 拉取已有记录失败时跳过去重
+        // 拉取已有记录失败时跳过 identity 分类（不阻断解析）
       }
       if (!result.validRows.length && !result.failedRows.length && !result.confirmationRows?.length) {
         message.warning('文件中没有有效数据')
@@ -939,12 +974,19 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
           record
       )
       // 导入批次元数据（写入导入历史）：文件名 + 本次成功/失败/跳过/重复统计 + 行级明细
+      // 说明（本阶段）：后端 import_batch_items.status 仅允许 success/fail/skip/duplicate，
+      //   exact_duplicate / existing_noop / existing_changed 统一记为 duplicate（都属于「已有记录，本次不新增」），
+      //   identity_uncertain 记为 skip（身份待人工确认，未导入）。批量口径与 import_batches 计数保持一致。
+      const existingMatchedCount = identityReview
+        ? identityReview.exactDuplicates.length + identityReview.existingNoop.length + identityReview.existingChanged.length
+        : 0
+      const identityUncertainCount = identityReview ? identityReview.identityUncertain.length : 0
       const batchMeta = {
         fileName: preview?.fileName || '',
-        totalCount: payload.length + confirmationRows.length + failedRows.length + duplicateRows.length + importStats.跳过,
+        totalCount: payload.length + confirmationRows.length + failedRows.length + excludedImportRows.length + importStats.跳过,
         failCount: failedRows.length,
-        skipCount: importStats.跳过 + confirmationRows.length,
-        duplicateCount: duplicateRows.length,
+        skipCount: importStats.跳过 + confirmationRows.length + identityUncertainCount,
+        duplicateCount: existingMatchedCount,
         items: [
           ...importableRows
             .filter((row) => row.manualCorrection || row.sourceCycleConfirmed || row.aiSuggestionAdopted)
@@ -969,10 +1011,14 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
             status: 'fail',
             reason: item.reason || '本地校验或 AI 校验未通过'
           })),
-          ...duplicateRows.map((item) => ({
+          ...excludedImportRows.map((item) => ({
             rowIndex: item.rowIndex,
-            status: 'duplicate',
-            reason: item.reason || '与已有记录重复'
+            status: item.kind === 'identity_uncertain' ? 'skip' : 'duplicate',
+            reason: item.kind === 'existing_changed'
+              ? `同一条已有记录，本次检测到数据变化（本阶段不自动写入）：${item.reason || ''}`
+              : item.kind === 'existing_noop'
+                ? `同一条已有记录，Excel 未提供更强的新信息，未导入：${item.reason || ''}`
+                : item.reason || '与已有记录重复，未导入'
           })),
           ...skippedRowIndexes.map((rowIndex) => ({
             rowIndex,
@@ -1537,14 +1583,59 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
             </Typography.Text>
           </Divider>
 
-          {/* 本地统计：正常行直接可入库；源档期冲突单列为需确认 */}
+          {/* 本地统计：按 record identity 分类（新记录 / 已有更新 / 已有无新信息 / 完全重复 / 需人工确认身份 / 跳过 / 需确认 / 失败） */}
           <Row gutter={[12, 12]}>
             <Col xs={12} md={8}>
               <Card size="small" styles={{ body: { padding: '12px 16px' } }}>
                 <Statistic
-                  title="成功（可入库）"
-                  value={importStats.成功}
+                  title="新记录（可导入）"
+                  value={importStats.新记录}
                   valueStyle={{ color: '#52c41a', fontSize: 22 }}
+                />
+              </Card>
+            </Col>
+            <Col xs={12} md={8}>
+              <Card size="small" styles={{ body: { padding: '12px 16px' } }}>
+                <Statistic
+                  title="已有记录更新"
+                  value={importStats.已有记录更新}
+                  valueStyle={{ color: importStats.已有记录更新 ? '#faad14' : undefined, fontSize: 22 }}
+                />
+              </Card>
+            </Col>
+            <Col xs={12} md={8}>
+              <Card size="small" styles={{ body: { padding: '12px 16px' } }}>
+                <Statistic
+                  title="已有记录无新增信息"
+                  value={importStats.已有记录无新增信息}
+                  valueStyle={{ fontSize: 22 }}
+                />
+              </Card>
+            </Col>
+            <Col xs={12} md={6}>
+              <Card size="small" styles={{ body: { padding: '12px 16px' } }}>
+                <Statistic
+                  title="完全重复"
+                  value={importStats.完全重复}
+                  valueStyle={{ color: importStats.完全重复 ? '#faad14' : undefined, fontSize: 22 }}
+                />
+              </Card>
+            </Col>
+            <Col xs={12} md={6}>
+              <Card size="small" styles={{ body: { padding: '12px 16px' } }}>
+                <Statistic
+                  title="需人工确认身份"
+                  value={importStats.需人工确认身份}
+                  valueStyle={{ color: importStats.需人工确认身份 ? '#faad14' : undefined, fontSize: 22 }}
+                />
+              </Card>
+            </Col>
+            <Col xs={12} md={4}>
+              <Card size="small" styles={{ body: { padding: '12px 16px' } }}>
+                <Statistic
+                  title="跳过"
+                  value={importStats.跳过}
+                  valueStyle={{ fontSize: 22 }}
                 />
               </Card>
             </Col>
@@ -1563,24 +1654,6 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
                   title="失败"
                   value={importStats.失败}
                   valueStyle={{ color: importStats.失败 ? '#ff4d4f' : undefined, fontSize: 22 }}
-                />
-              </Card>
-            </Col>
-            <Col xs={12} md={4}>
-              <Card size="small" styles={{ body: { padding: '12px 16px' } }}>
-                <Statistic
-                  title="跳过"
-                  value={importStats.跳过}
-                  valueStyle={{ fontSize: 22 }}
-                />
-              </Card>
-            </Col>
-            <Col xs={12} md={4}>
-              <Card size="small" styles={{ body: { padding: '12px 16px' } }}>
-                <Statistic
-                  title="重复"
-                  value={importStats.重复}
-                  valueStyle={{ color: importStats.重复 ? '#faad14' : undefined, fontSize: 22 }}
                 />
               </Card>
             </Col>
@@ -1658,17 +1731,65 @@ export default function ExcelImportModal({ open, onCancel, onSuccess }) {
             />
           )}
 
-          {/* 重复明细：与库中已有记录重复 / 文件内重复 */}
-          {duplicateRows.length > 0 && (
+          {/* 已有记录数据变化：只识别 + 展示 diff，本阶段不写入（避免破坏 batch rollback 语义） */}
+          {identityReview && identityReview.existingChanged.length > 0 && (
             <Alert
               type="warning"
               showIcon
-              message={`重复 ${duplicateRows.length} 条（导入时将跳过）`}
+              message={`检测到 ${identityReview.existingChanged.length} 条已有记录的数据变化（本阶段不自动写入）`}
               description={
-                <div style={{ maxHeight: 140, overflow: 'auto' }}>
-                  {duplicateRows.map((item) => (
+                <div style={{ maxHeight: 240, overflow: 'auto' }}>
+                  <div style={{ color: '#8c8c8c', marginBottom: 6 }}>
+                    这些行的视频链接与库中已有记录相同（同一条内容），仅数据有更新；
+                    本阶段只识别与展示，不会新增重复记录，也不会覆盖旧记录。
+                  </div>
+                  {identityReview.existingChanged.map((item) => (
+                    <div key={item.row.rowIndex} style={{ marginBottom: 8 }}>
+                      <div>
+                        Excel 第{item.row.rowIndex}行：{item.row.nickname}；发布日期 {item.row.publish_date}；
+                        视频链接 {item.row.video_link}
+                      </div>
+                      {(item.diffs || [])
+                        .filter((diff) => diff.change_type !== 'incoming_missing')
+                        .map((diff) => (
+                          <div key={diff.field} style={{ color: '#d46b08' }}>
+                            {RECORD_FACT_LABELS[diff.field] || diff.field}：{String(diff.existing_value ?? '')} →{' '}
+                            {String(diff.incoming_value ?? '')}
+                          </div>
+                        ))}
+                      {(item.diffs || [])
+                        .filter((diff) => diff.change_type === 'incoming_missing')
+                        .map((diff) => (
+                          <div key={diff.field} style={{ color: '#8c8c8c' }}>
+                            Excel 未提供{RECORD_FACT_LABELS[diff.field] || diff.field}，保留已有值
+                            {String(diff.existing_value ?? '')}
+                          </div>
+                        ))}
+                    </div>
+                  ))}
+                  <div style={{ color: '#8c8c8c', marginTop: 6 }}>
+                    已有记录更新暂不自动写入；将在确认更新机制后单独处理。
+                  </div>
+                </div>
+              }
+            />
+          )}
+
+          {/* 完全重复 / 已有无新增信息 / 身份待确认：均不导入 */}
+          {excludedImportRows.length > 0 && (
+            <Alert
+              type="warning"
+              showIcon
+              message={`不导入 ${excludedImportRows.length} 条（完全重复 ${
+                importStats.完全重复
+              } 条 · 已有记录更新 ${importStats.已有记录更新} 条 · 已有无新增信息 ${
+                importStats.已有记录无新增信息
+              } 条 · 身份待确认 ${importStats.需人工确认身份} 条）`}
+              description={
+                <div style={{ maxHeight: 200, overflow: 'auto' }}>
+                  {excludedImportRows.map((item) => (
                     <div key={item.rowIndex}>
-                      第 {item.rowIndex} 行：{item.reason}
+                      Excel 第 {item.rowIndex} 行：{item.reason}
                     </div>
                   ))}
                 </div>

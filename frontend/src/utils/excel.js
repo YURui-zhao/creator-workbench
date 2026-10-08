@@ -359,57 +359,166 @@ export function findPlayRangeError(row = {}) {
   return null
 }
 
-// 导入去重判定字段（与表格展示列对应）
-const IDENTITY_FIELDS = [
-  'time_cycle',
-  'nickname',
+// ---------- Record Identity（one content/video = one creator_record） ----------
+//
+// 身份只由「视频内容链接」决定：normalizeRecordIdentityLink(video_link) 相同 => 同一条 record。
+// mutable business facts（花费 / 7日播放 / 累计播放 / 类型 / 主页 / 发布日期）**不参与身份判断**，
+// 它们只在「身份已经相同」之后用于比较事实是否变化（精确重复 / 无新增信息 / 有变化）。
+//
+// 历史实现的错误：把 10 个字段（含 second_week_play 等可变事实）整体作为指纹，
+// 导致「累计播放量更新」被误判成新记录（2026-10 的 1008.xlsx：11 条误判）。
+export const IDENTITY_UNCERTAIN = 'identity_uncertain'
+export const IDENTITY_FIELD = 'video_link'
+
+// 事实字段：仅用于同 identity 之后的差异比较，绝不用于判断「是不是同一条记录」
+export const RECORD_FACT_FIELDS = [
   'creator_type',
   'homepage',
   'content_link',
-  'video_link',
   'total_cost',
+  'publish_date',
   'first_play',
-  'second_week_play',
-  'publish_date'
+  'second_week_play'
 ]
 
-// 归一化用于指纹比对的单元格值（数字与数字字符串视为相同）
-function normalizeIdentityValue(value) {
-  if (value === undefined || value === null) return ''
-  if (typeof value === 'number') return value
-  const text = String(value).trim()
-  const num = Number(text)
-  return text !== '' && Number.isFinite(num) ? num : text
-}
-
-function identityFingerprint(row) {
-  return JSON.stringify(IDENTITY_FIELDS.map((field) => normalizeIdentityValue(row[field])))
+export const RECORD_FACT_LABELS = {
+  creator_type: '达人类型',
+  homepage: '达人主页',
+  content_link: '植入内容链接',
+  total_cost: '总花费',
+  publish_date: '发布日期',
+  first_play: '7日播放量',
+  second_week_play: '累计播放量'
 }
 
 /**
- * 剔除无效（重复）数据：与库中已有记录重复、或文件内部重复的行都会被剔除
- * @param {Array<Object>} rows 解析后的有效行（含 rowIndex）
- * @param {Array<Object>} existingRows 数据库已有记录
- * @returns {{ uniqueRows: Array<Object>, duplicateRows: Array<{ rowIndex: number, reason: string }> }}
+ * 记录身份链接归一化（纯函数，确定性；不做短链展开 / 不做 AI / 不做 fuzzy）
+ *   · trim、去 query、去 fragment、去 trailing slash
+ *   · hostname 去 www.、去端口、小写；scheme（http/https/协议相对）不影响身份
+ *   · 空 / 缺失 => ''（调用方据此判为 identity_uncertain，不得自动判重复或新增）
  */
-export function dedupeImportRows(rows, existingRows = []) {
-  const seen = new Set(existingRows.map((row) => identityFingerprint(row)))
-  const uniqueRows = []
-  const duplicateRows = []
+export function normalizeRecordIdentityLink(url) {
+  if (url === null || url === undefined) return ''
+  const raw = String(url).trim()
+  if (!raw) return ''
+  const withoutHash = raw.split('#')[0]
+  const withoutQuery = withoutHash.split('?')[0]
+  const withoutScheme = withoutQuery.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, '')
+  const hostAndPath = withoutScheme.replace(/^\/\//, '')
+  const slashIndex = hostAndPath.indexOf('/')
+  const hostPart = slashIndex === -1 ? hostAndPath : hostAndPath.slice(0, slashIndex)
+  const pathPart = slashIndex === -1 ? '' : hostAndPath.slice(slashIndex)
+  const host = hostPart.toLowerCase().replace(/^www\./, '').replace(/:\d+$/, '')
+  const path = pathPart.replace(/\/+$/, '')
+  return `${host}${path}`
+}
 
-  for (const row of rows) {
-    const key = identityFingerprint(row)
-    if (seen.has(key)) {
-      duplicateRows.push({
-        rowIndex: row.rowIndex,
-        reason: '与已有记录重复（时间周期、昵称、博主类型、主页、链接、花费、播放量、日期均相同）'
+/** 事实值归一化：数字与数字字符串等价；0 是真实值；空字符串/null/undefined 表示「未提供」 */
+function normalizeFactValue(value) {
+  if (value === undefined || value === null) return ''
+  if (typeof value === 'number') return Number.isFinite(value) ? value : ''
+  const text = String(value).trim()
+  if (text === '') return ''
+  const num = Number(text)
+  return Number.isFinite(num) ? num : text
+}
+
+/**
+ * 字段级差异（事实比较，不使用「整行覆盖」思维）
+ * change_type：
+ *   · incoming_missing —— Excel 未提供该事实（含 DB 有值 / DB 为 0），**绝不视作需要覆盖**
+ *   · new_information  —— DB 空、Excel 提供了值（真正的新事实）
+ *   · changed_value    —— 两边都有值且不同（真正的事实变化）
+ */
+export function buildRecordFieldDiff(existingRow = {}, incomingRow = {}) {
+  const diffs = []
+  for (const field of RECORD_FACT_FIELDS) {
+    const existing = normalizeFactValue(existingRow?.[field])
+    const incoming = normalizeFactValue(incomingRow?.[field])
+    let changeType = null
+    if (incoming === '') changeType = 'incoming_missing'
+    else if (existing === '') changeType = 'new_information'
+    else if (String(existing) !== String(incoming)) changeType = 'changed_value'
+    if (changeType) {
+      diffs.push({
+        field,
+        label: RECORD_FACT_LABELS[field] || field,
+        existing_value: existingRow?.[field] ?? null,
+        incoming_value: incomingRow?.[field] ?? null,
+        change_type: changeType
       })
-    } else {
-      seen.add(key)
-      uniqueRows.push(row)
     }
   }
-  return { uniqueRows, duplicateRows }
+  return diffs
+}
+
+/** 只有「真正的新事实」才允许进入 existing_changed（incoming_missing 永远不算变化） */
+function hasUpdatableChange(diffs) {
+  return diffs.some((diff) => diff.change_type !== 'incoming_missing')
+}
+
+/**
+ * 导入分类（替换 10 字段 fingerprint dedupe）
+ * @returns {{ newRecords: Array, exactDuplicates: Array, existingNoop: Array, existingChanged: Array, identityUncertain: Array }}
+ *   每项形如 { row, existingRow?, diffs?, reason }
+ */
+export function classifyImportRows(rows = [], existingRows = []) {
+  const byIdentity = new Map()
+  const ambiguousIdentities = new Set()
+  for (const record of existingRows) {
+    const key = normalizeRecordIdentityLink(record?.[IDENTITY_FIELD])
+    if (!key) continue
+    if (byIdentity.has(key)) ambiguousIdentities.add(key)
+    else byIdentity.set(key, record)
+  }
+
+  const result = {
+    newRecords: [],
+    exactDuplicates: [],
+    existingNoop: [],
+    existingChanged: [],
+    identityUncertain: []
+  }
+  const seenIncoming = new Map()
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const key = normalizeRecordIdentityLink(row?.[IDENTITY_FIELD])
+    if (!key) {
+      result.identityUncertain.push({ row, reason: '缺少可用于判定记录身份的视频链接，需人工确认' })
+      continue
+    }
+    if (seenIncoming.has(key)) {
+      // 文件内部重复：与本次已出现的第一条比较（不重复导入）
+      const first = seenIncoming.get(key)
+      const diffs = buildRecordFieldDiff(first, row)
+      if (diffs.length === 0) {
+        result.exactDuplicates.push({ row, existingRow: first, diffs, reason: '文件内重复（同一视频链接，事实一致）' })
+      } else {
+        result.existingChanged.push({ row, existingRow: first, diffs, reason: '文件内重复（同一视频链接，事实不同）' })
+      }
+      continue
+    }
+    seenIncoming.set(key, row)
+
+    if (ambiguousIdentities.has(key)) {
+      result.identityUncertain.push({ row, reason: '该视频链接在库中对应多条记录，无法确定身份' })
+      continue
+    }
+    const existing = byIdentity.get(key)
+    if (!existing) {
+      result.newRecords.push({ row })
+      continue
+    }
+    const diffs = buildRecordFieldDiff(existing, row)
+    if (hasUpdatableChange(diffs)) {
+      result.existingChanged.push({ row, existingRow: existing, diffs, reason: '同一条记录，但出现新的事实变化' })
+    } else if (diffs.length === 0) {
+      result.exactDuplicates.push({ row, existingRow: existing, diffs, reason: '与已有记录完全重复（同一视频链接，事实一致）' })
+    } else {
+      result.existingNoop.push({ row, existingRow: existing, diffs, reason: '与已有记录同一条，Excel 未提供更强的新信息' })
+    }
+  }
+  return result
 }
 
 // ---------- 日期与单元格归一化 ----------

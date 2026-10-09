@@ -130,6 +130,37 @@ async function main() {
   const callHistorical = (body) => call(postHistorical, { body })
   const callGet = (query) => call(getCases, { query })
 
+  // ================= 0. GET 契约（此时 cases 表为空） =================
+  console.log('\n===== 0. GET / 查询契约（空表） =====')
+  check('前置：cases 表为空', countCases() === 0)
+  const emptyBySource = callGet({ source_type: 'historical_backfill' })
+  check(
+    '1：GET ?source_type=historical_backfill（0 rows）→ 200 且 cases = []',
+    emptyBySource.statusCode === 200 &&
+      Array.isArray(emptyBySource.payload?.data?.cases) &&
+      emptyBySource.payload.data.cases.length === 0
+  )
+  const emptyByRecord = callGet({ record_id: '920' })
+  check(
+    '3：GET ?record_id=920（0 rows）→ 200 且 []',
+    emptyByRecord.statusCode === 200 && emptyByRecord.payload?.data?.cases.length === 0
+  )
+  const emptyByCombo = callGet({ record_id: '920', source_type: 'historical_backfill' })
+  check(
+    '4：GET ?record_id=920&source_type=historical_backfill（0 rows）→ 200 且 []',
+    emptyByCombo.statusCode === 200 && emptyByCombo.payload?.data?.cases.length === 0
+  )
+  const noFilter = callGet({})
+  check(
+    '旧防护保留：无任何 filter → 400（提示含全部 4 个受支持条件）',
+    noFilter.statusCode === 400 &&
+      /creator \/ decision_id \/ record_id \/ source_type/.test(noFilter.payload?.msg || '')
+  )
+  const badSourceType = callGet({ source_type: 'made_up' })
+  check('source_type 非法值 → 400', badSourceType.statusCode === 400)
+  const badRecordId = callGet({ record_id: 'abc' })
+  check('record_id 非法值 → 400', badRecordId.statusCode === 400)
+
   // ================= 1. 必须绑定 record_id =================
   console.log('\n===== 1. record 锚点 =====')
   const r1 = callHistorical({ negotiated_price: 4500, negotiated_at: '2026-06-15' })
@@ -470,6 +501,67 @@ async function main() {
     '23b：同一张 creator_negotiation_cases 同时存在 live 与 historical_backfill',
     historicalCount >= 6 && liveCount === 1 && countCases() === historicalCount + liveCount,
     `historical=${historicalCount} live=${liveCount}`
+  )
+
+  // ================= 24b. GET 契约（有数据） =================
+  console.log('\n===== 24b. GET / 查询契约（有数据） =====')
+  const listBySource = callGet({ source_type: 'historical_backfill' })
+  check(
+    '2：GET ?source_type=historical_backfill 只返回 historical rows',
+    listBySource.statusCode === 200 &&
+      listBySource.payload.data.cases.length === historicalCount &&
+      listBySource.payload.data.cases.every((item) => item.source_type === 'historical_backfill')
+  )
+  const listByRecord = callGet({ record_id: String(recordA) })
+  check(
+    '3b：GET ?record_id=… 只返回该投放记录的案例',
+    listByRecord.statusCode === 200 &&
+      listByRecord.payload.data.cases.length === 1 &&
+      listByRecord.payload.data.cases[0].record_id === recordA
+  )
+  // 组合查询语义为 AND：record_id + source_type 只应命中所属记录（而不是全量 historical）
+  const listByCombo = callGet({ record_id: String(recordA), source_type: 'historical_backfill' })
+  check(
+    '4b：GET ?record_id=…&source_type=historical_backfill 组合为 AND（仅命中该记录）',
+    listByCombo.statusCode === 200 &&
+      listByCombo.payload.data.cases.length === 1 &&
+      listByCombo.payload.data.cases[0].record_id === recordA
+  )
+  const listByCreator = callGet({ creator: '怪有道理' })
+  check(
+    '5：旧 creator filter 继续正常',
+    listByCreator.statusCode === 200 &&
+      listByCreator.payload.data.cases.length === 1 &&
+      listByCreator.payload.data.cases[0].creator === '怪有道理'
+  )
+  const listByDecision = callGet({ decision_id: String(legacyDecisionId) })
+  check(
+    '6：旧 decision_id filter 继续正常',
+    listByDecision.statusCode === 200 &&
+      listByDecision.payload.data.cases.length === 1 &&
+      listByDecision.payload.data.cases[0].decision_id === legacyDecisionId
+  )
+  const historicalOnly = callGet({ source_type: 'live' })
+  check(
+    '2b：source_type=live 只返回 1 条 live case',
+    historicalOnly.payload.data.cases.length === 1 &&
+      historicalOnly.payload.data.cases[0].decision_id === legacyDecisionId
+  )
+  check(
+    '7：historical case 不需要 decision_id（record_id 存在、decision_id 为 null）',
+    listByRecord.payload.data.cases[0].decision_id === null &&
+      listByRecord.payload.data.cases[0].record_id === recordA
+  )
+  // Records 页面标记历史回填的加载路径：请求 ?source_type=historical_backfill 且失败被静默捕获
+  const recordsSrc = fs.readFileSync(path.join(REPO_ROOT, 'frontend/src/pages/Records/index.jsx'), 'utf8')
+  check(
+    '8：Records 页面用 source_type=historical_backfill 加载映射（不再触发旧 400 校验）',
+    /getNegotiationCasesBySourceType\('historical_backfill'\)/.test(recordsSrc) &&
+      listBySource.statusCode === 200
+  )
+  check(
+    '8b：该后台加载失败被静默捕获（不额外弹错，仅由拦截器提示）',
+    /const res = await getNegotiationCasesBySourceType\('historical_backfill'\)[\s\S]{0,300}?catch \{/.test(recordsSrc)
   )
 
   // ================= 25. AI 建议 ≠ 已保存案例（UX 语义） =================

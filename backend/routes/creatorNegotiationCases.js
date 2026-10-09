@@ -316,67 +316,67 @@ router.post('/historical-backfill', (req, res) => {
 /**
  * GET /api/creator-negotiation-cases?creator=... 或 ?decision_id=... 或 ?record_id=...
  *   或 ?source_type=historical_backfill（只读列出历史回填，供 Records 页面标记「已补录谈价」）
- * 时间倒序（created_at DESC, id DESC）
+ *
+ * 契约：
+ *   · 支持 4 个查询条件：creator / decision_id / record_id / source_type
+ *   · 多个条件可组合，语义为 AND（例如 ?record_id=920&source_type=historical_backfill）
+ *   · 仍然要求「至少提供一个受支持的查询条件」（保留旧防护，不做无条件全量开放）
+ *   · 时间倒序（created_at DESC, id DESC）；仅 source_type 全量列举时上限 500 条
  */
 router.get('/', (req, res) => {
   const creator = String(req.query?.creator ?? '').trim()
   const decisionIdRaw = req.query?.decision_id
   const recordIdRaw = req.query?.record_id
   const sourceTypeRaw = String(req.query?.source_type ?? '').trim()
-  if (
-    !creator &&
-    (decisionIdRaw === undefined || decisionIdRaw === '') &&
-    (recordIdRaw === undefined || recordIdRaw === '') &&
-    !sourceTypeRaw
-  ) {
-    return fail(res, 400, 'creator / decision_id / record_id / source_type 至少提供一个')
-  }
-  let rows
+
+  const conditions = []
+  const params = []
+  // source_type（live / historical_backfill）
   if (sourceTypeRaw) {
     if (!NEGOTIATION_SOURCE_TYPES.includes(sourceTypeRaw)) {
       return fail(res, 400, 'source_type 只能是 live 或 historical_backfill')
     }
-    rows = db
-      .prepare(
-        `SELECT * FROM creator_negotiation_cases
-         WHERE source_type = ?
-         ORDER BY created_at DESC, id DESC
-         LIMIT 500`
-      )
-      .all(sourceTypeRaw)
-  } else if (recordIdRaw !== undefined && recordIdRaw !== '') {
+    conditions.push('source_type = ?')
+    params.push(sourceTypeRaw)
+  }
+  // record_id（historical_backfill 的稳定 anchor；不需要 decision_id）
+  if (recordIdRaw !== undefined && recordIdRaw !== '') {
     const recordId = Number(recordIdRaw)
     if (!Number.isInteger(recordId) || recordId <= 0) {
       return fail(res, 400, 'record_id 必须是正整数')
     }
-    rows = db
-      .prepare(
-        `SELECT * FROM creator_negotiation_cases
-         WHERE record_id = ?
-         ORDER BY created_at DESC, id DESC`
-      )
-      .all(recordId)
-  } else if (decisionIdRaw !== undefined && decisionIdRaw !== '') {
+    conditions.push('record_id = ?')
+    params.push(recordId)
+  }
+  // decision_id（live 渠道）
+  if (decisionIdRaw !== undefined && decisionIdRaw !== '') {
     const decisionId = Number(decisionIdRaw)
     if (!Number.isInteger(decisionId) || decisionId <= 0) {
       return fail(res, 400, 'decision_id 必须是正整数')
     }
-    rows = db
-      .prepare(
-        `SELECT * FROM creator_negotiation_cases
-         WHERE decision_id = ?
-         ORDER BY created_at DESC, id DESC`
-      )
-      .all(decisionId)
-  } else {
-    rows = db
-      .prepare(
-        `SELECT * FROM creator_negotiation_cases
-         WHERE creator = ?
-         ORDER BY created_at DESC, id DESC`
-      )
-      .all(creator)
+    conditions.push('decision_id = ?')
+    params.push(decisionId)
   }
+  // creator（创建时名称快照）
+  if (creator) {
+    conditions.push('creator = ?')
+    params.push(creator)
+  }
+
+  // 旧防护保留：至少提供一个受支持的查询条件（不无条件全量开放）
+  if (!conditions.length) {
+    return fail(res, 400, 'creator / decision_id / record_id / source_type 至少提供一个')
+  }
+
+  // 仅按 source_type 全量列举时限制条数；其余（creator / record_id / decision_id）沿用原有不加 limit 的行为
+  const isBulkList = conditions.length === 1 && conditions[0].startsWith('source_type')
+  const rows = db
+    .prepare(
+      `SELECT * FROM creator_negotiation_cases
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY created_at DESC, id DESC${isBulkList ? ' LIMIT 500' : ''}`
+    )
+    .all(...params)
   ok(res, { creator: creator || null, cases: rows.map(toPublicNegotiationCase) })
 })
 

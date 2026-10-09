@@ -216,6 +216,13 @@ db.exec(`
     target_price_snapshot REAL,
     reference_low_snapshot REAL,
     reference_high_snapshot REAL,
+    -- Historical Negotiation Backfill V0.1：
+    --   source_type = live（既有实时谈价工作流）| historical_backfill（历史真实案例回填）
+    --   record_id = 历史回填的稳定身份（live 保持 NULL，仍走 decision_id → outcome/record）
+    --   source_note = 人工维护的历史谈价原始备注（经验蒸馏的人工 source of truth）
+    source_type TEXT NOT NULL DEFAULT 'live',
+    record_id INTEGER,
+    source_note TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(decision_id)
   );
@@ -325,6 +332,34 @@ if (!outcomeColumns.includes('link_evidence_json')) {
   db.exec('ALTER TABLE creator_decision_outcomes ADD COLUMN link_evidence_json TEXT')
   console.log('[db] 已为 creator_decision_outcomes 添加 link_evidence_json 列（旧关联保持 NULL）')
 }
+
+// Historical Negotiation Backfill V0.1：为既有 creator_negotiation_cases 安全补充三个列
+// 说明：
+//   · 只在列不存在时 ALTER TABLE，不修改 / 不迁移任何旧 case（旧行 source_type = 'live'）
+//   · live case 不写 record_id（保持 NULL）；历史回填 case 必须写 record_id
+//   · 索引必须在补列之后创建（老库此刻才有这些列）
+const negotiationCaseColumns = db
+  .prepare('PRAGMA table_info(creator_negotiation_cases)')
+  .all()
+  .map((column) => column.name)
+if (!negotiationCaseColumns.includes('source_type')) {
+  db.exec("ALTER TABLE creator_negotiation_cases ADD COLUMN source_type TEXT NOT NULL DEFAULT 'live'")
+  console.log('[db] 已为 creator_negotiation_cases 添加 source_type 列（旧 case 保持 live）')
+}
+if (!negotiationCaseColumns.includes('record_id')) {
+  db.exec('ALTER TABLE creator_negotiation_cases ADD COLUMN record_id INTEGER')
+  console.log('[db] 已为 creator_negotiation_cases 添加 record_id 列（旧 case 保持 NULL）')
+}
+if (!negotiationCaseColumns.includes('source_note')) {
+  db.exec('ALTER TABLE creator_negotiation_cases ADD COLUMN source_note TEXT')
+  console.log('[db] 已为 creator_negotiation_cases 添加 source_note 列（旧 case 保持 NULL）')
+}
+// 同一投放记录最多一条 historical_backfill（partial unique index，只约束历史回填，不影响 live）
+db.exec(
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_negotiation_cases_hist_record
+   ON creator_negotiation_cases(record_id)
+   WHERE source_type = 'historical_backfill' AND record_id IS NOT NULL`
+)
 
 // 首次启动写入示例项目（前端工作台展示用）
 const projectCount = db.prepare('SELECT COUNT(*) AS n FROM projects').get().n

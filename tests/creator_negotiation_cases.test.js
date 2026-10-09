@@ -557,8 +557,10 @@ async function main() {
     const routeSource = fs.readFileSync(path.join(root, 'backend/routes/creatorNegotiationCases.js'), 'utf8')
     check('A4-51 新路由不引用 AI / 网络能力', !/deepseek|axios|fetch\(|callProviderVision/i.test(routeSource))
     check(
-      'A4-52 只注册 POST / 与 GET /',
-      cases.default.stack.filter((l) => l.route).map((l) => `${Object.keys(l.route.methods)[0].toUpperCase()} ${l.route.path}`).sort().join(' | ') === 'GET / | POST /'
+      // Historical Negotiation Backfill V0.1：新增 POST /historical-backfill（历史真实案例回填），
+      // 原有 POST / 与 GET / 语义与行为保持不变。
+      'A4-52 只注册 GET / : POST / : POST /historical-backfill',
+      cases.default.stack.filter((l) => l.route).map((l) => `${Object.keys(l.route.methods)[0].toUpperCase()} ${l.route.path}`).sort().join(' | ') === 'GET / | POST / | POST /historical-backfill'
     )
     const caseRowsText = JSON.stringify(db.prepare('SELECT * FROM creator_negotiation_cases').all())
     check('A4-53 不保存 base64 / Key / provider 原始数据', !/base64|apiKey|api_key|sk-|provider_response|data:image/i.test(caseRowsText))

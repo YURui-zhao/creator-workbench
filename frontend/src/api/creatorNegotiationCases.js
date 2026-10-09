@@ -20,3 +20,22 @@ export function getNegotiationCasesByCreator(creator) {
 export function getNegotiationCaseByDecision(decisionId) {
   return request.get('/creator-negotiation-cases', { params: { decision_id: decisionId } })
 }
+
+/**
+ * Historical Negotiation Backfill V0.1：把「过去真实发生过、且已有真实 creator_record 的谈价案例」回填。
+ * 前端只提交：record_id / 价格事实（历史星图刊例、历史初始报价、谈后价）/ 谈价日期 / 原因标签 / 备注 / source_note。
+ * creator 由后端用 record.nickname 冻结；decision_id / snapshot_id / CPM30 快照一律不接受前端提交。
+ */
+export function createHistoricalNegotiationCase(payload) {
+  return request.post('/creator-negotiation-cases/historical-backfill', payload, { timeout: 20000 })
+}
+
+/** 查询某条投放记录的历史谈价回填（用于「已补录谈价」状态与只读查看） */
+export function getNegotiationCasesByRecord(recordId) {
+  return request.get('/creator-negotiation-cases', { params: { record_id: recordId } })
+}
+
+/** 只读列出全部历史回填案例（Records 页面标记「已补录谈价」，最多 500 条） */
+export function getNegotiationCasesBySourceType(sourceType = 'historical_backfill') {
+  return request.get('/creator-negotiation-cases', { params: { source_type: sourceType } })
+}

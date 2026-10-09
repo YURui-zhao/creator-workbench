@@ -38,6 +38,8 @@ import { getImportBatches } from '../../api/importBatches'
 import { useSearchParams } from 'react-router-dom'
 import ExcelImportModal from '../../components/ExcelImportModal'
 import RecordFormModal from '../../components/RecordFormModal'
+import HistoricalNegotiationCaseModal from '../../components/HistoricalNegotiationCaseModal'
+import { getNegotiationCasesByRecord, getNegotiationCasesBySourceType } from '../../api/creatorNegotiationCases'
 import {
   buildExportFileName,
   exportRecordsToExcel,
@@ -87,6 +89,10 @@ export default function Records() {
   const [editingRecord, setEditingRecord] = useState(null)
   // 导入弹窗
   const [importOpen, setImportOpen] = useState(false)
+  // Historical Negotiation Backfill V0.1：历史谈价补录 / 只读查看
+  const [harvestRecord, setHarvestRecord] = useState(null)
+  // record_id -> 已有历史回填案例（用于「已补录谈价」标记）
+  const [backfilledCases, setBackfilledCases] = useState({})
   // ---------- 批量操作状态 ----------
   // 选中的记录 ID（跨分页/筛选保留，便于批量处理）
   const [selectedRowKeys, setSelectedRowKeys] = useState([])
@@ -138,6 +144,24 @@ export default function Records() {
   useEffect(() => {
     loadBatchOptions()
   }, [loadBatchOptions])
+
+  // ---------- Historical Negotiation Backfill V0.1：已有历史谈价回填（只读标记） ----------
+  const loadBackfilledCases = useCallback(async () => {
+    try {
+      const res = await getNegotiationCasesBySourceType('historical_backfill')
+      const map = {}
+      for (const item of res?.data?.cases || []) {
+        if (item?.record_id) map[item.record_id] = item
+      }
+      setBackfilledCases(map)
+    } catch {
+      // 读取失败不影响投放列表主流程（入口仍可人工补录）
+    }
+  }, [])
+
+  useEffect(() => {
+    loadBackfilledCases()
+  }, [loadBackfilledCases])
 
   // 从导入历史跳转过来（/records?batchId=xx）：自动回填筛选器并按批次查询
   useEffect(() => {
@@ -471,8 +495,31 @@ export default function Records() {
     return formatPlays(latest - first)
   }
 
+  // Historical Negotiation Backfill V0.1：打开「补录历史谈价 / 已补录谈价（只读）」
+  const openHarvest = async (record) => {
+    const local = backfilledCases[record.id]
+    if (local) {
+      setHarvestRecord({ record, existingCase: local })
+      return
+    }
+    try {
+      const res = await getNegotiationCasesByRecord(record.id)
+      const existing = (res?.data?.cases || [])[0] || null
+      setHarvestRecord({ record, existingCase: existing })
+    } catch {
+      setHarvestRecord({ record, existingCase: null })
+    }
+  }
+
   const actionRender = (_, record) => (
     <Space size={0}>
+      <Button
+        type="link"
+        size="small"
+        onClick={() => openHarvest(record)}
+      >
+        {backfilledCases[record.id] ? '已补录谈价' : '补录历史谈价'}
+      </Button>
       <Button
         type="link"
         size="small"
@@ -551,7 +598,7 @@ export default function Records() {
       render: post7dGrowthRender
     },
     { title: '发布日期', dataIndex: 'publish_date', width: 110 },
-    { title: '操作', key: 'action', width: 120, fixed: 'right', render: actionRender }
+    { title: '操作', key: 'action', width: 220, fixed: 'right', render: actionRender }
   ]
 
   return (
@@ -831,6 +878,20 @@ export default function Records() {
               setPage(nextPage)
             }
           }
+        }}
+      />
+
+      {/* Historical Negotiation Backfill V0.1：历史谈价补录 / 只读查看 */}
+      <HistoricalNegotiationCaseModal
+        open={Boolean(harvestRecord)}
+        record={harvestRecord?.record || null}
+        existingCase={harvestRecord?.existingCase || null}
+        onClose={() => setHarvestRecord(null)}
+        onSaved={async (saved) => {
+          if (saved?.record_id) {
+            setBackfilledCases((current) => ({ ...current, [saved.record_id]: saved }))
+          }
+          await loadBackfilledCases()
         }}
       />
 

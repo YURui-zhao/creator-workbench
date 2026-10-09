@@ -14,6 +14,7 @@ import {
 } from '../utils/dateCycle.js'
 import { parsePlayText, parsePriceText } from '../utils/screenshotValues.js'
 import { normalizeContentType } from '../utils/recentPerformanceStats.js'
+import { NEGOTIATION_REASON_TAG_VALUES } from '../utils/negotiationCase.js'
 
 const router = Router()
 
@@ -990,6 +991,122 @@ router.post('/distill-creator-note', async (req, res) => {
     }
     console.error('[ai] 备注整理异常')
     return fail(res, 500, 'AI 备注整理服务异常，请稍后重试')
+  }
+})
+
+// ---------- Historical Negotiation Backfill V0.1：AI 整理谈价经验（建议，不落库） ----------
+const MAX_NEGOTIATION_SOURCE_NOTE_LENGTH = 2000
+const MAX_NEGOTIATION_NOTE_LENGTH_AI = 500
+
+// 固定任务 prompt：前端不能传入任意 system prompt（路由只读取 source_note）
+export function buildNegotiationHarvestSystemPrompt() {
+  return `
+你是「达人投放工作台」的谈价经验整理助手。用户会提供一段自己写的历史谈价原始备注（source_note）。
+
+你唯一的任务：把这段人工备注整理成「建议的原因标签 + 补充说明 + 谈价依据 / 过程」。
+
+必须遵守：
+1. 只允许基于用户提供的 source_note 整理，禁止添加任何外部事实、常识推断或你没被告知的信息。
+2. 绝不创造价格事实：不得推断 / 编造 xingtu_price、current_quote、negotiated_price，
+   也不要把备注里的价格当成系统事实（可以原样转述，但要保留「人工备注」的来源限定）。
+3. 不做任何「这个策略有效 / 不有效」的判断，不输出推荐折扣、不给出建议价格。
+4. reason_tags 只能从下面这个固定 allowlist 中选择（不能创造新标签，不确定就不要选）：
+   history_performance_plain, budget_limited, long_term_cooperation, batch_cooperation,
+   creator_price_cut, schedule_factor, other, sponsored_below_organic, sponsored_sample_low,
+   playback_volatile, quote_above_playbook_range, quote_above_history_reference
+5. 输出必须是「建议」口吻并保留来源限定，例如：
+   source「我觉得他商单明显比日常差，所以压价」
+   → reason_tags: ["sponsored_below_organic"]
+   → strategy_note: "人工备注显示谈价时以商单播放低于日常作为压价依据。"
+   绝对不要写成「该达人商单表现较差，因此应该压价。」
+6. 只输出一个严格 JSON 对象，不要输出解释、Markdown 代码块或多余文字：
+{"reason_tags": ["..."], "reason_note": "...", "strategy_note": "..."}
+`
+}
+
+// 只把 source_note 作为用户输入发送（数据最小化：不发送 records / 其它达人 / decision / outcome）
+export function buildNegotiationHarvestUserText(sourceNote) {
+  return String(sourceNote ?? '')
+}
+
+/**
+ * 解析 AI 返回：只接受 { reason_tags, reason_note, strategy_note }
+ *   · reason_tags 只保留 allowlist 内的值（非法 tag 直接过滤，不猜测、不修复）
+ *   · reason_note / strategy_note 只做 trim + 截断长度
+ */
+export function parseNegotiationHarvestResult(content) {
+  let parsed
+  try {
+    parsed = parseAiResult(content)
+  } catch {
+    throw new DeepSeekError('AI 返回内容不是合法 JSON，谈价经验整理失败，请重试', 502)
+  }
+  const rawTags = Array.isArray(parsed?.reason_tags)
+    ? parsed.reason_tags
+    : typeof parsed?.reason_tags === 'string'
+      ? [parsed.reason_tags]
+      : []
+  const reasonTags = [
+    ...new Set(
+      rawTags
+        .map((tag) => (typeof tag === 'string' ? tag.trim() : ''))
+        .filter((tag) => NEGOTIATION_REASON_TAG_VALUES.includes(tag))
+    )
+  ]
+  const toNote = (value) => {
+    if (typeof value !== 'string') return null
+    const text = value.trim()
+    return text ? text.slice(0, MAX_NEGOTIATION_NOTE_LENGTH_AI) : null
+  }
+  const reasonNote = toNote(parsed?.reason_note)
+  const strategyNote = toNote(parsed?.strategy_note)
+  if (!reasonTags.length && !reasonNote && !strategyNote) {
+    throw new DeepSeekError('AI 未返回可用的谈价经验整理结果，请重试', 502)
+  }
+  return { reason_tags: reasonTags, reason_note: reasonNote, strategy_note: strategyNote }
+}
+
+/**
+ * 整理历史谈价经验（可注入 callFn，便于测试完全离线）
+ * @param {string} sourceNote 用户的历史谈价原始备注（唯一输入）
+ * @param {Function} [callFn] 默认 callDeepSeek
+ * @param {{ provider?: string, model?: string, apiKey?: string }} [options]
+ */
+export async function harvestNegotiationExperience(
+  sourceNote,
+  callFn = callDeepSeek,
+  options = {}
+) {
+  const content = await callFn(
+    buildNegotiationHarvestSystemPrompt(),
+    buildNegotiationHarvestUserText(sourceNote),
+    options
+  )
+  return parseNegotiationHarvestResult(content)
+}
+
+/**
+ * POST /api/ai/harvest-negotiation-experience
+ * 入参：{ source_note: string }（只发送这一段人工备注，数据最小化）
+ * 出参：{ reason_tags: string[], reason_note: string|null, strategy_note: string|null }
+ * 说明：固定任务 prompt；只返回**建议**，绝不写库；AI 不可用时历史回填仍可人工填写保存。
+ */
+router.post('/harvest-negotiation-experience', async (req, res) => {
+  const body = req.body && !Array.isArray(req.body) ? req.body : {}
+  const sourceNote = typeof body.source_note === 'string' ? body.source_note.trim() : ''
+  if (!sourceNote) return fail(res, 400, 'source_note 不能为空')
+  if (sourceNote.length > MAX_NEGOTIATION_SOURCE_NOTE_LENGTH) {
+    return fail(res, 400, `历史谈价原始备注长度不能超过 ${MAX_NEGOTIATION_SOURCE_NOTE_LENGTH}`)
+  }
+  try {
+    const result = await harvestNegotiationExperience(sourceNote, callDeepSeek, aiOptions(req))
+    ok(res, result)
+  } catch (err) {
+    if (err instanceof DeepSeekError || err.isDeepSeekError) {
+      return fail(res, err.status || 502, err.message)
+    }
+    console.error('[ai] 谈价经验整理异常')
+    return fail(res, 500, 'AI 谈价经验整理服务异常，请稍后重试')
   }
 })
 

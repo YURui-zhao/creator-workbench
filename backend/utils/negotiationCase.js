@@ -38,6 +38,13 @@ export const NEGOTIATION_REASON_TAG_LABELS = Object.fromEntries(
 
 export const MAX_NEGOTIATION_NOTE_LENGTH = 500
 
+// Historical Negotiation Backfill V0.1
+//   source_type = live（实时谈价工作流，走 decision_id）
+//               | historical_backfill（历史真实案例回填，走 record_id）
+export const NEGOTIATION_SOURCE_TYPES = ['live', 'historical_backfill']
+// 历史谈价原始备注：人工维护的 source of truth（比 reason/strategy note 承载更多原始上下文）
+export const MAX_SOURCE_NOTE_LENGTH = 2000
+
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
 
 /** 严格校验 YYYY-MM-DD（含真实日历校验；与 P2B observed_at 同一规则） */
@@ -155,6 +162,10 @@ export function toPublicNegotiationCase(row) {
     creator: row.creator,
     decision_id: row.decision_id ?? null,
     snapshot_id: row.snapshot_id ?? null,
+    // Historical Negotiation Backfill V0.1：来源与稳定身份
+    source_type: row.source_type || 'live',
+    record_id: row.record_id ?? null,
+    source_note: row.source_note ?? null,
     xingtu_price_snapshot: row.xingtu_price_snapshot ?? null,
     current_quote_snapshot: row.current_quote_snapshot ?? null,
     negotiated_price: row.negotiated_price,

@@ -93,3 +93,18 @@ export function distillCreatorNote(description) {
     { timeout: 60000, headers: buildAiHeaders() }
   )
 }
+
+/**
+ * Historical Negotiation Backfill V0.1：AI 整理谈价经验（可选增强）
+ * 入参：source_note = 用户写的历史谈价原始备注（**只发送这一段**，数据最小化）
+ * 返回：{ code, data: { reason_tags: string[], reason_note: string|null, strategy_note: string|null }, msg }
+ * 说明：只返回「建议」，绝不写库；reason_tags 只可能落在现有 allowlist 内；
+ *      AI 不可用时历史回填仍可人工填写并保存。
+ */
+export function harvestNegotiationExperience(sourceNote) {
+  return request.post(
+    '/ai/harvest-negotiation-experience',
+    { source_note: sourceNote },
+    { timeout: 60000, headers: buildAiHeaders() }
+  )
+}

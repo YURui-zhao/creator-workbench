@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Alert,
   Button,
   Card,
   Checkbox,
   Col,
+  Collapse,
   Descriptions,
   Divider,
   Empty,
@@ -13,6 +14,7 @@ import {
   List,
   Modal,
   Row,
+  Segmented,
   Space,
   Statistic,
   Tag,
@@ -20,7 +22,7 @@ import {
   Typography,
   message
 } from 'antd'
-import { PlusOutlined, ReloadOutlined, UserAddOutlined } from '@ant-design/icons'
+import { PlusOutlined, ReloadOutlined, SearchOutlined, UserAddOutlined } from '@ant-design/icons'
 import {
   createCandidateDecision,
   createCandidatePostQuoteDecision,
@@ -45,8 +47,25 @@ import {
   applyCandidateEditValues,
   applyXingtuIdFormValues
 } from '../../utils/creatorCandidateForm.js'
+// 达人拓展 IA：三个工作盒子只由最新 candidate_review 派生（纯函数，便于单测）
+import {
+  WORK_STATE_CANDIDATE_REVIEW_STAGE,
+  WORK_STATE_FILTER_ALL,
+  WORK_STATE_FILTER_OPTIONS,
+  WORK_STATE_LABELS,
+  WORK_STATE_OPTIONS,
+  WORK_STATE_TAG_COLORS,
+  buildLinkedCollaborationRecords,
+  deriveWorkState,
+  filterCandidates,
+  summarizeWorkStates,
+  workStateOf
+} from '../../utils/creatorWorkState.js'
 import RecentPerformanceAssistantModal from '../../components/RecentPerformanceAssistantModal'
-import NegotiationCaseModal from '../../components/NegotiationCaseModal'
+// Negotiation Unification V0.2：candidate 谈价经验统一走共享表单 + live case 领域模型
+import CandidateNegotiationExperienceModal from '../../components/CandidateNegotiationExperienceModal'
+import { getNegotiationCasesByRecord } from '../../api/creatorNegotiationCases'
+import { NEGOTIATION_REASON_TAG_LABELS } from '../../utils/negotiationCaseDisplay.js'
 
 const PLACEHOLDER = '-'
 
@@ -77,12 +96,13 @@ const PRICE_REF_MESSAGES = {
   high_scale_not_supported: '当前属于高量级达人。现有高量级历史样本较少，V0.1 暂不生成历史价格参考。'
 }
 
-// Phase 4B：candidate_review 人工决定（必须由用户显式选择；系统 / AI / 规则绝不自动选择）
-const CANDIDATE_REVIEW_OPTIONS = [
-  { value: 'contact', label: '继续联系' },
-  { value: 'observe', label: '继续观察' },
-  { value: 'hold', label: '暂不推进' }
-]
+// 当前处理（Work State）三选一由 utils/creatorWorkState.js 统一提供：
+//   contact → 推进中 / observe → 观察中 / hold → 暂缓池
+// 只有用户显式点击三个状态按钮时，才会新增一条 candidate_review decision（append-only）。
+
+// 达人资料画像的观察提示：只是 guidance，不是必填表单，也不新增任何 DB 字段
+const PROFILE_GUIDANCE =
+  '观察提示（仅作参考，不必逐条填写）：主要内容类型？· 人设 / 表达风格？· 视频偏长还是偏短？· 商单与日常差异？· 粉丝互动情况？· 明显记忆点？· 优势 / 风险？'
 
 // Phase 4D：candidate 报价阶段（candidate 第一次投放，用「直接推进」而非「复投」）
 const CANDIDATE_POST_QUOTE_OPTIONS = [
@@ -171,7 +191,7 @@ function renderPriceReference(priceRef, loading) {
 }
 
 /**
- * 新达人判断（V3-alpha.3 Playbook Phase 1）
+ * 达人拓展（V3-alpha.3 Playbook Phase 1；原「新达人判断」）
  *
  * 本阶段只做两件事：
  *   1) 建立候选达人稳定身份（creator_candidates）
@@ -184,6 +204,14 @@ export default function CreatorPlaybook() {
   const [listLoading, setListLoading] = useState(true)
   const [listError, setListError] = useState('')
   const [selectedId, setSelectedId] = useState(null)
+  // A. 列表顶部：名称 substring 搜索 + 三个工作盒子筛选（单选，互斥）
+  const [searchKeyword, setSearchKeyword] = useState('')
+  const [workStateFilter, setWorkStateFilter] = useState(WORK_STATE_FILTER_ALL)
+  // 每个 candidate 的当前 Work State（由最新 candidate_review 派生；列表筛选 / 计数用）
+  const [workStateMap, setWorkStateMap] = useState({})
+  // 当前合作 / 已关联合作记录：两个独立的折叠区块（当前合作默认展开，合作记录默认折叠）
+  const [cooperationKeys, setCooperationKeys] = useState(['cooperation'])
+  const [linkedRecordKeys, setLinkedRecordKeys] = useState([])
   const [snapshot, setSnapshot] = useState(null)
   const [snapshotLoading, setSnapshotLoading] = useState(false)
   // Phase 3B：历史价格参考（只读，后端按 candidate_id 派生 target）
@@ -216,9 +244,9 @@ export default function CreatorPlaybook() {
   const [createOpen, setCreateOpen] = useState(false)
   const [creating, setCreating] = useState(false)
   const [assistantOpen, setAssistantOpen] = useState(false)
-  // AI 是否可用（仅控制「AI整理备注」按钮；不影响 candidate / snapshot 等其它能力）
+  // AI 是否可用（仅控制「AI整理达人资料」按钮；不影响 candidate / snapshot 等其它能力）
   const [aiReady, setAiReady] = useState(false)
-  // AI 整理备注：预览态（不自动写库）
+  // AI 整理达人资料：预览态（不自动写库）
   const [distilling, setDistilling] = useState(false)
   const [distillPreview, setDistillPreview] = useState(null)
   const [savingDistill, setSavingDistill] = useState(false)
@@ -302,14 +330,17 @@ export default function CreatorPlaybook() {
   const loadDecisions = useCallback(async (candidateId) => {
     if (!candidateId) {
       setDecisions([])
-      return
+      return []
     }
     setDecisionsLoading(true)
     try {
       const res = await listCandidateDecisions(candidateId)
-      setDecisions(res?.data?.decisions || [])
+      const list = res?.data?.decisions || []
+      setDecisions(list)
+      return list
     } catch {
       setDecisions([])
+      return []
     } finally {
       setDecisionsLoading(false)
     }
@@ -318,6 +349,29 @@ export default function CreatorPlaybook() {
   useEffect(() => {
     loadDecisions(selectedId)
   }, [selectedId, loadDecisions])
+
+  // A. 列表的工作盒子筛选：需要「每个 candidate 的最新 candidate_review」。
+  // 严格按 candidate_id 逐条读取 append-only 历史（不新增后端接口、不按昵称猜、不新增 DB 字段）。
+  const loadWorkStates = useCallback(async (list) => {
+    const rows = (Array.isArray(list) ? list : []).filter((item) => item && item.id !== null && item.id !== undefined)
+    if (!rows.length) return
+    const entries = await Promise.all(
+      rows.map(async (item) => {
+        try {
+          const res = await listCandidateDecisions(item.id)
+          return [item.id, deriveWorkState(res?.data?.decisions || [])]
+        } catch {
+          // 读取失败不伪造状态：按「无 candidate_review」的默认语义展示（推进中）
+          return [item.id, deriveWorkState([])]
+        }
+      })
+    )
+    setWorkStateMap((prev) => ({ ...prev, ...Object.fromEntries(entries) }))
+  }, [])
+
+  useEffect(() => {
+    loadWorkStates(candidates)
+  }, [candidates, loadWorkStates])
 
   // 切换候选时收起历史 / 清空待提交的决定
   useEffect(() => {
@@ -333,6 +387,9 @@ export default function CreatorPlaybook() {
     setSelectedOutcomeRecordId(null)
     setOutcomeIdentityConfirmed(false)
     setOutcomeTimingConfirmed(false)
+    // 区块折叠状态回归默认：当前合作展开、已关联合作记录折叠
+    setCooperationKeys(['cooperation'])
+    setLinkedRecordKeys([])
   }, [selectedId])
 
   // AI 可用性：会话 Key（本地）或后端环境变量任一可用即可；查询失败不影响页面其它能力
@@ -360,6 +417,21 @@ export default function CreatorPlaybook() {
   }, [selectedId])
 
   const selected = candidates.find((item) => item.id === selectedId) || null
+  // A. 列表视图：名称 substring 搜索 + 三个工作盒子筛选（纯函数，保持后端返回顺序）
+  const visibleCandidates = useMemo(
+    () =>
+      filterCandidates({
+        candidates,
+        keyword: searchKeyword,
+        workState: workStateFilter,
+        workStateByCandidate: workStateMap
+      }),
+    [candidates, searchKeyword, workStateFilter, workStateMap]
+  )
+  const workStateCounts = useMemo(
+    () => summarizeWorkStates(candidates, workStateMap),
+    [candidates, workStateMap]
+  )
 
   const handleCreate = async () => {
     if (creating) return
@@ -391,7 +463,7 @@ export default function CreatorPlaybook() {
     }
   }
 
-  // 只整理已有的人工备注（只在用户显式点击时调用；AI 失败不影响 candidate 数据）
+  // 只整理已有的人工观察（只在用户显式点击时调用；AI 失败不影响 candidate 数据）
   const handleDistill = async () => {
     if (!selected) return
     const note = String(selected.description ?? '').trim()
@@ -522,7 +594,9 @@ export default function CreatorPlaybook() {
       message.success('决定已记录')
       setPendingDecision(null)
       setDecisionNote('')
-      await loadDecisions(selected.id)
+      // 新增一条 decision（不 UPDATE 旧 decision），并同步刷新该 candidate 的当前 Work State
+      const refreshed = await loadDecisions(selected.id)
+      setWorkStateMap((prev) => ({ ...prev, [selected.id]: deriveWorkState(refreshed) }))
     } catch {
       // 失败提示由 request 响应拦截器统一给出，这里不再重复 toast
     } finally {
@@ -537,6 +611,15 @@ export default function CreatorPlaybook() {
   })()
   // 量化判断全部由纯函数规则引擎给出（页面只负责展示，不重复计算业务规则）
   const assessment = snapshot ? buildCreatorPlaybookAssessment(snapshot) : null
+  // B. 当前处理（Work State）：只由「最新 candidate_review」派生；post_quote 决策不参与
+  const currentWorkState = useMemo(() => deriveWorkState(decisions), [decisions])
+  // 历史人工决定（只统计 candidate_review，报价阶段决策不混入 Work State 历史）
+  const reviewDecisions = useMemo(
+    () => decisions.filter((item) => item.decision_stage === WORK_STATE_CANDIDATE_REVIEW_STAGE),
+    [decisions]
+  )
+  // F. 已关联合作记录：只使用 outcome 显式关联的投放记录（不按昵称猜、不自动连接历史 record）
+  const linkedCollaborationRecords = useMemo(() => buildLinkedCollaborationRecords(decisions), [decisions])
   // Phase 4D：最近一次 review / 报价阶段决策（decisions 已按时间倒序）
   const latestReviewDecision = decisions.find((item) => item.decision_stage === 'candidate_review') || null
   const latestPostQuoteDecision = decisions.find((item) => item.decision_stage === 'post_quote') || null
@@ -546,9 +629,38 @@ export default function CreatorPlaybook() {
     Boolean(latestPostQuoteDecision) &&
     ['proceed', 'small_test'].includes(latestPostQuoteDecision.human_decision)
   const currentOutcome = latestPostQuoteDecision?.outcome || null
-  // Phase 4F-B：最新 post_quote = negotiate 时的谈价事实（按 decision_id 关联）
-  const latestPostQuoteNegotiating = latestPostQuoteDecision?.human_decision === 'negotiate'
+  // Unification V0.2：谈价经验不再要求必须是 negotiate（proceed / small_test / pause 也可记录已发生谈价），
+  // 但仍只挂在真实存在的报价阶段决策上（不伪造 post_quote）
+  const negotiationCapturableDecisions = ['negotiate', 'proceed', 'small_test', 'pause']
+  const canRecordNegotiationExperience =
+    Boolean(latestPostQuoteDecision) &&
+    negotiationCapturableDecisions.includes(latestPostQuoteDecision.human_decision)
   const latestNegotiationCase = latestPostQuoteDecision?.negotiation_case || null
+  // Semantic Duplicate V0.2：同一真实事件已由 outcome 关联的投放记录补录了历史谈价时，
+  // candidate workspace 直接复用该 historical case（只读查看），不再提供 live 记录入口。
+  const [linkedHistoricalCase, setLinkedHistoricalCase] = useState(null)
+  const linkedOutcomeRecordId = currentOutcome?.record_id ?? null
+  useEffect(() => {
+    let active = true
+    if (!linkedOutcomeRecordId) {
+      setLinkedHistoricalCase(null)
+      return undefined
+    }
+    getNegotiationCasesByRecord(linkedOutcomeRecordId)
+      .then((res) => {
+        if (!active) return
+        const historical = (res?.data?.cases || []).find(
+          (item) => item.source_type === 'historical_backfill'
+        )
+        setLinkedHistoricalCase(historical || null)
+      })
+      .catch(() => active && setLinkedHistoricalCase(null))
+    return () => {
+      active = false
+    }
+  }, [linkedOutcomeRecordId])
+  // 已有谈价经验（live 或 outcome-linked 历史补录）→ 只读查看；否则才允许记录已发生谈价
+  const existingNegotiationExperience = latestNegotiationCase || linkedHistoricalCase || null
 
   // 报价阶段：必须由用户主动点击后打开，无默认选中
   const openPostQuote = (prefillAmount) => {
@@ -647,10 +759,10 @@ export default function CreatorPlaybook() {
         >
           <Space direction="vertical" size={4}>
             <Typography.Title level={4} style={{ margin: 0 }}>
-              新达人判断
+              达人拓展
             </Typography.Title>
             <Typography.Text type="secondary">
-              为尚未投放的新达人建立稳定身份，并录入 / 查看近期表现。本阶段不做价格案例与推荐结论。
+              当前正在筛选 / 推进的达人：维护资料画像与近期数据，记录当前合作事实与已关联合作记录。
             </Typography.Text>
           </Space>
           <Space wrap>
@@ -673,39 +785,69 @@ export default function CreatorPlaybook() {
         {/* A. 候选达人列表 */}
         <Col xs={24} lg={8}>
           <Card size="small" title={`候选达人（${candidates.length}）`}>
-            {candidates.length === 0 && !listLoading ? (
-              <Empty
-                image={Empty.PRESENTED_IMAGE_SIMPLE}
-                description="还没有候选达人，先新建一个"
+            <Space direction="vertical" size={10} style={{ display: 'flex' }}>
+              {/* A1. 名称 substring 搜索（不做高级筛选） */}
+              <Input
+                allowClear
+                size="small"
+                value={searchKeyword}
+                onChange={(event) => setSearchKeyword(event.target.value)}
+                placeholder="搜索达人名称"
+                prefix={<SearchOutlined style={{ color: 'rgba(0,0,0,0.35)' }} />}
               />
-            ) : (
-              <List
-                loading={listLoading}
-                dataSource={candidates}
-                renderItem={(item) => (
-                  <List.Item
-                    style={{
-                      cursor: 'pointer',
-                      background: item.id === selectedId ? 'rgba(22, 119, 255, 0.06)' : undefined,
-                      borderRadius: 4,
-                      paddingLeft: 8,
-                      paddingRight: 8
-                    }}
-                    onClick={() => setSelectedId(item.id)}
-                  >
-                    <List.Item.Meta
-                      title={
-                        <Space size={6} wrap>
-                          <Typography.Text strong>{item.name}</Typography.Text>
-                          {item.status === 'archived' && <Tag>已归档</Tag>}
-                        </Space>
-                      }
-                      description={item.creator_type || '未分类'}
-                    />
-                  </List.Item>
-                )}
+              {/* A2. 三个工作盒子筛选（互斥单选；由最新 candidate_review 派生） */}
+              <Segmented
+                size="small"
+                block
+                value={workStateFilter}
+                onChange={setWorkStateFilter}
+                options={WORK_STATE_FILTER_OPTIONS.map((option) => ({
+                  value: option.value,
+                  label: `${option.label} ${workStateCounts[option.value] ?? 0}`
+                }))}
               />
-            )}
+              {candidates.length === 0 && !listLoading ? (
+                <Empty
+                  image={Empty.PRESENTED_IMAGE_SIMPLE}
+                  description="还没有候选达人，先新建一个"
+                />
+              ) : visibleCandidates.length === 0 ? (
+                <Empty
+                  image={Empty.PRESENTED_IMAGE_SIMPLE}
+                  description="当前筛选条件下没有达人"
+                />
+              ) : (
+                <List
+                  loading={listLoading}
+                  dataSource={visibleCandidates}
+                  renderItem={(item) => (
+                    <List.Item
+                      style={{
+                        cursor: 'pointer',
+                        background: item.id === selectedId ? 'rgba(22, 119, 255, 0.06)' : undefined,
+                        borderRadius: 4,
+                        paddingLeft: 8,
+                        paddingRight: 8
+                      }}
+                      onClick={() => setSelectedId(item.id)}
+                    >
+                      <List.Item.Meta
+                        title={
+                          <Space size={6} wrap>
+                            <Typography.Text strong>{item.name}</Typography.Text>
+                            {item.status === 'archived' && <Tag>已归档</Tag>}
+                            <Tag color={WORK_STATE_TAG_COLORS[workStateOf(workStateMap, item.id).value]}>
+                              {workStateOf(workStateMap, item.id).label}
+                            </Tag>
+                          </Space>
+                        }
+                        description={item.creator_type || '未分类'}
+                      />
+                    </List.Item>
+                  )}
+                />
+              )}
+            </Space>
           </Card>
         </Col>
 
@@ -719,13 +861,21 @@ export default function CreatorPlaybook() {
               />
             </Card>
           ) : (
-            <Card
-              size="small"
-              title={
-                <Space size={8} wrap>
-                  <Typography.Text strong style={{ fontSize: 16 }}>
+            <div>
+              {/* 达人名称 + 主操作（一级信息：这是谁 / 要不要继续处理） */}
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'flex-start',
+                  flexWrap: 'wrap',
+                  gap: 12
+                }}
+              >
+                <Space size={8} wrap align="center">
+                  <Typography.Title level={4} style={{ margin: 0 }}>
                     {selected.name}
-                  </Typography.Text>
+                  </Typography.Title>
                   <Typography.Text type="secondary">{selected.creator_type || '未分类'}</Typography.Text>
                   {selected.status === 'archived' && <Tag>已归档</Tag>}
                   {/* 次级操作：编辑资料（不抢「录入近期表现」的主 CTA 层级） */}
@@ -733,13 +883,84 @@ export default function CreatorPlaybook() {
                     编辑资料
                   </Button>
                 </Space>
-              }
-              extra={
                 <Button type="primary" onClick={() => setAssistantOpen(true)}>
                   录入近期表现
                 </Button>
-              }
-            >
+              </div>
+
+              {/* B. 轻量当前工作状态栏：只由最新 candidate_review 派生（不折叠、不套 Card） */}
+              <div
+                style={{
+                  marginTop: 12,
+                  padding: '10px 12px',
+                  background: 'rgba(0,0,0,0.02)',
+                  borderRadius: 6
+                }}
+              >
+                <Space size={8} wrap align="center">
+                  <Typography.Text strong>当前处理</Typography.Text>
+                  {WORK_STATE_OPTIONS.map((option) => (
+                    <Button
+                      key={option.value}
+                      size="small"
+                      type={currentWorkState.value === option.value ? 'primary' : 'default'}
+                      onClick={() => openDecision(option)}
+                    >
+                      {option.label}
+                    </Button>
+                  ))}
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    只由最新一次人工决定派生；本轮谈价结果不会自动改变工作状态
+                  </Typography.Text>
+                  {decisionsLoading && (
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      同步中…
+                    </Typography.Text>
+                  )}
+                </Space>
+                <div style={{ marginTop: 6 }}>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    状态备注：
+                  </Typography.Text>
+                  {currentWorkState.note ? (
+                    <Typography.Text style={{ whiteSpace: 'pre-wrap' }}>{currentWorkState.note}</Typography.Text>
+                  ) : (
+                    <Typography.Text type="secondary">暂无状态备注</Typography.Text>
+                  )}
+                  {currentWorkState.decidedAt && (
+                    <Typography.Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>
+                      {String(currentWorkState.decidedAt).slice(0, 16)}
+                    </Typography.Text>
+                  )}
+                </div>
+                {/* 历史人工决定（append-only 审计；报价阶段决策单独展示，不混入） */}
+                {reviewDecisions.length > 1 && (
+                  <div style={{ marginTop: 6 }}>
+                    <a style={{ fontSize: 12 }} onClick={() => setHistoryExpanded((value) => !value)}>
+                      {historyExpanded ? '收起历史决定' : `查看历史决定（${reviewDecisions.length - 1}）`}
+                    </a>
+                    {historyExpanded && (
+                      <List
+                        size="small"
+                        dataSource={reviewDecisions.slice(1)}
+                        renderItem={(item) => (
+                          <List.Item style={{ paddingLeft: 0, paddingRight: 0 }}>
+                            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                              {String(item.created_at || '').slice(0, 16)} ·{' '}
+                              {WORK_STATE_LABELS[item.human_decision] || item.human_decision_label}
+                              {item.decision_note ? ` · ${item.decision_note}` : ''}
+                            </Typography.Text>
+                          </List.Item>
+                        )}
+                      />
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <Divider style={{ margin: '16px 0 12px' }} />
+
+              {/* 基础信息：身份 / 归档事实（不属于任何一个业务区块） */}
               <Descriptions size="small" column={2} style={{ marginBottom: 8 }}>
                 <Descriptions.Item label="主页链接">
                   {selected.profile_url ? (
@@ -773,21 +994,26 @@ export default function CreatorPlaybook() {
                 <Descriptions.Item label="最近观察日期">{observedLabel}</Descriptions.Item>
               </Descriptions>
 
-              <Divider style={{ margin: '8px 0 12px' }} />
+              <Divider style={{ margin: '16px 0 12px' }} />
 
-              {/* 人工备注：source of truth（AI 只整理，绝不覆盖） */}
+              {/* 一级：达人资料画像（常驻展开）
+                 语义：这个达人长期是什么样；人工观察是 source of truth（AI 只整理，绝不覆盖）。 */}
               <div>
+                <Typography.Text strong style={{ fontSize: 15 }}>达人资料画像</Typography.Text>
+                <Typography.Paragraph type="secondary" style={{ marginTop: 4, marginBottom: 8 }}>
+                  记录这个达人的长期特征、内容风格、价格感知和合作观察。这里只描述长期画像，不放本轮谈价结果。
+                </Typography.Paragraph>
                 <Space size={8} wrap align="center">
-                  <Typography.Text strong>人工备注</Typography.Text>
+                  <Typography.Text strong>人工观察</Typography.Text>
                   {Boolean(String(selected.description ?? '').trim()) && (
-                    <Tooltip title={aiReady ? '' : '连接 AI 后可整理备注'}>
+                    <Tooltip title={aiReady ? '' : '连接 AI 后可整理达人资料'}>
                       <Button
                         size="small"
                         disabled={!aiReady}
                         loading={distilling}
                         onClick={handleDistill}
                       >
-                        AI整理备注
+                        AI整理达人资料
                       </Button>
                     </Tooltip>
                   )}
@@ -795,13 +1021,17 @@ export default function CreatorPlaybook() {
                 <Typography.Paragraph style={{ marginTop: 6, marginBottom: 0, whiteSpace: 'pre-wrap' }}>
                   {selected.description || PLACEHOLDER}
                 </Typography.Paragraph>
+                {/* 观察提示：只是 guidance，不是必填表单，也不新增 DB 字段 */}
+                <Typography.Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 8 }}>
+                  {PROFILE_GUIDANCE}
+                </Typography.Text>
               </div>
 
-              {/* AI 整理预览（未保存）：明确与人工备注区分，不自动写库 */}
+              {/* AI 整理预览（未保存）：明确与人工观察区分，不自动写库 */}
               {distillPreview && (
                 <div style={{ marginTop: 10, padding: 8, background: 'rgba(0,0,0,0.02)', borderRadius: 4 }}>
                   <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                    AI整理（预览，未保存）
+                    AI整理达人资料（仅供参考）· 预览，未保存
                   </Typography.Text>
                   <ul style={{ margin: '4px 0 8px', paddingLeft: 20 }}>
                     {distillPreview.points.map((point) => (
@@ -810,7 +1040,7 @@ export default function CreatorPlaybook() {
                   </ul>
                   <Space size={8}>
                     <Button size="small" type="primary" loading={savingDistill} onClick={handleSaveDistill}>
-                      保存整理结果
+                      保存达人资料整理结果
                     </Button>
                     <Button size="small" onClick={() => setDistillPreview(null)}>
                       放弃
@@ -819,11 +1049,11 @@ export default function CreatorPlaybook() {
                 </div>
               )}
 
-              {/* 已保存的 AI 整理结果（派生文本，与人工备注分开展示） */}
+              {/* 已保存的 AI 整理结果（派生文本，与人工观察分开展示） */}
               {selected.distilled_description && (
                 <div style={{ marginTop: 10 }}>
                   <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                    AI整理
+                    AI整理后的达人画像（仅供参考）
                   </Typography.Text>
                   <Typography.Paragraph style={{ marginTop: 4, marginBottom: 0, whiteSpace: 'pre-wrap' }}>
                     {selected.distilled_description}
@@ -831,8 +1061,17 @@ export default function CreatorPlaybook() {
                 </div>
               )}
 
-              <Divider style={{ margin: '12px 0' }} />
+              <Divider style={{ margin: '16px 0 12px' }} />
 
+              {/* 一级：近期数据（常驻展开；原样复用既有 recent performance UI，不重写） */}
+              <div>
+                <Typography.Text strong style={{ fontSize: 15 }}>
+                  近期数据
+                </Typography.Text>
+                <Typography.Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 2 }}>
+                  来自最近一次录入的近期表现快照
+                </Typography.Text>
+                <div style={{ marginTop: 8 }}>
               {snapshotLoading ? (
                 <Typography.Text type="secondary">加载近期表现…</Typography.Text>
               ) : !snapshot ? (
@@ -842,9 +1081,11 @@ export default function CreatorPlaybook() {
                 />
               ) : (
                 <Space direction="vertical" size={16} style={{ display: 'flex' }}>
-                  {/* 第一层：近期数据（核心事实，直接来自 snapshot） */}
+                  {/* 核心指标：直接来自 snapshot 的事实（不重算） */}
                   <div>
-                    <Typography.Text strong>近期数据</Typography.Text>
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      核心指标
+                    </Typography.Text>
                     <Row gutter={[12, 12]} style={{ marginTop: 8 }}>
                       <Col xs={12} sm={8} lg={6}>
                         <Statistic title="整体中位播放" value={renderMedian(snapshot.median_play)} />
@@ -947,265 +1188,359 @@ export default function CreatorPlaybook() {
                   </div>
                 </Space>
               )}
-
-              <Divider style={{ margin: '12px 0' }} />
-
-              {/* Phase 3B：历史价格参考（只读历史事实，与 CPM15-20 经验估价并列，不融合成"建议价"） */}
-              <div>
-                <Typography.Text strong>历史价格参考</Typography.Text>
-                <Typography.Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 4 }}>
-                  基于过去真实投放记录，按商单播放量接近度检索。仅展示历史事实，不代表推荐价格。
-                </Typography.Text>
-                <div style={{ marginTop: 8 }}>{renderPriceReference(priceRef, priceRefLoading)}</div>
+                </div>
               </div>
 
-              <Divider style={{ margin: '12px 0' }} />
+              <Divider style={{ margin: '16px 0 12px' }} />
 
-              {/* Phase 4B：人工决定（append-only；系统不推荐、不自动选择、AI 不参与） */}
-              <div>
-                <Space size={8} wrap align="baseline">
-                  <Typography.Text strong>人工决定</Typography.Text>
-                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                    由人显式选择，系统不推荐、不自动决定
-                  </Typography.Text>
-                </Space>
-                <Space size={8} wrap style={{ display: 'flex', marginTop: 8 }}>
-                  {CANDIDATE_REVIEW_OPTIONS.map((option) => (
-                    <Button key={option.value} onClick={() => openDecision(option)}>
-                      {option.label}
-                    </Button>
-                  ))}
-                </Space>
+              {/* 一级：当前合作（可独立折叠）：价格与参考 / 本轮谈价 / 本轮结果
+                  底层仍是不同事实，但前端属于同一个 Business Context。
+                  MOVE, DON'T REWRITE：下面是既有事实块的搬运，不重写底层语义。 */}
+              <Collapse
+                ghost
+                activeKey={cooperationKeys}
+                onChange={(keys) => setCooperationKeys(Array.isArray(keys) ? keys : [keys])}
+                items={[
+                  {
+                    key: 'cooperation',
+                    label: (
+                      <Space size={8} wrap>
+                        <Typography.Text strong style={{ fontSize: 15 }}>
+                          当前合作
+                        </Typography.Text>
+                        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                          价格与参考 · 本轮谈价 · 本轮结果
+                        </Typography.Text>
+                      </Space>
+                    ),
+                    children: (
+                      <Space direction="vertical" size={14} style={{ display: 'flex' }}>
+                        {/* 二级：价格与参考（当前报价 + 历史价格参考，全部是既有事实展示） */}
+                        <div>
+                          <Typography.Text strong>价格与参考</Typography.Text>
 
-                {decisionsLoading ? (
-                  <Typography.Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
-                    加载决定历史…
-                  </Typography.Text>
-                ) : decisions.length === 0 ? (
-                  <Typography.Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
-                    还没有记录人工决定
-                  </Typography.Text>
-                ) : (
-                  <div style={{ marginTop: 10 }}>
-                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                      最近一次人工决定
-                    </Typography.Text>
-                    <div>
-                      <Typography.Text strong>
-                        {decisions[0].human_decision_label || decisions[0].human_decision}
-                      </Typography.Text>
-                      <Typography.Text type="secondary" style={{ marginLeft: 8 }}>
-                        {String(decisions[0].created_at || '').slice(0, 16)}
-                      </Typography.Text>
-                    </div>
-                    {decisions[0].decision_note && (
-                      <Typography.Paragraph style={{ marginTop: 4, marginBottom: 0, whiteSpace: 'pre-wrap' }}>
-                        备注：{decisions[0].decision_note}
-                      </Typography.Paragraph>
-                    )}
-                    {decisions.length > 1 && (
-                      <div style={{ marginTop: 6 }}>
-                        <a style={{ fontSize: 12 }} onClick={() => setHistoryExpanded((value) => !value)}>
-                          {historyExpanded ? '收起历史决定' : `查看历史决定（${decisions.length - 1}）`}
-                        </a>
-                        {historyExpanded && (
+                          {/* Phase 4D：报价阶段（继续联系后的自然 next step；同时保留直接记录入口，不制造流程死锁） */}
+                          <div style={{ marginTop: 8 }}>
+                            <Space size={8} wrap align="center">
+                              {reviewContactConfirmed ? (
+                                <Button type="primary" ghost onClick={openPostQuote}>
+                                  记录当前报价
+                                </Button>
+                              ) : (
+                                <Button onClick={openPostQuote}>已有报价，直接记录</Button>
+                              )}
+                              {!snapshot && (
+                                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                                  需先录入近期表现
+                                </Typography.Text>
+                              )}
+                            </Space>
+
+                            {latestPostQuoteDecision && (
+                              <div style={{ marginTop: 10 }}>
+                                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                                  最近报价阶段
+                                </Typography.Text>
+                                <Space direction="vertical" size={2} style={{ display: 'flex', marginTop: 4 }}>
+                                  <Typography.Text>
+                                    当前报价：{formatPrice(latestPostQuoteDecision.current_quote) ?? '-'}
+                                    {latestPostQuoteDecision.pricing_evidence?.xingtu_price !== null &&
+                                    latestPostQuoteDecision.pricing_evidence?.xingtu_price !== undefined
+                                      ? ` · 星图刊例：${formatPrice(latestPostQuoteDecision.pricing_evidence.xingtu_price)}`
+                                      : ''}
+                                    {typeof latestPostQuoteDecision.pricing_evidence?.quote_to_xingtu_ratio === 'number'
+                                      ? ` · 当前报价约 ${(latestPostQuoteDecision.pricing_evidence.quote_to_xingtu_ratio * 10).toFixed(1)} 折`
+                                      : ''}
+                                  </Typography.Text>
+                                  {latestPostQuoteDecision.pricing_evidence?.playbook_estimate && (
+                                    <Typography.Text type="secondary">
+                                      Playbook 估价：
+                                      {renderEstimateRange({
+                                        low: latestPostQuoteDecision.pricing_evidence.playbook_estimate.estimate_low,
+                                        high: latestPostQuoteDecision.pricing_evidence.playbook_estimate.estimate_high
+                                      })}
+                                      {' · 报价位置：'}
+                                      {QUOTE_POSITION_LABELS[
+                                        latestPostQuoteDecision.pricing_evidence.current_quote_assessment?.position
+                                      ] || '-'}
+                                    </Typography.Text>
+                                  )}
+                                  <Typography.Text type="secondary">
+                                    人工决定：
+                                    {latestPostQuoteDecision.human_decision_label || latestPostQuoteDecision.human_decision} ·{' '}
+                                    {String(latestPostQuoteDecision.created_at || '').slice(0, 16)}
+                                  </Typography.Text>
+                                  {latestPostQuoteDecision.decision_note && (
+                                    <Typography.Text type="secondary">
+                                      备注：{latestPostQuoteDecision.decision_note}
+                                    </Typography.Text>
+                                  )}
+                                </Space>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Phase 3B：历史价格参考（只读历史事实，与 CPM15-20 经验估价并列，不融合成"建议价"） */}
+                          <div style={{ marginTop: 10 }}>
+                            <Typography.Text strong>历史价格参考</Typography.Text>
+                            <Typography.Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 4 }}>
+                              基于过去真实投放记录，按商单播放量接近度检索。仅展示历史事实，不代表推荐价格。
+                            </Typography.Text>
+                            <div style={{ marginTop: 8 }}>{renderPriceReference(priceRef, priceRefLoading)}</div>
+                          </div>
+                        </div>
+                        {/* /价格与参考 */}
+
+                        <Divider style={{ margin: '4px 0' }} />
+
+                        {/* 二级：本轮谈价（事件级事实；AI整理谈价经验只针对这一次真实谈价） */}
+                        <div>
+                          <Typography.Text strong>本轮谈价</Typography.Text>
+
+                          {/* Unification V0.2：本次谈价记录（negotiate / proceed / small_test / pause 都可记录） */}
+                          <div style={{ marginTop: 8 }}>
+                            <Typography.Text strong>本次谈价记录</Typography.Text>
+                            <Typography.Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
+                              记录这一次具体谈价的价格变化、原因和过程，可用于后续复盘。
+                            </Typography.Text>
+                            {canRecordNegotiationExperience && !existingNegotiationExperience && (
+                              <Button size="small" style={{ marginTop: 6 }} onClick={() => setNegotiationOpen(true)}>
+                                记录本次谈价
+                              </Button>
+                            )}
+                          </div>
+                          {latestNegotiationCase && (
+                            <div style={{ marginTop: 6, borderTop: '1px dashed #f0f0f0', paddingTop: 6 }}>
+                              <Typography.Text style={{ display: 'block' }}>
+                                初始报价：{formatPrice(latestNegotiationCase.current_quote_snapshot) ?? '暂无'}
+                              </Typography.Text>
+                              <Typography.Text style={{ display: 'block' }}>
+                                谈后价格：{formatPrice(latestNegotiationCase.negotiated_price) ?? '-'}
+                              </Typography.Text>
+                              <Typography.Text type="secondary" style={{ display: 'block' }}>
+                                星图刊例：
+                                {latestNegotiationCase.xingtu_price_snapshot === null ||
+                                latestNegotiationCase.xingtu_price_snapshot === undefined
+                                  ? '暂无'
+                                  : `${formatPrice(latestNegotiationCase.xingtu_price_snapshot)} · 谈后价约为星图 ${
+                                      latestNegotiationCase.outcome?.xingtu_discount_zhe ?? '-'
+                                    }折 · 初始报价约为星图 ${
+                                      latestNegotiationCase.outcome?.initial_quote_to_xingtu_ratio !== null &&
+                                      latestNegotiationCase.outcome?.initial_quote_to_xingtu_ratio !== undefined
+                                        ? (latestNegotiationCase.outcome.initial_quote_to_xingtu_ratio * 10).toFixed(1)
+                                        : '-'
+                                    }折`}
+                              </Typography.Text>
+                              <Typography.Text type="secondary" style={{ display: 'block' }}>
+                                相对初始报价：
+                                {latestNegotiationCase.outcome?.quote_change_rate === null ||
+                                latestNegotiationCase.outcome?.quote_change_rate === undefined
+                                  ? '无法计算（初始报价为 0 / 暂无）'
+                                  : latestNegotiationCase.outcome.quote_change_rate < 0
+                                    ? `下降 ${(Math.abs(latestNegotiationCase.outcome.quote_change_rate) * 100).toFixed(1)}%`
+                                    : latestNegotiationCase.outcome.quote_change_rate > 0
+                                      ? `上升 ${(latestNegotiationCase.outcome.quote_change_rate * 100).toFixed(1)}%`
+                                      : '无变化'}
+                              </Typography.Text>
+                              {(latestNegotiationCase.reason_tag_labels || []).length > 0 && (
+                                <Typography.Text type="secondary" style={{ display: 'block' }}>
+                                  原因：{latestNegotiationCase.reason_tag_labels.join(' · ')}
+                                </Typography.Text>
+                              )}
+                              {latestNegotiationCase.reason_note && (
+                                <Typography.Text type="secondary" style={{ display: 'block' }}>
+                                  补充说明：{latestNegotiationCase.reason_note}
+                                </Typography.Text>
+                              )}
+                              {latestNegotiationCase.strategy_note && (
+                                <Typography.Text type="secondary" style={{ display: 'block' }}>
+                                  谈价依据 / 过程：{latestNegotiationCase.strategy_note}
+                                </Typography.Text>
+                              )}
+                              <Button
+                                size="small"
+                                style={{ marginTop: 6 }}
+                                onClick={() => openPostQuote(String(latestNegotiationCase.negotiated_price))}
+                              >
+                                以谈后价继续判断
+                              </Button>
+                              <Button
+                                size="small"
+                                style={{ marginTop: 6, marginLeft: 8 }}
+                                onClick={() => setNegotiationOpen(true)}
+                              >
+                                查看本次谈价记录
+                              </Button>
+                            </div>
+                          )}
+                          {/* Semantic Duplicate V0.2：该次真实投放已补录历史谈价 → 只读查看，不再提供 live 记录入口 */}
+                          {!latestNegotiationCase && linkedHistoricalCase && (
+                            <div style={{ marginTop: 6, borderTop: '1px dashed #f0f0f0', paddingTop: 6 }}>
+                              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                                本次谈价记录 · 来源：历史补录
+                              </Typography.Text>
+                              <Typography.Text style={{ display: 'block' }}>
+                                谈前报价：
+                                {formatPrice(linkedHistoricalCase.current_quote_snapshot) ?? '暂无'}
+                              </Typography.Text>
+                              <Typography.Text style={{ display: 'block' }}>
+                                谈后价格：{formatPrice(linkedHistoricalCase.negotiated_price) ?? '-'}
+                              </Typography.Text>
+                              {linkedHistoricalCase.negotiated_at && (
+                                <Typography.Text type="secondary" style={{ display: 'block' }}>
+                                  谈价日期：{linkedHistoricalCase.negotiated_at}
+                                </Typography.Text>
+                              )}
+                              {(linkedHistoricalCase.reason_tag_labels || []).length > 0 && (
+                                <Typography.Text type="secondary" style={{ display: 'block' }}>
+                                  谈价原因 / 背景：
+                                  {(linkedHistoricalCase.reason_tags || [])
+                                    .map((tag) => NEGOTIATION_REASON_TAG_LABELS[tag] || tag)
+                                    .join(' · ')}
+                                </Typography.Text>
+                              )}
+                              {linkedHistoricalCase.reason_note && (
+                                <Typography.Text type="secondary" style={{ display: 'block' }}>
+                                  补充说明：{linkedHistoricalCase.reason_note}
+                                </Typography.Text>
+                              )}
+                              {linkedHistoricalCase.strategy_note && (
+                                <Typography.Text type="secondary" style={{ display: 'block' }}>
+                                  谈价依据 / 过程：{linkedHistoricalCase.strategy_note}
+                                </Typography.Text>
+                              )}
+                              <Button size="small" style={{ marginTop: 6 }} onClick={() => setNegotiationOpen(true)}>
+                                查看本次谈价记录
+                              </Button>
+                            </div>
+                          )}
+                          {/* Unification V0.2：没有真实报价阶段决策时不制造流程死锁，也不伪造 post_quote */}
+                          {!latestPostQuoteDecision && (
+                            <Typography.Text
+                              type="secondary"
+                              style={{ display: 'block', fontSize: 12, marginTop: 8 }}
+                            >
+                              本次谈价记录：当前没有报价阶段记录，如确实已发生谈价，请先补充当前报价 / 报价阶段事实。
+                            </Typography.Text>
+                          )}
+                        </div>
+
+                        <Divider style={{ margin: '4px 0' }} />
+
+                        {/* 二级：本轮结果（Phase 4E；只针对「最新 post_quote 且 eligible」的决策） */}
+                        <div>
+                          <Typography.Text strong>本轮结果</Typography.Text>
+                          <Typography.Text strong style={{ display: 'block', fontSize: 12, marginTop: 6 }}>
+                            实际投放结果
+                          </Typography.Text>
+                          {!latestPostQuoteEligible ? (
+                            <Typography.Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 6 }}>
+                              尚未进入可关联实际投放结果的阶段。
+                            </Typography.Text>
+                          ) : currentOutcome ? (
+                            <Space direction="vertical" size={2} style={{ display: 'flex', marginTop: 6 }}>
+                              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                                已关联实际投放
+                              </Typography.Text>
+                              <Typography.Text>达人：{currentOutcome.creator || '-'}</Typography.Text>
+                              <Typography.Text type="secondary">
+                                发布日期：{currentOutcome.publish_date || '-'} · 实际合作成本：
+                                {formatPrice(currentOutcome.total_cost) ?? '-'}
+                              </Typography.Text>
+                              <Typography.Text type="secondary">
+                                7日播放：{formatPlays(currentOutcome.first_play)} · 累计播放：
+                                {formatPlays(currentOutcome.latest_play)} · 最终 CPM：
+                                {currentOutcome.latest_cpm ?? '-'}
+                              </Typography.Text>
+                              <Typography.Text type="secondary">
+                                关联时间：{String(currentOutcome.linked_at || '').slice(0, 16)}
+                              </Typography.Text>
+                              <Space size={6} wrap>
+                                {currentOutcome.link_evidence?.identity?.override_used && (
+                                  <Tag>人工确认身份关联</Tag>
+                                )}
+                                {currentOutcome.link_evidence?.timing?.override_used && (
+                                  <Tag>人工确认发布时间关系</Tag>
+                                )}
+                              </Space>
+                            </Space>
+                          ) : (
+                            <Space size={8} wrap align="center" style={{ marginTop: 6 }}>
+                              <Typography.Text type="secondary">
+                                当前投放决定：
+                                {latestPostQuoteDecision.human_decision_label || latestPostQuoteDecision.human_decision}
+                              </Typography.Text>
+                              <Button type="primary" onClick={openOutcome}>
+                                关联实际投放记录
+                              </Button>
+                            </Space>
+                          )}
+                        </div>
+                      </Space>
+                    )
+                  }
+                ]}
+              />
+
+              <Divider style={{ margin: '16px 0 12px' }} />
+
+              {/* 一级：已关联合作记录（默认折叠）
+                  只使用 outcome 显式关联的投放记录：不按昵称模糊匹配、不按名称相等猜测、不自动连接历史 record。
+                  多轮合作 A / B 并存，每轮独立展示，绝不覆盖。 */}
+              <Collapse
+                ghost
+                activeKey={linkedRecordKeys}
+                onChange={(keys) => setLinkedRecordKeys(Array.isArray(keys) ? keys : [keys])}
+                items={[
+                  {
+                    key: 'linked-records',
+                    label: (
+                      <Space size={8} wrap>
+                        <Typography.Text strong style={{ fontSize: 15 }}>
+                          已关联合作记录（{linkedCollaborationRecords.length}）
+                        </Typography.Text>
+                        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                          仅统计已由 outcome 显式关联的投放记录
+                        </Typography.Text>
+                      </Space>
+                    ),
+                    children: (
+                      <div>
+                        {linkedCollaborationRecords.length === 0 ? (
+                          <Typography.Text type="secondary">暂无已关联的历史合作记录</Typography.Text>
+                        ) : (
                           <List
                             size="small"
-                            dataSource={decisions.slice(1)}
-                            renderItem={(item) => (
+                            dataSource={linkedCollaborationRecords}
+                            renderItem={({ decision, record }) => (
                               <List.Item style={{ paddingLeft: 0, paddingRight: 0 }}>
-                                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                                  {String(item.created_at || '').slice(0, 16)} ·{' '}
-                                  {item.human_decision_label || item.human_decision}
-                                  {item.decision_note ? ` · ${item.decision_note}` : ''}
-                                </Typography.Text>
+                                <Space direction="vertical" size={2} style={{ display: 'flex' }}>
+                                  <Space size={6} wrap>
+                                    <Typography.Text strong>{record.creator || '-'}</Typography.Text>
+                                    <Typography.Text type="secondary">
+                                      发布日期：{record.publish_date || '-'}
+                                    </Typography.Text>
+                                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                                      关联时间：{String(decision.outcome?.linked_at || '').slice(0, 16) || '-'}
+                                    </Typography.Text>
+                                    {currentOutcome?.record_id === record.record_id && <Tag>本轮</Tag>}
+                                  </Space>
+                                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                                    实际合作成本 {formatPrice(record.total_cost) ?? '-'} · 7日播放{' '}
+                                    {formatPlays(record.first_play)} · 累计播放 {formatPlays(record.latest_play)} ·
+                                    最终 CPM {record.latest_cpm ?? '-'}
+                                  </Typography.Text>
+                                </Space>
                               </List.Item>
                             )}
                           />
                         )}
                       </div>
-                    )}
-                  </div>
-                )}
-
-                {/* Phase 4D：报价阶段（继续联系后的自然 next step；同时保留直接记录入口，不制造流程死锁） */}
-                <div style={{ marginTop: 12 }}>
-                  <Space size={8} wrap align="center">
-                    {reviewContactConfirmed ? (
-                      <Button type="primary" ghost onClick={openPostQuote}>
-                        记录当前报价
-                      </Button>
-                    ) : (
-                      <Button onClick={openPostQuote}>已有报价，直接记录</Button>
-                    )}
-                    {!snapshot && (
-                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                        需先录入近期表现
-                      </Typography.Text>
-                    )}
-                  </Space>
-
-                  {latestPostQuoteDecision && (
-                    <div style={{ marginTop: 10 }}>
-                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                        最近报价阶段
-                      </Typography.Text>
-                      <Space direction="vertical" size={2} style={{ display: 'flex', marginTop: 4 }}>
-                        <Typography.Text>
-                          当前报价：{formatPrice(latestPostQuoteDecision.current_quote) ?? '-'}
-                          {latestPostQuoteDecision.pricing_evidence?.xingtu_price !== null &&
-                          latestPostQuoteDecision.pricing_evidence?.xingtu_price !== undefined
-                            ? ` · 星图刊例：${formatPrice(latestPostQuoteDecision.pricing_evidence.xingtu_price)}`
-                            : ''}
-                          {typeof latestPostQuoteDecision.pricing_evidence?.quote_to_xingtu_ratio === 'number'
-                            ? ` · 当前报价约 ${(latestPostQuoteDecision.pricing_evidence.quote_to_xingtu_ratio * 10).toFixed(1)} 折`
-                            : ''}
-                        </Typography.Text>
-                        {latestPostQuoteDecision.pricing_evidence?.playbook_estimate && (
-                          <Typography.Text type="secondary">
-                            Playbook 估价：
-                            {renderEstimateRange({
-                              low: latestPostQuoteDecision.pricing_evidence.playbook_estimate.estimate_low,
-                              high: latestPostQuoteDecision.pricing_evidence.playbook_estimate.estimate_high
-                            })}
-                            {' · 报价位置：'}
-                            {QUOTE_POSITION_LABELS[
-                              latestPostQuoteDecision.pricing_evidence.current_quote_assessment?.position
-                            ] || '-'}
-                          </Typography.Text>
-                        )}
-                        <Typography.Text type="secondary">
-                          人工决定：
-                          {latestPostQuoteDecision.human_decision_label || latestPostQuoteDecision.human_decision} ·{' '}
-                          {String(latestPostQuoteDecision.created_at || '').slice(0, 16)}
-                        </Typography.Text>
-                        {latestPostQuoteDecision.decision_note && (
-                          <Typography.Text type="secondary">
-                            备注：{latestPostQuoteDecision.decision_note}
-                          </Typography.Text>
-                        )}
-
-                        {/* Phase 4F-B：谈价结果（只有「最新 post_quote = negotiate」才出现） */}
-                        {latestPostQuoteNegotiating && !latestNegotiationCase && (
-                          <Button size="small" onClick={() => setNegotiationOpen(true)}>
-                            记录谈价结果
-                          </Button>
-                        )}
-                        {latestPostQuoteNegotiating && latestNegotiationCase && (
-                          <div style={{ marginTop: 6, borderTop: '1px dashed #f0f0f0', paddingTop: 6 }}>
-                            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                              谈价结果
-                            </Typography.Text>
-                            <Typography.Text style={{ display: 'block' }}>
-                              初始报价：{formatPrice(latestNegotiationCase.current_quote_snapshot) ?? '暂无'}
-                            </Typography.Text>
-                            <Typography.Text style={{ display: 'block' }}>
-                              谈后价格：{formatPrice(latestNegotiationCase.negotiated_price) ?? '-'}
-                            </Typography.Text>
-                            <Typography.Text type="secondary" style={{ display: 'block' }}>
-                              星图刊例：
-                              {latestNegotiationCase.xingtu_price_snapshot === null ||
-                              latestNegotiationCase.xingtu_price_snapshot === undefined
-                                ? '暂无'
-                                : `${formatPrice(latestNegotiationCase.xingtu_price_snapshot)} · 谈后价约为星图 ${
-                                    latestNegotiationCase.outcome?.xingtu_discount_zhe ?? '-'
-                                  }折 · 初始报价约为星图 ${
-                                    latestNegotiationCase.outcome?.initial_quote_to_xingtu_ratio !== null &&
-                                    latestNegotiationCase.outcome?.initial_quote_to_xingtu_ratio !== undefined
-                                      ? (latestNegotiationCase.outcome.initial_quote_to_xingtu_ratio * 10).toFixed(1)
-                                      : '-'
-                                  }折`}
-                            </Typography.Text>
-                            <Typography.Text type="secondary" style={{ display: 'block' }}>
-                              相对初始报价：
-                              {latestNegotiationCase.outcome?.quote_change_rate === null ||
-                              latestNegotiationCase.outcome?.quote_change_rate === undefined
-                                ? '无法计算（初始报价为 0 / 暂无）'
-                                : latestNegotiationCase.outcome.quote_change_rate < 0
-                                  ? `下降 ${(Math.abs(latestNegotiationCase.outcome.quote_change_rate) * 100).toFixed(1)}%`
-                                  : latestNegotiationCase.outcome.quote_change_rate > 0
-                                    ? `上升 ${(latestNegotiationCase.outcome.quote_change_rate * 100).toFixed(1)}%`
-                                    : '无变化'}
-                            </Typography.Text>
-                            {(latestNegotiationCase.reason_tag_labels || []).length > 0 && (
-                              <Typography.Text type="secondary" style={{ display: 'block' }}>
-                                原因：{latestNegotiationCase.reason_tag_labels.join(' · ')}
-                              </Typography.Text>
-                            )}
-                            {latestNegotiationCase.reason_note && (
-                              <Typography.Text type="secondary" style={{ display: 'block' }}>
-                                补充说明：{latestNegotiationCase.reason_note}
-                              </Typography.Text>
-                            )}
-                            {latestNegotiationCase.strategy_note && (
-                              <Typography.Text type="secondary" style={{ display: 'block' }}>
-                                谈价依据 / 过程：{latestNegotiationCase.strategy_note}
-                              </Typography.Text>
-                            )}
-                            <Button
-                              size="small"
-                              style={{ marginTop: 6 }}
-                              onClick={() => openPostQuote(String(latestNegotiationCase.negotiated_price))}
-                            >
-                              以谈后价继续判断
-                            </Button>
-                          </div>
-                        )}
-                      </Space>
-                    </div>
-                  )}
-                </div>
-
-                <Divider style={{ margin: '12px 0' }} />
-
-                {/* Phase 4E：实际投放结果（只针对「最新 post_quote 且 eligible」的决策） */}
-                <div>
-                  <Typography.Text strong>实际投放结果</Typography.Text>
-                  {!latestPostQuoteEligible ? (
-                    <Typography.Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 6 }}>
-                      尚未进入可关联实际投放结果的阶段。
-                    </Typography.Text>
-                  ) : currentOutcome ? (
-                    <Space direction="vertical" size={2} style={{ display: 'flex', marginTop: 6 }}>
-                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                        已关联实际投放
-                      </Typography.Text>
-                      <Typography.Text>达人：{currentOutcome.creator || '-'}</Typography.Text>
-                      <Typography.Text type="secondary">
-                        发布日期：{currentOutcome.publish_date || '-'} · 实际合作成本：
-                        {formatPrice(currentOutcome.total_cost) ?? '-'}
-                      </Typography.Text>
-                      <Typography.Text type="secondary">
-                        7日播放：{formatPlays(currentOutcome.first_play)} · 累计播放：
-                        {formatPlays(currentOutcome.latest_play)} · 最终 CPM：
-                        {currentOutcome.latest_cpm ?? '-'}
-                      </Typography.Text>
-                      <Typography.Text type="secondary">
-                        关联时间：{String(currentOutcome.linked_at || '').slice(0, 16)}
-                      </Typography.Text>
-                      <Space size={6} wrap>
-                        {currentOutcome.link_evidence?.identity?.override_used && (
-                          <Tag>人工确认身份关联</Tag>
-                        )}
-                        {currentOutcome.link_evidence?.timing?.override_used && (
-                          <Tag>人工确认发布时间关系</Tag>
-                        )}
-                      </Space>
-                    </Space>
-                  ) : (
-                    <Space size={8} wrap align="center" style={{ marginTop: 6 }}>
-                      <Typography.Text type="secondary">
-                        当前投放决定：
-                        {latestPostQuoteDecision.human_decision_label || latestPostQuoteDecision.human_decision}
-                      </Typography.Text>
-                      <Button type="primary" onClick={openOutcome}>
-                        关联实际投放记录
-                      </Button>
-                    </Space>
-                  )}
-                </div>
-              </div>
-            </Card>
+                    )
+                  }
+                ]}
+              />
+            </div>
           )}
         </Col>
       </Row>
@@ -1313,17 +1648,17 @@ export default function CreatorPlaybook() {
           </Form.Item>
           <Form.Item
             name="description"
-            label="人工备注（可选）"
-            extra="备注变化后，旧的 AI 整理结果会自动失效"
+            label="人工观察（可选）"
+            extra="观察内容变化后，旧的 AI 整理达人资料结果会自动失效"
           >
             <Input.TextArea placeholder="来源 / 判断线索等" maxLength={500} autoSize={{ minRows: 2, maxRows: 4 }} />
           </Form.Item>
         </Form>
       </Modal>
 
-      {/* Phase 4B：人工决定确认（轻量 Modal；无默认选中，不推荐） */}
+      {/* 当前处理（Work State）确认：沿用既有 candidate_review decision 创建能力（append-only，不 UPDATE） */}
       <Modal
-        title="记录人工决定"
+        title="更新当前处理"
         open={Boolean(pendingDecision)}
         onCancel={() => {
           setPendingDecision(null)
@@ -1339,6 +1674,9 @@ export default function CreatorPlaybook() {
           <div>
             <Typography.Text type="secondary">你选择：</Typography.Text>
             <Typography.Text strong>{pendingDecision?.label}</Typography.Text>
+            <Typography.Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 4 }}>
+              会新增一条人工决定记录（历史记录不覆盖）；当前处理只由最新一次人工决定派生。
+            </Typography.Text>
           </div>
           <div>
             <Typography.Text type="secondary">决策备注（可选）</Typography.Text>
@@ -1406,11 +1744,14 @@ export default function CreatorPlaybook() {
         </Space>
       </Modal>
 
-      {/* Phase 4F-B：记录谈价结果（复用现有 NegotiationCaseModal，candidate 模式不展示 CPM30 体系） */}
-      <NegotiationCaseModal
+      {/* Unification V0.2：谈价经验（共享谈价经验表单 + live negotiation case 领域模型） */}
+      <CandidateNegotiationExperienceModal
         open={negotiationOpen}
+        candidate={selected}
         decision={latestPostQuoteDecision}
-        mode="candidate_playbook"
+        postQuoteDecision={latestPostQuoteDecision}
+        existingCase={existingNegotiationExperience}
+        xingtuPrice={snapshot?.xingtu_price ?? null}
         onClose={() => setNegotiationOpen(false)}
         onSaved={() => loadDecisions(selectedId)}
       />

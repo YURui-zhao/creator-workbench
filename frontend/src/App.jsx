@@ -27,7 +27,7 @@ export default function App() {
       <Route path="/repurchase-radar" element={<MainLayout />}>
         <Route index element={<RepurchaseRadar />} />
       </Route>
-      {/* 新达人判断（V3-alpha.3 Playbook Phase 1） */}
+      {/* 达人拓展（原「新达人判断」；V3-alpha.3 Playbook + 达人拓展信息架构） */}
       <Route path="/creator-playbook" element={<MainLayout />}>
         <Route index element={<CreatorPlaybook />} />
       </Route>

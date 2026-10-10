@@ -130,13 +130,23 @@ function main() {
   check('高播放标签只消费 Rule Engine（assessment.highPlaySignal.label）', /assessment\.highPlaySignal\.label/.test(page))
   check('估价说明只消费 Rule Engine（页面不自行拼装商单/日常文案）', /assessment\.estimate\.explanation/.test(page) && !/商单样本仅/.test(page))
 
-  console.log('\n===== 9. 人工决定（Phase 4B） =====')
+  console.log('\n===== 9. 当前处理 / Work State（Phase 4B 之上的 IA 收敛） =====')
   check('页面调用 candidate decision API', /createCandidateDecision\(selected\.id,/.test(page) && /listCandidateDecisions\(candidateId\)/.test(page))
-  check('三个决定按钮（继续联系 / 继续观察 / 暂不推进）', /继续联系/.test(page) && /继续观察/.test(page) && /暂不推进/.test(page) && /CANDIDATE_REVIEW_OPTIONS\.map/.test(page))
+  // Work State 三选一：contact → 推进中 / observe → 观察中 / hold → 暂缓池（纯函数来自 utils/creatorWorkState.js）
+  check(
+    '三个工作状态按钮（推进中 / 观察中 / 暂缓池）',
+    /推进中/.test(page) && /观察中/.test(page) && /暂缓池/.test(page) && /WORK_STATE_OPTIONS\.map/.test(page)
+  )
+  check(
+    '三个状态按钮只消费 Work State 派生值（不在页面本地重算 candidate_review 语义）',
+    /currentWorkState\.value === option\.value/.test(page) &&
+      /deriveWorkState\(decisions\)/.test(page) &&
+      !/CANDIDATE_REVIEW_OPTIONS/.test(page)
+  )
   check('无默认选中（pendingDecision 初始为 null，且按钮由点击显式发起）', /useState\(null\)[\s\S]{0,40}pendingDecision|const \[pendingDecision, setPendingDecision\] = useState\(null\)/.test(page) && /onClick=\{\(\) => openDecision\(option\)\}/.test(page))
   check('轻量确认 Modal：你选择 / 决策备注 / 记录决定', /你选择：/.test(page) && /决策备注（可选）/.test(page) && /okText="记录决定"/.test(page))
-  check('保存后展示最近一次人工决定 + 时间 + 备注', /最近一次人工决定/.test(page) && /decisions\[0\]\.decision_note/.test(page))
-  check('多条历史可折叠查看', /查看历史决定（/.test(page) && /historyExpanded/.test(page))
+  check('状态备注展示最新 candidate_review.decision_note', /状态备注：/.test(page) && /currentWorkState\.note/.test(page))
+  check('多条历史可折叠查看（只统计 candidate_review）', /查看历史决定（/.test(page) && /historyExpanded/.test(page) && /reviewDecisions\.slice\(1\)/.test(page))
   check('决定文案单一来源（消费 human_decision_label，不本地映射）', /human_decision_label/.test(page) && !/contact:\s*'继续联系'/.test(page))
   check('页面不做推荐 / 不自动选择 / 不出现评分字段', !/shouldInvest|recommendation_score|推荐决定|建议选择/.test(page))
 

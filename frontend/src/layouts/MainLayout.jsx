@@ -26,7 +26,7 @@ const MENU_ITEMS = [
   { key: 'dashboard', icon: <BarChartOutlined />, label: '数据看板' },
   { key: 'creators', icon: <TeamOutlined />, label: '达人汇总' },
   { key: 'repurchase-radar', icon: <RadarChartOutlined />, label: '复投雷达' },
-  { key: 'creator-playbook', icon: <ExperimentOutlined />, label: '新达人判断' },
+  { key: 'creator-playbook', icon: <ExperimentOutlined />, label: '达人拓展' },
   { key: 'records', icon: <OrderedListOutlined />, label: '投放管理' },
   { key: 'import-history', icon: <HistoryOutlined />, label: '导入历史' }
 ]

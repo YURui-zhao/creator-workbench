@@ -10,6 +10,8 @@ import creatorDecisionsRouter from './routes/creatorDecisions.js'
 import creatorDecisionOutcomesRouter from './routes/creatorDecisionOutcomes.js'
 import creatorNegotiationCasesRouter from './routes/creatorNegotiationCases.js'
 import creatorCandidatesRouter from './routes/creatorCandidates.js'
+// Creator Identity V1 Phase 2：Creator 身份层只读视图（creators / creator_aliases）
+import creatorsRouter from './routes/creators.js'
 import importBatchesRouter from './routes/importBatches.js'
 import recentSnapshotsRouter from './routes/recentSnapshots.js'
 import recordsRouter from './routes/records.js'
@@ -66,6 +68,8 @@ app.use('/api/creator-decisions', creatorDecisionOutcomesRouter)
 app.use('/api/creator-negotiation-cases', creatorNegotiationCasesRouter)
 // Playbook Phase 1：候选达人身份层（独立表 / 独立路由，不影响 creator_records 与 Radar）
 app.use('/api/creator-candidates', creatorCandidatesRouter)
+// Creator Identity Phase 2：Creator 只读接口（GET only；不写库、不影响 legacy nickname 路径）
+app.use('/api/creators', creatorsRouter)
 app.use('/api/import', importBatchesRouter)
 app.use('/api/recent-snapshots', recentSnapshotsRouter)
 app.use('/api/records', recordsRouter)

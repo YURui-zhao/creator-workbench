@@ -580,6 +580,8 @@ async function main() {
 main()
   .catch((error) => {
     console.error('测试执行异常：', error)
+    failCount += 1
+    failures.push(`执行异常：${error?.message || error}`)
     process.exitCode = 1
   })
   .finally(() => {

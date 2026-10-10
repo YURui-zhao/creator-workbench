@@ -138,6 +138,13 @@ async function main() {
   check('--commit 拒绝非临时库路径', commitRejected)
   const tmpPath = path.join(os.tmpdir(), 'creator-identity-guard', 'workbench.db')
   check('--commit 允许临时库路径', migration.guardDbPath(tmpPath, 'commit').endsWith('workbench.db'))
+  // 回归：不存在的临时路径（无法 realpath）也必须被接受；仓库内路径必须被拒绝
+  const nonExistentTemp = path.join(os.tmpdir(), 'creator-identity-guard-not-created', 'x.db')
+  check('--commit 允许“尚未创建”的临时库路径（realpath 不可用也不能误拒）',
+    migration.guardDbPath(nonExistentTemp, 'commit').endsWith('x.db'))
+  check('isUnderTempRoot：临时路径 true / 仓库路径 false',
+    migration.isUnderTempRoot(nonExistentTemp) === true &&
+      migration.isUnderTempRoot(path.join(REPO_ROOT, 'backend', 'workbench.db')) === false)
   check('REAL_DB_PATH 指向 backend/workbench.db', migration.REAL_DB_PATH === path.join(REPO_ROOT, 'backend', 'workbench.db'))
   check(
     'canonicalDbPath 与 REAL_DB_PATH 等价（symlink 安全）',
@@ -170,6 +177,9 @@ async function main() {
 main()
   .catch((error) => {
     console.error('测试执行异常：', error)
+    // 关键：异常必须计入失败，否则 main() 中途抛错会被打印成「失败：0 / 通过率 100%」而静默截断
+    failCount += 1
+    failures.push(`执行异常：${error?.message || error}`)
     process.exitCode = 1
   })
   .finally(() => {

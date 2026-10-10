@@ -27,6 +27,15 @@ import { parsePriceText } from '../utils/screenshotValues.js'
 import { loadOutcomeSummaries } from './creatorDecisionOutcomes.js'
 // Phase 4F-B：候选决策历史附带谈价结果（按 decision_id 关联，绝不按名称查询）
 import { loadNegotiationCaseSummaries } from './creatorNegotiationCases.js'
+// Phase 2：服务端 Work State 只读派生（新表优先 / legacy fallback，两表绝不混合）
+import {
+  hasColumn,
+  hasTable,
+  latestWorkStateCte,
+  loadWorkStateHistory,
+  resolveWorkState,
+  workStateMode
+} from '../utils/creatorWorkStateRead.js'
 
 /**
  * 候选达人身份层（V3-alpha.3 Playbook Phase 1）
@@ -183,6 +192,40 @@ function toPublicCandidate(row) {
 }
 
 /**
+ * Phase 2：candidate 对外字段 = 原 contract（toPublicCandidate，字段一个不少）
+ *   + additive：creator_id / creator（轻量对象）/ work_state / work_state_note /
+ *               work_state_updated_at / work_state_source
+ *
+ * 说明：
+ *   · candidate.name 仍是 legacy display cache，权威显示名是 creator.canonical_name（本轮不切）
+ *   · work_state 由服务端派生（新表优先，老环境 legacy fallback），前端无需逐 candidate 拉 decisions
+ *   · work_state_source 只为可观测性（events / legacy / default），不参与业务判断
+ */
+function toPublicCandidateWithWorkState(row, workState, creator = null) {
+  const base = toPublicCandidate(row)
+  if (!base) return null
+  return {
+    ...base,
+    creator_id: row.creator_id ?? null,
+    creator,
+    work_state: workState.state,
+    work_state_note: workState.note ?? null,
+    work_state_updated_at: workState.created_at ?? null,
+    work_state_source: workState.source
+  }
+}
+
+/** 轻量 creator 引用（只在 additive 列/表都存在时可用）；不复制完整 Profile */
+function loadCreatorLight(candidateRow) {
+  if (candidateRow?.creator_id === null || candidateRow?.creator_id === undefined) return null
+  if (!hasColumn(db, 'creator_candidates', 'creator_id') || !hasTable(db, 'creators')) return null
+  const row = db
+    .prepare('SELECT id, canonical_name, identity_status FROM creators WHERE id = ?')
+    .get(candidateRow.creator_id)
+  return row ? { id: row.id, canonical_name: row.canonical_name, identity_status: row.identity_status } : null
+}
+
+/**
  * POST /api/creator-candidates
  * body: { name, creator_type?, profile_url?, description?, status? }
  * name 不唯一：允许创建两个同名 candidate（id 不同）。
@@ -222,26 +265,79 @@ router.post('/', (req, res) => {
 /**
  * GET /api/creator-candidates?status=active|archived
  * 列表（默认返回全部；id DESC，最新在前）。不返回任何 snapshot 统计。
+ *
+ * Phase 2：同一 SQL 内联「每个 candidate 的最新 Work State」（窗口函数 + CTE），
+ * 不再需要前端逐 candidate 拉 decisions（消除 N+1）。SQL 条数与候选数量无关。
  */
 router.get('/', (req, res) => {
   const status = typeof req.query?.status === 'string' ? req.query.status.trim() : ''
   if (status && !STATUS_VALUES.includes(status)) {
     return fail(res, 400, `status 只支持 ${STATUS_VALUES.join(' / ')}`)
   }
-  const rows = status
-    ? db.prepare('SELECT * FROM creator_candidates WHERE status = ? ORDER BY id DESC').all(status)
-    : db.prepare('SELECT * FROM creator_candidates ORDER BY id DESC').all()
-  ok(res, { candidates: rows.map(toPublicCandidate) })
+
+  const mode = workStateMode(db)
+  // additive 列/表缺失（老 fixture）时退化为不 join creators，creator 字段为 null
+  const hasCreatorRef = hasColumn(db, 'creator_candidates', 'creator_id') && hasTable(db, 'creators')
+  const creatorJoin = hasCreatorRef ? 'LEFT JOIN creators cr ON cr.id = c.creator_id' : ''
+  const creatorSelect = hasCreatorRef
+    ? ', cr.canonical_name AS creator_canonical_name, cr.identity_status AS creator_identity_status'
+    : ''
+  // legacy 模式下 latest_ws 没有 state 列 → 显式补 NULL，保持对外字段形状一致
+  const workStateSelect =
+    mode === 'events'
+      ? 'ws.state AS ws_state, ws.legacy_state AS ws_legacy_state, ws.note AS ws_note, ws.created_at AS ws_created_at'
+      : 'NULL AS ws_state, ws.legacy_state AS ws_legacy_state, ws.note AS ws_note, ws.created_at AS ws_created_at'
+
+  const sql = `WITH ${latestWorkStateCte(mode)}
+    SELECT c.*${creatorSelect}, ${workStateSelect}
+    FROM creator_candidates c
+    ${creatorJoin}
+    LEFT JOIN latest_ws ws ON ws.candidate_id = c.id
+    ${status ? 'WHERE c.status = ?' : ''}
+    ORDER BY c.id DESC`
+
+  const rows = status ? db.prepare(sql).all(status) : db.prepare(sql).all()
+  ok(res, {
+    candidates: rows.map((row) => {
+      const workState = resolveWorkState(
+        {
+          state: row.ws_state,
+          legacy_state: row.ws_legacy_state,
+          note: row.ws_note,
+          created_at: row.ws_created_at
+        },
+        mode
+      )
+      const creator =
+        hasCreatorRef && row.creator_id !== null && row.creator_id !== undefined && row.creator_canonical_name
+          ? {
+              id: row.creator_id,
+              canonical_name: row.creator_canonical_name,
+              identity_status: row.creator_identity_status
+            }
+          : null
+      return toPublicCandidateWithWorkState(row, workState, creator)
+    })
+  })
 })
 
 /**
  * GET /api/creator-candidates/:id
- * 候选达人基本信息（不含 snapshot）。
+ * 候选达人基本信息（不含 snapshot）+ Phase 2 服务端 Work State（含 append-only 历史）。
+ *
+ * work_state_history 契约：数组，最新 → 最旧（ORDER BY created_at DESC, id DESC，稳定 tie-break）。
  */
 router.get('/:id', (req, res) => {
   const row = findCandidateRow(req.params.id)
   if (!row) return fail(res, 404, `候选达人不存在（id=${req.params.id}）`)
-  ok(res, toPublicCandidate(row))
+  const mode = workStateMode(db)
+  const history = loadWorkStateHistory(db, row.id, mode)
+  // 最新一条 = history[0]（history 契约已保证最新在前）；无事件 → default advancing（不写库）
+  const workState = resolveWorkState(history.length ? history[0] : null, mode)
+  ok(res, {
+    ...toPublicCandidateWithWorkState(row, workState, loadCreatorLight(row)),
+    work_state_history: history
+  })
 })
 
 /**

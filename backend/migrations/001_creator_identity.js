@@ -840,6 +840,27 @@ export function isRealDbPath(dbPath) {
 }
 
 /**
+ * 路径是否位于临时目录（commit mode 允许范围）。
+ * 注意：macOS 上 /tmp → /private/tmp、/var/folders → /private/var/folders 会被 realpath 改写，
+ * 而**不存在的**路径无法 realpath（只能 path.resolve）。因此两侧都取「原始形式 + canonical 形式」
+ * 做前缀比较，避免合法临时库被误拒（或仓库内路径被误放行）。
+ */
+export function isUnderTempRoot(dbPath) {
+  const forms = new Set([path.resolve(String(dbPath)), canonicalDbPath(dbPath)])
+  const roots = new Set()
+  for (const root of [os.tmpdir(), '/tmp', '/private/tmp']) {
+    roots.add(path.resolve(root))
+    roots.add(canonicalDbPath(root))
+  }
+  for (const form of forms) {
+    for (const root of roots) {
+      if (form === root || form.startsWith(root + path.sep)) return true
+    }
+  }
+  return false
+}
+
+/**
  * 路径护栏（默认拒绝真实库）。
  * @param {string} dbPath
  * @param {'dry-run'|'commit'} mode
@@ -861,8 +882,7 @@ export function guardDbPath(dbPath, mode, { allowRealDb = false } = {}) {
     return resolved
   }
   if (mode === 'commit') {
-    const inTemp = resolved.startsWith(os.tmpdir()) || resolved.includes('/tmp/')
-    if (!inTemp) throw new Error(`--commit 仅允许用于临时库（当前：${resolved}）`)
+    if (!isUnderTempRoot(dbPath)) throw new Error(`--commit 仅允许用于临时库（当前：${resolved}）`)
   }
   return resolved
 }

@@ -887,9 +887,39 @@ export function guardDbPath(dbPath, mode, { allowRealDb = false } = {}) {
   return resolved
 }
 
-/** 文件 sha256（迁移前源库指纹；WAL 场景下作为「源库未被写入」的强指示） */
+/** 单个文件 sha256（备份文件 / 主库文件各自使用；**不能**单独当作「逻辑库未变化」的证明） */
 export function computeFileSha256(filePath) {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex')
+}
+
+/**
+ * Creator Identity 审计 §17：WAL 感知的数据库状态指纹。
+ *
+ * 冻结规则（修正 Phase 1 的错误假设「主 .db sha 不变 = 逻辑库未变化」）：
+ *   · WAL 模式下，已提交写入可能只存在于 -wal 文件中，主 .db 的 sha **不变**。
+ *   · 因此「源库未被写入」的证明必须同时覆盖 主库字节 + WAL 字节（本函数的 fingerprint），
+ *     并在报告里同时暴露 main sha / WAL bytes / WAL sha。
+ *   · 0 字节 WAL 视为不存在。
+ *   · 业务逻辑计数 / integrity 由 snapshotBusinessData / PRAGMA integrity_check 另行校验（见检查 C/B）。
+ */
+export function computeDbStateFingerprint(dbPath) {
+  const canonical = canonicalDbPath(dbPath)
+  const mainBytes = fs.readFileSync(canonical)
+  const walPath = `${canonical}-wal`
+  const walBytes = fs.existsSync(walPath) ? fs.readFileSync(walPath) : Buffer.alloc(0)
+  const hash = crypto.createHash('sha256')
+  // 长度前缀框架：主库与 WAL 字节流不可能产生歧义拼接
+  hash.update(Buffer.from('creator-db-state-v1:'))
+  hash.update(Buffer.from(mainBytes.length.toString(16), 'utf8')).update(Buffer.from(':'))
+  hash.update(mainBytes)
+  hash.update(Buffer.from(walBytes.length.toString(16), 'utf8')).update(Buffer.from(':'))
+  hash.update(walBytes)
+  return {
+    fingerprint: hash.digest('hex'),
+    mainSha: crypto.createHash('sha256').update(mainBytes).digest('hex'),
+    walBytes: walBytes.length,
+    walSha: walBytes.length ? crypto.createHash('sha256').update(walBytes).digest('hex') : null
+  }
 }
 
 const SHA256_RE = /^[0-9a-f]{64}$/
@@ -935,25 +965,25 @@ export function authorizeRealDbCommit({
   const backupExists = Boolean(backupPath) && fs.existsSync(backupPath) && fs.statSync(backupPath).isFile()
   push('A', 'backup exists', backupExists, backupExists ? String(backupPath) : `不存在或不是文件：${backupPath ?? '(未提供 --backup-path)'}`)
 
-  // D. expected source sha
+  // D. expected source 状态指纹（WAL 感知：主库 + WAL 字节；主文件 sha 单独不能证明逻辑未变）
   const expected = String(expectedSourceSha ?? '').trim().toLowerCase()
-  let actualSha = null
+  let sourceState = null
   try {
-    actualSha = computeFileSha256(canonicalSource ?? sourcePath)
+    sourceState = computeDbStateFingerprint(canonicalSource ?? sourcePath)
   } catch (error) {
-    actualSha = null
+    sourceState = null
     push('D', 'expected source sha256', false, `无法读取源库：${error?.message || error}`)
   }
   if (!checks.some((c) => c.id === 'D')) {
     const shaShapeOk = SHA256_RE.test(expected)
-    const shaMatch = shaShapeOk && actualSha === expected
+    const shaMatch = shaShapeOk && sourceState?.fingerprint === expected
     push(
       'D',
-      'expected source sha256',
+      'expected source state fingerprint',
       shaMatch,
       shaMatch
-        ? expected
-        : `期望=${expected || '(未提供 --expected-source-sha)'} 实际=${actualSha ?? '(读取失败)'}`
+        ? `${expected} (main=${sourceState.mainSha} wal=${sourceState.walBytes}B)`
+        : `期望=${expected || '(未提供 --expected-source-sha)'} 实际=${sourceState?.fingerprint ?? '(读取失败)'} (main=${sourceState?.mainSha ?? '-'} wal=${sourceState?.walBytes ?? '-'}B)`
     )
   }
 
@@ -1004,7 +1034,7 @@ export function authorizeRealDbCommit({
   if (sourceDb) sourceDb.close()
   if (backupDb) backupDb.close()
 
-  return { ok: errors.length === 0, checks, errors, sourceSha: actualSha }
+  return { ok: errors.length === 0, checks, errors, sourceSha: sourceState?.fingerprint ?? null, sourceState }
 }
 
 export function printAuthorization(auth) {
@@ -1077,6 +1107,31 @@ async function main() {
   const canonicalRequested = canonicalDbPath(requested)
   const realTarget = isRealDbPath(canonicalRequested)
 
+  // Phase audit §17：任何迁移/安全判断都必须先记录完整 DB 状态（主库 + WAL + 逻辑计数 + integrity）
+  try {
+    const stateDb = new Database(canonicalRequested, { readonly: true, fileMustExist: true })
+    const stateFingerprint = computeDbStateFingerprint(canonicalRequested)
+    const integrity = String(stateDb.prepare('PRAGMA integrity_check').get()?.integrity_check ?? '')
+    const businessCounts = snapshotBusinessData(stateDb)
+    console.log('')
+    console.log('=== Source DB state（main + WAL + logical counts + integrity）===')
+    console.log(`path: ${canonicalRequested}`)
+    console.log(`main sha256: ${stateFingerprint.mainSha}`)
+    console.log(`wal: ${stateFingerprint.walBytes}B${stateFingerprint.walSha ? ` sha256=${stateFingerprint.walSha}` : ' (空)'}`)
+    console.log(`integrity_check: ${integrity}`)
+    console.log(
+      'logical counts: ' +
+        Object.entries(businessCounts)
+          .map(([table, info]) => `${table}=${info.count}`)
+          .join(' ')
+    )
+    stateDb.close()
+  } catch (error) {
+    console.error('读取源库状态失败：', error?.message || error)
+    process.exitCode = 1
+    return
+  }
+
   // 真实库：默认拒绝；commit 需要完整 A–E 授权
   if (realTarget) {
     if (args.mode !== 'commit') {
@@ -1139,7 +1194,11 @@ async function main() {
           /* 非致命 */
         }
         console.log(`REAL_MIGRATION_RESULT: COMMITTED`)
-        console.log(`post-migration source sha256: ${computeFileSha256(dbPath)}`)
+        // Phase audit §17：迁移后的库状态必须同时暴露 主库 sha / WAL / 逻辑计数（不能只看主文件 sha）
+        const postState = computeDbStateFingerprint(dbPath)
+        console.log(
+          `post-migration db state: fingerprint=${postState.fingerprint} main=${postState.mainSha} wal=${postState.walBytes}B`
+        )
         console.log(`backup: ${args.backupPath}`)
       } else {
         console.log('REAL_MIGRATION_RESULT: ROLLED_BACK')

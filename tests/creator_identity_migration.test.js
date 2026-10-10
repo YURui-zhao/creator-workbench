@@ -474,7 +474,7 @@ async function main() {
         sourcePath: fixture.dbPath,
         realDbPath: fixture.dbPath, // 测试用「假真实库」避免触碰真实库
         backupPath,
-        expectedSourceSha: migration.computeFileSha256(fixture.dbPath)
+        expectedSourceSha: migration.computeDbStateFingerprint(fixture.dbPath).fingerprint
       })
       check('A–E 全部满足 → 授权通过', auth.ok === true, JSON.stringify(auth.errors))
       check('授权报告包含 5 项检查（A/B/C/D/E）', auth.checks.length === 5 && auth.checks.every((c) => c.pass))
@@ -489,7 +489,7 @@ async function main() {
         sourcePath: fixture.dbPath,
         realDbPath: fixture.dbPath,
         backupPath: null,
-        expectedSourceSha: migration.computeFileSha256(fixture.dbPath)
+        expectedSourceSha: migration.computeDbStateFingerprint(fixture.dbPath).fingerprint
       })
       check('缺 --backup-path → hard fail（A）', auth.ok === false && auth.checks.find((c) => c.id === 'A').pass === false)
       fixture.db.close()
@@ -502,7 +502,7 @@ async function main() {
         sourcePath: fixture.dbPath,
         realDbPath: fixture.dbPath,
         backupPath: path.join(tmpRoot, 'not-there.db'),
-        expectedSourceSha: migration.computeFileSha256(fixture.dbPath)
+        expectedSourceSha: migration.computeDbStateFingerprint(fixture.dbPath).fingerprint
       })
       check('--backup-path 指向不存在的文件 → hard fail', auth.ok === false)
       fixture.db.close()
@@ -527,7 +527,7 @@ async function main() {
         sourcePath: fixture.dbPath,
         realDbPath: path.join(tmpRoot, 'some-other.db'),
         backupPath,
-        expectedSourceSha: migration.computeFileSha256(fixture.dbPath)
+        expectedSourceSha: migration.computeDbStateFingerprint(fixture.dbPath).fingerprint
       })
       check('db path 不等于真实库 → hard fail（E）', auth.ok === false && auth.checks.find((c) => c.id === 'E').pass === false)
       fixture.db.close()
@@ -542,7 +542,7 @@ async function main() {
         sourcePath: fixture.dbPath,
         realDbPath: fixture.dbPath,
         backupPath: brokenPath,
-        expectedSourceSha: migration.computeFileSha256(fixture.dbPath)
+        expectedSourceSha: migration.computeDbStateFingerprint(fixture.dbPath).fingerprint
       })
       check('备份损坏（integrity 无法通过）→ hard fail（B）', auth.ok === false && auth.checks.find((c) => c.id === 'B').pass === false)
       fixture.db.close()
@@ -559,9 +559,57 @@ async function main() {
         sourcePath: fixture.dbPath,
         realDbPath: fixture.dbPath,
         backupPath,
-        expectedSourceSha: migration.computeFileSha256(fixture.dbPath)
+        expectedSourceSha: migration.computeDbStateFingerprint(fixture.dbPath).fingerprint
       })
       check('备份缺少业务行（logical hash 不一致）→ hard fail（C）', auth.ok === false && auth.checks.find((c) => c.id === 'C').pass === false)
+      fixture.db.close()
+    }
+
+    // Phase audit §17：WAL 场景下「主文件 sha 不变」不能证明逻辑库未变化
+    {
+      const fixture = createFixture()
+      // 与真实库一致：WAL 模式（否则写入走 rollback journal，不会产生 -wal 文件）
+      fixture.db.pragma('journal_mode = WAL')
+      // 在 fixture 上提交一条业务写入（WAL 承载，未 checkpoint）——与真实用户操作同构
+      fixture.db
+        .prepare(
+          "INSERT INTO creator_records (time_cycle, nickname, total_cost, first_play, second_week_play) VALUES ('2026-W40','wal写入',1000,100,200)"
+        )
+        .run()
+      const mainSha = migration.computeFileSha256(fixture.dbPath)
+      const state = migration.computeDbStateFingerprint(fixture.dbPath)
+      const backupPath = await makeBackup(fixture, 'backup-wal.db')
+      const staleShaAuth = migration.authorizeRealDbCommit({
+        sourcePath: fixture.dbPath,
+        realDbPath: fixture.dbPath,
+        backupPath,
+        expectedSourceSha: mainSha
+      })
+      const freshAuth = migration.authorizeRealDbCommit({
+        sourcePath: fixture.dbPath,
+        realDbPath: fixture.dbPath,
+        backupPath,
+        expectedSourceSha: state.fingerprint
+      })
+      check(
+        '§17 WAL 已承载写入：主文件 sha ≠ 逻辑状态指纹（旧假设会漏判）',
+        state.mainSha === mainSha && state.walBytes > 0 && state.fingerprint !== mainSha,
+        `main=${state.mainSha.slice(0, 12)}… fp=${state.fingerprint.slice(0, 12)}… wal=${state.walBytes}B`
+      )
+      check(
+        '§17 仅用主文件 sha 作为 expected → 授权拒绝（D 项不再被 WAL 欺骗）',
+        staleShaAuth.ok === false && staleShaAuth.checks.find((c) => c.id === 'D').pass === false
+      )
+      check(
+        '§17 用逻辑状态指纹作为 expected → 授权通过（正确契约）',
+        freshAuth.ok === true && freshAuth.sourceState?.walBytes > 0
+      )
+      check(
+        '§17 授权结果暴露完整 DB 状态（main sha / WAL bytes / WAL sha）',
+        Boolean(freshAuth.sourceState?.mainSha) &&
+          Number.isInteger(freshAuth.sourceState?.walBytes) &&
+          typeof freshAuth.sourceState?.walSha === 'string'
+      )
       fixture.db.close()
     }
 

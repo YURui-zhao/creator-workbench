@@ -205,7 +205,7 @@ export function normalizeSnapshotPlays(plays = []) {
     excluded_count: rows.filter((row) => row.excluded).length,
     unresolved_count: rows.filter((row) => !row.excluded && row.normalized_play === null).length,
     valid_count: valid.length,
-    // 保持人工确认顺序（从新到旧），趋势不重排
+    // 保持人工录入顺序（从旧到新，时间向下推进；最新样本在数组末尾），趋势不重排
     validPlaysInOrder: valid.map((row) => row.normalized_play)
   }
 }

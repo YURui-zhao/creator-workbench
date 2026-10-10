@@ -13,7 +13,16 @@
  *   · 内部按原始精度计算，只在最终输出 round（播放量取整）
  */
 
-export const STATS_VERSION = 'recent-performance-v1'
+/**
+ * 近期表现统计口径版本：
+ *   · v1（历史）：recent/prior 切片方向错误（把最旧 5 条当 recent）
+ *   · v2（当前冻结）：录入顺序 = 从旧到新（时间向下推进），最新样本在数组末尾；
+ *     validCount >= 8 时 recent = 最后 5 条、prior = 其余更早样本；
+ *     ratio = median(recent)/median(prior) − 1（±20% 阈值）。
+ *     median_play / p25 / p75 / analysis 等其它口径与 v1 完全一致。
+ * v1 落库的 trend 派生字段由一次性 backfill 修正（不修改 plays_json 等事实）。
+ */
+export const STATS_VERSION = 'recent-performance-v2'
 // ±20% 阈值唯一来源（不在别处散落 magic number）
 export const TREND_THRESHOLD_PERCENT = 20
 export const TREND_THRESHOLD = TREND_THRESHOLD_PERCENT / 100
@@ -135,7 +144,7 @@ export function computeContentTypeBreakdown(plays = []) {
 }
 
 /**
- * 由「有效且按人工确认顺序（从新到旧）排列」的播放量数组计算统计结果
+ * 由「有效且按人工录入顺序（从旧到新，时间向下推进）排列」的播放量数组计算统计结果
  * @param {number[]} validPlaysInOrder
  * @returns {{
  *   valid_count: number, analysis_count: number,
@@ -172,11 +181,13 @@ export function computeRecentPerformanceStats(validPlaysInOrder = []) {
     stats_status: canComputeTypical ? 'ok' : 'insufficient'
   }
 
-  // ---------- 近期趋势：使用全部有效样本的确认顺序（不做去极值、不重排） ----------
+  // ---------- 近期趋势：使用全部有效样本的录入顺序（不做去极值、不重排） ----------
+  // Phase audit 顺序契约（用户确认）：录入顺序 = 从旧到新（时间向下推进），最新样本在数组末尾。
+  // 因此 recent = 「最后 5 条」（最新），prior = 「其余更早的」；绝不 slice(0, 5)。
   if (validCount < MIN_VALID_FOR_TREND) return stats
 
-  const recentValues = valid.slice(0, RECENT_GROUP_SIZE)
-  const priorValues = valid.slice(RECENT_GROUP_SIZE)
+  const recentValues = valid.slice(-RECENT_GROUP_SIZE)
+  const priorValues = valid.slice(0, valid.length - RECENT_GROUP_SIZE)
   const recentMedian = medianOf(recentValues)
   const priorMedian = medianOf(priorValues)
   stats.recent_median_play = roundPlay(recentMedian)

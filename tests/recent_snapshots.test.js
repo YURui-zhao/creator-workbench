@@ -237,7 +237,7 @@ async function main() {
     })
     check('首次保存返回 200', first.status === 200, JSON.stringify(first.msg))
     check('返回完整 public snapshot', Boolean(first.data?.id) && first.data.creator === 'Gary' && Array.isArray(first.data.plays))
-    check('stats_version 正确保存', first.data?.stats_version === 'recent-performance-v1', String(first.data?.stats_version))
+    check('stats_version 正确保存', first.data?.stats_version === 'recent-performance-v2', String(first.data?.stats_version))
     check('source_type 固定 screenshot', first.data?.source_type === 'screenshot')
 
     const second = await save({
@@ -280,7 +280,7 @@ async function main() {
       provider_response: { raw: 'x' }
     })
     check('含伪造派生值的请求仍以 raw_text 为准', tampered.data?.plays?.[0]?.normalized_play === 52000, String(tampered.data?.plays?.[0]?.normalized_play))
-    check('伪造的 valid_count / stats_version 被忽略', tampered.data?.valid_count === 6 && tampered.data?.stats_version === 'recent-performance-v1', `${tampered.data?.valid_count}/${tampered.data?.stats_version}`)
+    check('伪造的 valid_count / stats_version 被忽略', tampered.data?.valid_count === 6 && tampered.data?.stats_version === 'recent-performance-v2', `${tampered.data?.valid_count}/${tampered.data?.stats_version}`)
     const storedRow = db.prepare('SELECT * FROM creator_recent_snapshots WHERE id = ?').get(tampered.data.id)
     const storedText = JSON.stringify(storedRow)
     check('base64 / apiKey / provider_response 均未入库', !storedText.includes('AAAABBBB') && !storedText.includes('sk-should-not-be-stored') && !storedText.includes('provider_response'))
@@ -329,7 +329,8 @@ async function main() {
     check('重复最高最低各只移除一个（10 → 8）', duplicatedEdge.analysis_count === 8, String(duplicatedEdge.analysis_count))
 
     console.log('\n===== 6. 趋势算法（±20% 常量 / 边界 / 不除零 / 不提前 round）=====')
-    const trendCase = (recent, prior) => stats.computeRecentPerformanceStats([...recent, ...prior])
+    // Phase audit 顺序契约：录入顺序 = 从旧到新 → recent 组在数组末尾
+    const trendCase = (recent, prior) => stats.computeRecentPerformanceStats([...prior, ...recent])
     check('valid < 8 → trend insufficient 且无统计值', trendCase([1, 2, 3, 4, 5], [6, 7]).trend_label === 'insufficient' && trendCase([1, 2, 3, 4, 5], [6, 7]).recent_median_play === null)
     check('阈值常量集中在后端（TREND_THRESHOLD_PERCENT = 20）', stats.TREND_THRESHOLD_PERCENT === 20 && stats.TREND_THRESHOLD === 0.2)
     check('+20% 边界 → up', trendCase([12000, 12000, 12000, 12000, 12000], [10000, 10000, 10000]).trend_label === 'up')
@@ -608,7 +609,7 @@ async function main() {
                trend_label, stats_status, stats_version, created_at, observed_at
              ) VALUES (?, 'screenshot', ?, 8, 8, 0, 0, 8, ?, ?, ?, 'stable', 'ok', ?, ?, NULL)`
           )
-          .run(creator, JSON.stringify([]), median, median, median, 'recent-performance-v1', createdAt)
+          .run(creator, JSON.stringify([]), median, median, median, 'recent-performance-v2', createdAt)
           .lastInsertRowid
       )
     const legacyLater = insertLegacySnapshot(OBS_D, '2026-10-08 08:00:00', 60000)
@@ -908,8 +909,9 @@ async function main() {
     check(
       'A3-16 ≥8 条时趋势可计算（与现有算法一致：recent/prior 中位数）',
       manualEightSave.data.trend_label === 'stable' &&
-        manualEightSave.data.recent_median_play === 48000 &&
-        manualEightSave.data.prior_median_play === 55000,
+        // Phase audit 顺序契约：录入从旧到新 → recent = 最后 5 条（55000），prior = 前 3 条（48000）
+        manualEightSave.data.recent_median_play === 55000 &&
+        manualEightSave.data.prior_median_play === 48000,
       JSON.stringify({ trend: manualEightSave.data.trend_label, recent: manualEightSave.data.recent_median_play, prior: manualEightSave.data.prior_median_play })
     )
 

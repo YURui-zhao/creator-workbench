@@ -74,7 +74,7 @@ import { CONTENT_TYPE_OPTIONS, normalizeContentType } from '../utils/contentType
 const SEND_NOTICE =
   '将向当前配置的 AI 服务发送所选截图，用于识别：达人昵称、星图刊例价、作品播放量。原图不会作为业务记录长期保存。'
 const ORDER_NOTICE =
-  '请确认作品顺序是否为从新到旧；如截图包含置顶或重复作品，可排除对应项。'
+  '请确认作品顺序是否为从旧到新（时间向下推进，最新一条在最后）；如截图包含置顶或重复作品，可排除对应项。'
 const SAVE_NOTICE = '将保存结构化播放数据与统计结果，不保存原截图。'
 
 /**
@@ -900,7 +900,7 @@ export default function RecentPerformanceAssistantModal({
         {entryMode === 'manual' && (
           <Space direction="vertical" size={8} style={{ display: 'flex' }}>
             <Typography.Text type="secondary">
-              请按「最近 → 更早」的顺序输入每条作品的播放量，一行一个（也支持中文 / 英文逗号分隔）。
+              请按「从旧到新」的时间顺序输入每条作品的播放量，一行一个（也支持中文 / 英文逗号分隔）。
               数值换算由系统确定性地完成，不会调用 AI。
             </Typography.Text>
             <Input.TextArea

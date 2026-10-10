@@ -11,7 +11,7 @@
 
 import { formatCpm, formatInteger, formatPlays } from './format.js'
 import { buildPricingRows, formatPrice } from './pricingDisplay.js'
-import { buildContentPerformanceLines } from './contentType.js'
+import { buildContentPerformanceLines, getSponsoredSampleTier } from './contentType.js'
 import { formatLastActualCostValue, formatMedianCpmValue } from './radarRowDisplay.js'
 import { TREND_LABELS_FULL } from './recentPerformanceSave.js'
 
@@ -79,13 +79,21 @@ export function buildContentBlock(creatorItem = {}) {
   }
   const sponsoredLine = cell.lines.find((line) => line.text.startsWith('商单中位'))
   const organicLine = cell.lines.find((line) => line.text.startsWith('日常中位'))
-  const sampleFew = cell.lines.some((line) => line.text === '商单样本较少')
+  // 近期表现语义审计：样本充分性直接来自商单样本分档（0 → 暂无 / 1–2 → 较少 / ≥3 → 充足），
+  // 不再由「是否出现提示行」反推 —— 0 条商单时旧逻辑会错误显示「商单样本充足」。
+  const sponsoredTier = getSponsoredSampleTier(snapshot?.sponsored_count)
+  const sampleText =
+    sponsoredTier === 'none'
+      ? '暂无商单样本'
+      : sponsoredTier === 'insufficient'
+        ? '商单样本较少'
+        : '商单样本充足'
   return {
     empty: false,
     rows: [
       row('商单', sponsoredLine ? sponsoredLine.text.replace('商单中位 ', '') : '暂无商单数据'),
       row('日常', organicLine ? organicLine.text.replace('日常中位 ', '') : '暂无'),
-      row('样本', sampleFew ? '商单样本较少' : '商单样本充足'),
+      row('样本', sampleText),
       row('待分类', `${cell.unknownCount} 条`)
     ]
   }

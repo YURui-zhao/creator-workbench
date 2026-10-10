@@ -1475,6 +1475,8 @@ async function main() {
       ) ===
         JSON.stringify([
           { text: '暂无商单数据', primary: true },
+          // 近期表现语义审计：0 条商单必须显式表达「暂无商单样本」（不得被下游当成「充足」）
+          { text: '暂无商单样本', primary: false },
           { text: '日常中位 8.1万 · 9条', primary: false }
         ])
   )

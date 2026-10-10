@@ -585,8 +585,8 @@ async function main() {
         !/parsePlayText\(/.test(modalSource)
     )
     check(
-      'A3-4 手工录入明确「最近 → 更早」顺序与数量建议',
-      /最近 → 更早/.test(modalSource) &&
+      'A3-4 手工录入明确「从旧到新」时间顺序与数量建议（Phase audit 冻结契约）',
+      /从旧到新/.test(modalSource) &&
         /至少 5 条才能计算中位播放与典型区间/.test(modalSource) &&
         /不强制凑满 15 条/.test(modalSource)
     )

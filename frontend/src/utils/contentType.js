@@ -109,7 +109,14 @@ export function buildContentPerformanceLines(snapshot) {
       primary: true
     }
   ]
-  if (getSponsoredSampleTier(sponsoredCount) === 'insufficient') {
+  // 近期表现语义审计：样本充分性必须如实表达 ——
+  //   0 条商单 → 「暂无商单样本」（既不是「较少」，更不能被下游推导成「充足」）
+  //   1–2 条商单 → 「商单样本较少」
+  //   >= 3 条商单 → 不出提示（充足语义由分档决定，不由「是否出现提示行」反推）
+  const sponsoredTier = getSponsoredSampleTier(sponsoredCount)
+  if (sponsoredTier === 'none') {
+    lines.push({ text: '暂无商单样本', primary: false })
+  } else if (sponsoredTier === 'insufficient') {
     lines.push({ text: '商单样本较少', primary: false })
   }
   if (organicCount > 0) {

@@ -406,7 +406,13 @@ async function main() {
   check('勾选 5 位 → 可对比', canCompareCreators(5).ok === true)
   check('勾选 6 位 → 不可对比并提示', canCompareCreators(6).ok === false && canCompareCreators(6).reason.includes('最多'))
   const allCreators = base.data.creators
-  const pick5 = allCreators.slice(0, 5).map((item) => item.nickname)
+  // Phase 5：对比身份 = creator_id（legacy fixture 无 creator_id → 退化为名称键，规则同一份）
+  const identityKeyOf = (item) =>
+    item.creator_id === null || item.creator_id === undefined
+      ? `name:${item.nickname}`
+      : `id:${item.creator_id}`
+  const picked = allCreators.slice(0, 5)
+  const pick5 = picked.map(identityKeyOf)
   const compareRows = buildCompareRows(allCreators, pick5)
   check(
     '对比数据按总花费降序',
@@ -415,7 +421,7 @@ async function main() {
   )
   check(
     '对比只包含所选达人',
-    compareRows.length === 5 && compareRows.every((item) => pick5.includes(item.nickname))
+    compareRows.length === 5 && compareRows.every((item) => pick5.includes(identityKeyOf(item)))
   )
 
   console.log('\n===== 8. 导出内容与页面一致（含新增三列）=====')

@@ -10,8 +10,14 @@ import {
   parseTimeCycleToWeekCode
 } from '../utils/dateCycle.js'
 import { buildXlsx } from '../utils/xlsx.js'
-import { loadLatestDecisionSummaries } from './creatorDecisions.js'
-import { loadLatestSnapshotSummaries } from './recentSnapshots.js'
+import {
+  loadLatestDecisionSummaries,
+  loadLatestDecisionSummariesByCreatorId
+} from './creatorDecisions.js'
+import {
+  loadLatestSnapshotSummaries,
+  loadLatestSnapshotSummariesByCreatorId
+} from './recentSnapshots.js'
 import { TARGET_CPM } from '../utils/creatorBusinessRules.js'
 // Creator Identity V1 Phase 4：新 record 必须继承 / 建立 creator_id 归属锚
 import {
@@ -21,6 +27,58 @@ import {
 } from '../utils/creatorIdentity.js'
 
 const router = Router()
+
+// ============================================================
+// Creator Identity V1 Phase 5：达人库 / 复投雷达的「身份层」判定
+// ------------------------------------------------------------
+// · 生产（Phase 1 migration 之后）：Creator 是身份来源，creator_id 是唯一身份键
+// · 老 fixture（无 creators 表 / 无 creator_id 列）：自动降级为 nickname 模式，
+//   既有接口契约与既有测试语义完全不变（不重写历史 fixture）
+// · 绝不出现「新表存在却因为方便仍优先 nickname」的情况
+// ============================================================
+function creatorIdentityReady() {
+  return identitySchemaReady(db) && identityTableHasColumn(db, 'creator_records', 'creator_id')
+}
+
+/** 聚合行的身份键：identity 模式用 creator_id，legacy 模式退回 nickname */
+function summaryRowKey(item) {
+  return item?.creator_id === null || item?.creator_id === undefined
+    ? item?.nickname
+    : item.creator_id
+}
+
+/**
+ * 达人库身份来源：creators（默认排除 merged 墓碑）。
+ * 类型筛选作用于 Creator 当前类型；关键词匹配 canonical_name / alias（只做 substring，
+ * 不 fuzzy / 不拼音 / 不相似度）。alias 只是搜索入口，命中后仍返回同一个 Creator。
+ */
+function loadLibraryCreators({ creatorTypes = [], keyword = '' } = {}) {
+  const conditions = ["c.identity_status != 'merged'"]
+  const params = []
+  if (creatorTypes.length) {
+    conditions.push(`c.creator_type IN (${creatorTypes.map(() => '?').join(', ')})`)
+    params.push(...creatorTypes)
+  }
+  const keywordText = String(keyword || '').trim()
+  if (keywordText) {
+    const like = `%${escapeLike(keywordText)}%`
+    conditions.push(
+      `(c.canonical_name LIKE ? ESCAPE '\\' OR EXISTS (
+         SELECT 1 FROM creator_aliases a
+         WHERE a.creator_id = c.id AND a.alias LIKE ? ESCAPE '\\'
+       ))`
+    )
+    params.push(like, like)
+  }
+  return db
+    .prepare(
+      `SELECT c.id AS creator_id, c.canonical_name, c.creator_type, c.identity_status
+       FROM creators c
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY c.id ASC`
+    )
+    .all(...params)
+}
 
 // 字段白名单：仅允许写入以下列，杜绝 SQL 注入
 const FIELDS = {
@@ -53,7 +111,17 @@ const SELECT_COLUMNS = [
   'second_week_play',
   'created_at'
 ]
-const SELECT_SQL = `SELECT ${SELECT_COLUMNS.join(', ')} FROM creator_records`
+/**
+ * Creator Identity V1 Phase 5：归属锚 creator_id 随记录一起返回（additive），
+ * 让前端可以按 creator_id 下钻（绝不按昵称文本匹配）。
+ * 老 fixture 没有该列时自动退回原列集合，响应形状与原来完全一致。
+ */
+function recordSelectSql() {
+  const columns = identityTableHasColumn(db, 'creator_records', 'creator_id')
+    ? [...SELECT_COLUMNS, 'creator_id']
+    : SELECT_COLUMNS
+  return `SELECT ${columns.join(', ')} FROM creator_records`
+}
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
 
 // ---------- 统一响应格式 { code, data, msg } ----------
@@ -398,7 +466,7 @@ router.get('/', (req, res) => {
   const where = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : ''
   const total = db.prepare(`SELECT COUNT(*) AS n FROM creator_records${where}`).get(...params).n
   const list = db
-    .prepare(`${SELECT_SQL}${where} ORDER BY id DESC LIMIT ? OFFSET ?`)
+    .prepare(`${recordSelectSql()}${where} ORDER BY id DESC LIMIT ? OFFSET ?`)
     .all(...params, finalSize, (finalPage - 1) * finalSize)
 
   ok(res, { list, total })
@@ -478,14 +546,35 @@ function buildRecordFilter({
 }
 
 // 聚合所需字段（周度聚合只用到这几列）
-function queryAggregateRows(filters = {}) {
+// Phase 5：withCreatorId 时额外取出 creator_id（达人库按 Creator 聚合的必需身份列）
+function queryAggregateRows(filters = {}, { withCreatorId = false } = {}) {
   const { where, params } = buildRecordFilter(filters)
   return db
     .prepare(
-      `SELECT time_cycle, nickname, creator_type, total_cost, first_play, second_week_play
+      `SELECT time_cycle, nickname, creator_type, total_cost, first_play, second_week_play${
+        withCreatorId ? ', creator_id' : ''
+      }
        FROM creator_records${where}`
     )
     .all(...params)
+}
+
+/**
+ * 雷达明细行：附带 Creator 身份（canonical_name）。
+ * 排序必须与 queryDetailRows 完全一致（雷达的 equal-date tie-break 依赖行序）。
+ */
+function queryRadarRows() {
+  return db
+    .prepare(
+      `SELECT r.id, r.time_cycle, r.nickname, r.creator_type, r.homepage, r.content_link, r.video_link,
+              r.total_cost, r.first_play, r.second_week_play, r.publish_date,
+              r.creator_id, c.canonical_name
+       FROM creator_records r
+       LEFT JOIN creators c ON c.id = r.creator_id
+       WHERE r.creator_id IS NOT NULL
+       ORDER BY r.time_cycle ASC, r.id ASC`
+    )
+    .all()
 }
 
 // 明细导出所需字段（与前端导出列一致）
@@ -1115,20 +1204,44 @@ function buildCreatorSummaryLatest({
   sortBy = 'total_cost',
   sortOrder = 'desc'
 } = {}) {
-  const rows = queryAggregateRows({ startWeek, endWeek, creatorTypes, keyword })
+  // ---------- 身份模式 ----------
+  // identity：达人库 = creators（含 zero-history Creator），metrics 由 creator_id 的 records 聚合
+  // legacy：保持原有 nickname 聚合（老 fixture / 未迁移库）
+  const identityMode = creatorIdentityReady()
+  const libraryCreators = identityMode ? loadLibraryCreators({ creatorTypes, keyword }) : null
+  // identity 模式下类型 / 关键词作用于 Creator（不是记录），因此记录只按周范围取
+  const rows = identityMode
+    ? queryAggregateRows({ startWeek, endWeek }, { withCreatorId: true })
+    : queryAggregateRows({ startWeek, endWeek, creatorTypes, keyword })
+
   const creatorMap = new Map()
-  const getCreator = (nickname, creatorType) => {
-    if (!creatorMap.has(nickname)) {
-      creatorMap.set(nickname, {
-        nickname,
+  let unattributedRecordCount = 0
+  const createEntry = ({ key, creatorId = null, displayName, creatorType }) => {
+    if (!creatorMap.has(key)) {
+      creatorMap.set(key, {
+        key,
+        creator_id: creatorId,
+        nickname: displayName,
         creator_type: creatorType,
         acc: createPlayAccumulator()
       })
     }
-    const entry = creatorMap.get(nickname)
-    // 同一昵称出现多个类型时，保留首个非空类型
+    const entry = creatorMap.get(key)
+    // 同一身份出现多个类型时，保留首个非空类型
     if (!entry.creator_type && creatorType) entry.creator_type = creatorType
     return entry
+  }
+
+  if (identityMode) {
+    // Creator 是身份来源：没有历史投放的 Creator 也必须出现在达人库（zero-history）
+    for (const creator of libraryCreators) {
+      createEntry({
+        key: creator.creator_id,
+        creatorId: creator.creator_id,
+        displayName: String(creator.canonical_name || '').trim() || '未命名达人',
+        creatorType: String(creator.creator_type || '').trim() || '未分类'
+      })
+    }
   }
 
   for (const row of rows) {
@@ -1136,15 +1249,36 @@ function buildCreatorSummaryLatest({
     if (!code) continue
     if (startWeek && code < startWeek) continue
     if (endWeek && code > endWeek) continue
+    if (identityMode) {
+      // 归属锚为 NULL 的记录绝不聚合成任何 Creator（更不形成「未知达人」超级行）
+      const creatorId = row.creator_id === null || row.creator_id === undefined ? null : Number(row.creator_id)
+      if (creatorId === null) {
+        unattributedRecordCount += 1
+        continue
+      }
+      const entry = creatorMap.get(creatorId)
+      // 被 Creator 类型 / 关键词过滤掉的身份：其记录不进入任何被返回的行
+      if (!entry) continue
+      accumulatePlay(entry.acc, computePlayMetrics(row), entry.nickname || '未命名达人')
+      continue
+    }
     const nickname = String(row.nickname || '').trim() || '未命名达人'
     const creatorType = String(row.creator_type || '').trim() || '未分类'
-    const entry = getCreator(nickname, creatorType)
+    const entry = createEntry({ key: nickname, displayName: nickname, creatorType })
     accumulatePlay(entry.acc, computePlayMetrics(row), nickname)
   }
 
   const serializeCreator = (entry) => {
     const summary = finalizePlayAccumulator(entry.acc)
     return {
+      // identity 模式下 creator_id 是行身份；legacy 模式不携带该字段
+      ...(entry.creator_id === null || entry.creator_id === undefined
+        ? {}
+        : { creator_id: entry.creator_id }),
+      // canonical_name（identity 模式 = Creator 权威名）；nickname 保留为兼容别名（同一显示名）
+      ...(entry.creator_id === null || entry.creator_id === undefined
+        ? {}
+        : { canonical_name: entry.nickname }),
       nickname: entry.nickname,
       creator_type: entry.creator_type,
       total_campaigns: summary.record_count,
@@ -1203,8 +1337,15 @@ function buildCreatorSummaryLatest({
       return sortDirection === 'asc' ? left - right : right - left
     })
 
-  const rawAccByNickname = new Map(creators.map((item) => [item.nickname, creatorMap.get(item.nickname).acc]))
-  const rawAccs = [...rawAccByNickname.values()]
+  // 原始累计器按「身份键」索引（identity = creator_id，legacy = nickname），
+  // 供分组聚合取到未经序列化的分子/分母（组级 CPM 必须同一样本）
+  const rawAccByKey = new Map(
+    creators.map((item) => {
+      const key = summaryRowKey(item)
+      return [key, creatorMap.get(key).acc]
+    })
+  )
+  const rawAccs = [...rawAccByKey.values()]
   const rawTotalCost = rawAccs.reduce((sum, acc) => sum + acc.total_cost, 0)
   const rawLatestValidCost = rawAccs.reduce((sum, acc) => sum + acc.latest_valid_cost, 0)
   const rawFirstValidCost = rawAccs.reduce((sum, acc) => sum + acc.first_valid_cost, 0)
@@ -1257,10 +1398,13 @@ function buildCreatorSummaryLatest({
     creatorTypes,
     keyword,
     minCampaigns: minCampaignsValue,
+    identity_mode: identityMode,
+    // 未归属（creator_id = NULL）的真实记录数：事实仍在投放记录里，但不进入任何 Creator 指标
+    unattributed_record_count: unattributedRecordCount,
     sort: { sortBy: sortField, sortOrder: sortDirection },
     creators,
     total_summary: totalSummary,
-    rawAccByNickname
+    rawAccByKey
   }
 }
 
@@ -1432,8 +1576,9 @@ function buildCreatorSummaryLegacyOccurrence({
  * - campaign：总播放 = Σ有效最新累计播放；最新平均CPM 的分子只含同一样本记录的花费
  * - occurrence：保持旧实现（TODO(occurrence)：待 snapshot Batch 重构）
  */
-function buildGroupSummary(creatorType, list, caliber = 'campaign', rawAccByNickname = null) {
-  const rawCost = (item, field) => rawAccByNickname?.get(item.nickname)?.[field] ?? item[field] ?? 0
+function buildGroupSummary(creatorType, list, caliber = 'campaign', rawAccByKey = null) {
+  // 身份键：identity 模式取 creator_id，legacy 模式取 nickname（与聚合层同一口径）
+  const rawCost = (item, field) => rawAccByKey?.get(summaryRowKey(item))?.[field] ?? item[field] ?? 0
   const totalCost = round2(list.reduce((sum, item) => sum + rawCost(item, 'total_cost'), 0))
   const totalCampaigns = list.reduce((sum, item) => sum + item.total_campaigns, 0)
 
@@ -1556,10 +1701,10 @@ router.get('/creator-summary', (req, res) => {
       typeMap.get(type).push(creator)
     }
     groups = [...typeMap.entries()]
-      .map(([creatorType, list]) => buildGroupSummary(creatorType, list, caliber, summary.rawAccByNickname))
+      .map(([creatorType, list]) => buildGroupSummary(creatorType, list, caliber, summary.rawAccByKey))
       .sort((a, b) => b.total_cost - a.total_cost || b.total_play - a.total_play)
   } else {
-    groups = [buildGroupSummary('全部达人', summary.creators, caliber, summary.rawAccByNickname)]
+    groups = [buildGroupSummary('全部达人', summary.creators, caliber, summary.rawAccByKey)]
   }
 
   ok(res, {
@@ -1571,7 +1716,10 @@ router.get('/creator-summary', (req, res) => {
     groups,
     // 扁平达人列表（分组数据的全集，便于前端做对比/导出，避免再遍历 groups）
     creators: summary.creators,
-    total_summary: summary.total_summary
+    total_summary: summary.total_summary,
+    // 身份模式标记 + 未归属记录数（未归属记录不进入任何 Creator 指标，但必须可见）
+    identity_mode: summary.identity_mode === true,
+    unattributed_record_count: summary.unattributed_record_count ?? 0
   })
 })
 
@@ -1762,9 +1910,20 @@ export function buildRepurchaseRadar(rows = [], { referenceDate = null } = {}) {
   for (const row of rows) {
     const nickname = String(row?.nickname || '').trim() || '未命名达人'
     const creatorType = String(row?.creator_type || '').trim() || '未分类'
-    if (!creatorMap.has(nickname)) {
-      creatorMap.set(nickname, {
-        creator: nickname,
+    // Creator Identity V1 Phase 5：有 creator_id 时以 creator_id 为分组键（同名不同人绝不合并）；
+    // 没有 creator_id（历史证据冻结路径 / 老 fixture）时退回 nickname 分组，行为与原来完全一致。
+    const rawCreatorId = row?.creator_id
+    const creatorId =
+      rawCreatorId === null || rawCreatorId === undefined || !Number.isInteger(Number(rawCreatorId))
+        ? null
+        : Number(rawCreatorId)
+    const key = creatorId === null ? `name:${nickname}` : `id:${creatorId}`
+    // 展示名：identity join 提供 canonical_name 时用它（权威显示名）；否则退回 frozen nickname
+    const displayName = String(row?.canonical_name ?? '').trim() || nickname
+    if (!creatorMap.has(key)) {
+      creatorMap.set(key, {
+        creator_id: creatorId,
+        creator: displayName,
         // 与 CreatorSummary 一致：保留首条记录的类型，空则「未分类」
         creator_type: creatorType,
         record_count: 0,
@@ -1775,7 +1934,7 @@ export function buildRepurchaseRadar(rows = [], { referenceDate = null } = {}) {
         lastActualCost: null
       })
     }
-    const entry = creatorMap.get(nickname)
+    const entry = creatorMap.get(key)
     entry.record_count += 1
 
     // 最近合作日期：合作新近度取该达人全部记录的 MAX(publish_date)，与 CPM 有效性无关。
@@ -1842,6 +2001,8 @@ export function buildRepurchaseRadar(rows = [], { referenceDate = null } = {}) {
     })
 
     return {
+      // Phase 5：Creator 身份（identity 模式下有值；legacy/证据路径为 null）
+      creator_id: entry.creator_id,
       creator: entry.creator,
       creator_type: entry.creator_type,
       record_count: entry.record_count,
@@ -1984,28 +2145,39 @@ router.get('/repurchase-radar', (req, res) => {
     }
     // 非测试模式：忽略该参数，生产始终以服务端本地当前日期为准
   }
-  const rows = queryDetailRows()
+  // Creator Identity V1 Phase 5：identity 模式下按 creator_id 分组（radar 只包含有真实记录的 Creator）；
+  // 未归属（creator_id = NULL）的记录绝不形成 group。legacy 模式保持原 nickname 行为。
+  const identityMode = creatorIdentityReady()
+  const rows = identityMode ? queryRadarRows() : queryDetailRows()
   const radar = buildRepurchaseRadar(rows, { referenceDate })
 
   // P2B：合并每位达人的「最新近期表现快照」轻量 summary。
   // 单条 SQL 批量查询（不做 N+1）；只增加展示字段，
   // 不参与 historical_status / 分组 / median_cpm / 排序，P1 规则保持不变。
-  const snapshotMap = loadLatestSnapshotSummaries(
-    radar.groups.flatMap((group) => group.creators.map((creator) => creator.creator))
-  )
+  // Phase 5：identity 模式下按 creator_id 关联（同名不同人绝不串数据）
+  const creatorItems = radar.groups.flatMap((group) => group.creators)
+  const useIdentityLookup = identityMode && creatorItems.every((item) => item.creator_id !== null)
+  const snapshotMap = useIdentityLookup
+    ? loadLatestSnapshotSummariesByCreatorId(creatorItems.map((item) => item.creator_id))
+    : loadLatestSnapshotSummaries(creatorItems.map((item) => item.creator))
   // P4：同样以单条 SQL 批量带上「最近一次决策」轻量 summary（只读展示，不参与 P1 规则）
-  const decisionMap = loadLatestDecisionSummaries(
-    radar.groups.flatMap((group) => group.creators.map((creator) => creator.creator))
-  )
+  const decisionMap = useIdentityLookup
+    ? loadLatestDecisionSummariesByCreatorId(creatorItems.map((item) => item.creator_id))
+    : loadLatestDecisionSummaries(creatorItems.map((item) => item.creator))
+  const lookupKey = (item) => (useIdentityLookup ? item.creator_id : item.creator)
   for (const group of radar.groups) {
     group.creators = group.creators.map((creator) => ({
       ...creator,
-      recent_snapshot: snapshotMap.get(creator.creator) || null,
-      recent_decision: decisionMap.get(creator.creator) || null
+      recent_snapshot: snapshotMap.get(lookupKey(creator)) || null,
+      recent_decision: decisionMap.get(lookupKey(creator)) || null
     }))
   }
 
-  return ok(res, radar)
+  // 未归属记录数（不进入任何 Creator 分组，但必须可见，避免事实被静默吞掉）
+  const unattributedRecordCount = identityMode
+    ? db.prepare('SELECT COUNT(*) AS n FROM creator_records WHERE creator_id IS NULL').get().n
+    : 0
+  return ok(res, { ...radar, identity_mode: identityMode, unattributed_record_count: unattributedRecordCount })
 })
 
 // ---------- 筛选元数据（博主类型 / 达人昵称 / 数据周范围，供 BI 筛选面板初始化） ----------
@@ -2671,7 +2843,7 @@ router.post('/', (req, res) => {
     ? insertRecordWithIdentity(row)
     : Number(db.prepare(INSERT_SQL).run(...COLUMNS.map((col) => row[col])).lastInsertRowid)
   const created = db
-    .prepare(`${SELECT_SQL} WHERE id = ?`)
+    .prepare(`${recordSelectSql()} WHERE id = ?`)
     .get(recordId)
   ok(res, created)
 })
@@ -2682,7 +2854,7 @@ router.get('/:id', (req, res) => {
   if (id === null) {
     return fail(res, 400, '非法的记录 ID')
   }
-  const row = db.prepare(`${SELECT_SQL} WHERE id = ?`).get(id)
+  const row = db.prepare(`${recordSelectSql()} WHERE id = ?`).get(id)
   if (!row) {
     return fail(res, 404, '记录不存在')
   }
@@ -2697,7 +2869,7 @@ router.put('/:id', (req, res) => {
   }
 
   // 读取完整原记录：PUT 需要基于「更新后的最终状态」做交叉校验
-  const exists = db.prepare(`${SELECT_SQL} WHERE id = ?`).get(id)
+  const exists = db.prepare(`${recordSelectSql()} WHERE id = ?`).get(id)
   if (!exists) {
     return fail(res, 404, '记录不存在')
   }
@@ -2730,7 +2902,7 @@ router.put('/:id', (req, res) => {
       id
     )
   }
-  ok(res, db.prepare(`${SELECT_SQL} WHERE id = ?`).get(id))
+  ok(res, db.prepare(`${recordSelectSql()} WHERE id = ?`).get(id))
 })
 
 // ---------- 5. 删除记录 ----------

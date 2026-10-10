@@ -338,6 +338,44 @@ export function loadLatestSnapshotSummaries(creatorList = []) {
   return map
 }
 
+/**
+ * Creator Identity V1 Phase 5：按 creator_id 批量读取最新快照 summary（单条 SQL，避免 N+1）。
+ * 语义与 loadLatestSnapshotSummaries 完全一致（同样只取 candidate_id IS NULL 的历史快照），
+ * 只是把「达人文本」换成「归属锚 creator_id」——同名不同人绝不串数据。
+ * @param {number[]} creatorIds
+ * @returns {Map<number, Object>} creator_id -> summary
+ */
+export function loadLatestSnapshotSummariesByCreatorId(creatorIds = []) {
+  const ids = [
+    ...new Set(
+      (Array.isArray(creatorIds) ? creatorIds : [])
+        .map((id) => Number(id))
+        .filter((id) => Number.isInteger(id) && id > 0)
+    )
+  ]
+  const map = new Map()
+  if (!ids.length) return map
+  // additive 列不存在（老 fixture）→ 返回空 map，调用方自动退回名称路径
+  if (!identitySchemaReady(db) || !identityTableHasColumn(db, 'creator_recent_snapshots', 'creator_id')) {
+    return map
+  }
+  const placeholders = ids.map(() => '?').join(', ')
+  const rows = db
+    .prepare(
+      `SELECT ${MAKE_SUMMARY_COLUMNS}, creator_id
+       FROM creator_recent_snapshots
+       WHERE candidate_id IS NULL
+         AND creator_id IN (${placeholders})
+       ${LATEST_SNAPSHOT_ORDER_SQL}`
+    )
+    .all(...ids)
+  for (const row of rows) {
+    const id = Number(row.creator_id)
+    if (!map.has(id)) map.set(id, toSnapshotSummary(row))
+  }
+  return map
+}
+
 function findCreatorRecord(creator) {
   return db.prepare('SELECT nickname FROM creator_records WHERE nickname = ? LIMIT 1').get(creator)
 }
@@ -489,20 +527,47 @@ router.post('/', (req, res) => {
  */
 router.get('/latest', (req, res) => {
   const creator = String(req.query?.creator ?? '').trim()
-  if (!creator) return fail(res, 400, 'creator 不能为空')
+  // Creator Identity V1 Phase 5：可选 creator_id——提供时优先按归属锚取最新快照
+  // （同名不同人绝不串数据）；未提供时保持原有 creator 文本查询（legacy 兼容）。
+  const rawCreatorId = req.query?.creator_id
+  let creatorId = null
+  if (rawCreatorId !== undefined && rawCreatorId !== null && String(rawCreatorId).trim() !== '') {
+    const parsed = Number(rawCreatorId)
+    if (!Number.isInteger(parsed) || parsed <= 0) return fail(res, 400, 'creator_id 必须是正整数')
+    creatorId = parsed
+  }
+  if (!creator && creatorId === null) return fail(res, 400, 'creator 不能为空')
   if (creator.length > MAX_CREATOR_LENGTH) {
     return fail(res, 400, `creator 长度不能超过 ${MAX_CREATOR_LENGTH}`)
   }
-  const row = db
-    .prepare(
-      `SELECT * FROM creator_recent_snapshots
-       WHERE candidate_id IS NULL
-         AND creator = ?
-       ${LATEST_SNAPSHOT_ORDER_SQL}
-       LIMIT 1`
-    )
-    .get(creator)
-  ok(res, { creator, snapshot: row ? toPublicSnapshot(row) : null })
+  const identityUsable =
+    creatorId !== null &&
+    identitySchemaReady(db) &&
+    identityTableHasColumn(db, 'creator_recent_snapshots', 'creator_id')
+  const row = identityUsable
+    ? db
+        .prepare(
+          `SELECT * FROM creator_recent_snapshots
+           WHERE candidate_id IS NULL
+             AND creator_id = ?
+           ${LATEST_SNAPSHOT_ORDER_SQL}
+           LIMIT 1`
+        )
+        .get(creatorId)
+    : db
+        .prepare(
+          `SELECT * FROM creator_recent_snapshots
+           WHERE candidate_id IS NULL
+             AND creator = ?
+           ${LATEST_SNAPSHOT_ORDER_SQL}
+           LIMIT 1`
+        )
+        .get(creator)
+  ok(res, {
+    creator: creator || null,
+    creator_id: identityUsable ? creatorId : null,
+    snapshot: row ? toPublicSnapshot(row) : null
+  })
 })
 
 export default router

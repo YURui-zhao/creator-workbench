@@ -35,7 +35,14 @@ import {
   buildCreatorSummaryFileName,
   exportCreatorStatsToExcel
 } from '../../utils/excel'
-import { buildCompareRows, canCompareCreators, COMPARE_MAX, COMPARE_MIN } from '../../utils/creatorCompare.js'
+import {
+  buildCompareRows,
+  canCompareCreators,
+  creatorDisplayName,
+  creatorIdentityKey as creatorRowKey,
+  COMPARE_MAX,
+  COMPARE_MIN
+} from '../../utils/creatorCompare.js'
 
 // 最小投放次数下拉选项
 const MIN_CAMPAIGNS_OPTIONS = [
@@ -43,6 +50,7 @@ const MIN_CAMPAIGNS_OPTIONS = [
   { value: 2, label: '2 次及以上' },
   { value: 3, label: '3 次及以上' }
 ]
+
 
 /**
  * 达人汇总分析页：按达人横向聚合投放数据，支持周范围/博主类型筛选、口径切换、
@@ -154,14 +162,24 @@ export default function CreatorSummary() {
 
   const totalSummary = summary?.total_summary
   const groups = summary?.groups || []
+  // Phase 5：身份模式来自后端（identity_mode）。identity 模式下行必须有 creator_id，
+  // 缺失属契约破坏 → 行键使用稳定无效键且不参与选择/对比（绝不静默用名称合并）。
+  const identityMode = summary?.identity_mode === true
   // 扁平达人列表（接口返回全集，用于对比与明细导出）
   const allCreators = summary?.creators || []
   // 对比勾选校验（2~5 位）
   const compareCheck = canCompareCreators(compareKeys.length)
   const compareRows = useMemo(
-    () => buildCompareRows(allCreators, compareKeys),
-    [allCreators, compareKeys]
+    () => buildCompareRows(allCreators, compareKeys, identityMode),
+    [allCreators, compareKeys, identityMode]
   )
+  // 当前选择是否覆盖全部数据周（用于区分「真的没有历史投放」与「只是这个范围没有」）
+  const isCreatorFullRange = useMemo(() => {
+    if (!weekOptions.length) return false
+    const first = weekOptions[0]?.weekCode
+    const last = weekOptions[weekOptions.length - 1]?.weekCode
+    return rangeStart === first && rangeEnd === last
+  }, [weekOptions, rangeStart, rangeEnd])
   const rangeText = useMemo(() => {
     if (!rangeStart || !rangeEnd) return '全部数据'
     const start = weekOptions.find((item) => item.weekCode === rangeStart)?.label || rangeStart
@@ -213,10 +231,21 @@ export default function CreatorSummary() {
 
   // 下钻：该达人在当前周范围内的全部投放记录
   const openCreatorDrawer = (creator) => {
+    // Phase 5：identity 模式下行缺少 creator_id = 契约破坏。
+    // 该行不是合法 Creator ownership：拒绝下钻，绝不退回昵称匹配（否则同名会串数据）。
+    if (identityMode && (creator.creator_id === null || creator.creator_id === undefined)) return
     setDrawerCreator(creator)
     setDetailLoading(true)
     const rows = allRecords.filter((row) => {
-      if (String(row.nickname || '').trim() !== creator.nickname) return false
+      // 非 identity 模式（老 schema，根本没有 creator_id 能力）→ 保留昵称匹配（旧契约）
+      if (!identityMode) {
+        if (String(row.nickname || '').trim() !== creator.nickname) return false
+      } else if (creator.creator_id === null || creator.creator_id === undefined) {
+        // 契约破坏行已被上方拒绝；此处兜底不匹配任何记录
+        return false
+      } else if (row.creator_id !== creator.creator_id) {
+        return false
+      }
       if (rangeStart && row.time_cycle < rangeStart) return false
       if (rangeEnd && row.time_cycle > rangeEnd) return false
       return true
@@ -238,12 +267,12 @@ export default function CreatorSummary() {
   // 达人表列：数值列支持点击排序（服务端排序），默认总花费降序
   const creatorColumns = [
     {
-      title: '达人昵称',
-      dataIndex: 'nickname',
+      title: '达人',
+      dataIndex: 'canonical_name',
       width: 160,
-      render: (value, record) => (
+      render: (_value, record) => (
         <Button type="link" style={{ padding: 0 }} onClick={() => openCreatorDrawer(record)}>
-          {value}
+          {creatorDisplayName(record)}
         </Button>
       )
     },
@@ -324,12 +353,17 @@ export default function CreatorSummary() {
       align: 'right',
       sorter: true,
       sortOrder: sortOrderOf('repeat_count'),
-      render: (value) =>
-        Number(value) > 0 ? (
+      render: (value, record) => {
+        // Phase 5：复投次数只在「有真实合作」时才有意义。
+        // 无任何投放记录（zero-history Creator）→ 0（既不是复投，也不是「首次合作」）；
+        // 有 1 条记录且 0 次复投 → 沿用既有产品语义「首次」。
+        if (Number(record?.total_campaigns ?? 0) === 0) return formatInteger(0)
+        return Number(value) > 0 ? (
           `${formatInteger(value)} 次`
         ) : (
           <Typography.Text type="secondary">首次</Typography.Text>
         )
+      }
     },
     {
       title: '操作',
@@ -866,15 +900,25 @@ export default function CreatorSummary() {
             children: (
               <Table
                 size="small"
-                rowKey="nickname"
+                rowKey="__rowKey"
                 columns={creatorColumns}
-                dataSource={group.creators}
+                // Phase 5：渲染前先算好行身份键（invalid 分支需要行下标来区分同名行）
+                dataSource={group.creators.map((item, index) => ({
+                  ...item,
+                  __rowKey: creatorRowKey(item, index, identityMode)
+                }))}
                 pagination={false}
                 onChange={handleTableSort}
                 rowSelection={{
                   selectedRowKeys: compareKeys,
                   preserveSelectedRowKeys: true,
                   onChange: (keys) => setCompareKeys(keys),
+                  // Phase 5：identity 模式下缺 creator_id 的行不是合法 ownership，禁止进入对比
+                  getCheckboxProps: (record) => ({
+                    disabled:
+                      identityMode &&
+                      (record.creator_id === null || record.creator_id === undefined)
+                  }),
                   columnWidth: 46
                 }}
                 scroll={{ x: 1400 }}
@@ -888,7 +932,7 @@ export default function CreatorSummary() {
       <Drawer
         title={
           drawerCreator
-            ? `${drawerCreator.nickname}（${drawerCreator.creator_type || '未分类'}）· 明细`
+            ? `${creatorDisplayName(drawerCreator)}（${drawerCreator.creator_type || '未分类'}）· 明细`
             : '达人明细'
         }
         width={860}
@@ -899,15 +943,29 @@ export default function CreatorSummary() {
           <Typography.Text type="secondary">
             范围：{rangeText} · {caliberLabel} · 共 {detailRecords.length} 条投放记录
           </Typography.Text>
-          <Table
-            size="small"
-            rowKey="id"
-            loading={detailLoading}
-            columns={detailColumns}
-            dataSource={detailRecords}
-            pagination={{ pageSize: 20, showSizeChanger: false }}
-            scroll={{ x: 1230 }}
-          />
+          {/* Phase 5：zero-history Creator（无任何历史投放）可正常打开详情，明确提示不伪造表现 */}
+          {detailRecords.length === 0 ? (
+            <Empty
+              description={
+                // 全量范围（默认）下 0 条 = 该 Creator 真的没有任何历史投放；
+                // 缩小范围后 0 条 = 只是这个范围没有（Creator 仍在达人库中）
+                !isCreatorFullRange
+                  ? '该统计范围内暂无投放记录（达人仍在达人库中）'
+                  : '暂无历史投放记录'
+              }
+              style={{ padding: 32 }}
+            />
+          ) : (
+            <Table
+              size="small"
+              rowKey="id"
+              loading={detailLoading}
+              columns={detailColumns}
+              dataSource={detailRecords}
+              pagination={{ pageSize: 20, showSizeChanger: false }}
+              scroll={{ x: 1230 }}
+            />
+          )}
         </Space>
       </Drawer>
 
@@ -945,12 +1003,18 @@ export default function CreatorSummary() {
           ) : (
             <Table
               size="small"
-              rowKey="nickname"
+              rowKey={creatorRowKey}
               dataSource={compareRows}
               pagination={false}
               scroll={{ x: 1180 }}
               columns={[
-                { title: '达人昵称', dataIndex: 'nickname', width: 140, fixed: 'left' },
+                {
+                  title: '达人',
+                  dataIndex: 'canonical_name',
+                  width: 140,
+                  fixed: 'left',
+                  render: (_value, record) => creatorDisplayName(record)
+                },
                 { title: '博主类型', dataIndex: 'creator_type', width: 110 },
                 {
                   title: '投放次数',
@@ -1013,8 +1077,15 @@ export default function CreatorSummary() {
                   dataIndex: 'repeat_count',
                   width: 100,
                   align: 'right',
-                  render: (value) =>
-                    Number(value) > 0 ? `${formatInteger(value)} 次` : <Typography.Text type="secondary">首次</Typography.Text>
+                  render: (value, record) => {
+                    // Phase 5：与主表同一语义 —— zero-history Creator 显示 0，不显示「首次」
+                    if (Number(record?.total_campaigns ?? 0) === 0) return formatInteger(0)
+                    return Number(value) > 0 ? (
+                      `${formatInteger(value)} 次`
+                    ) : (
+                      <Typography.Text type="secondary">首次</Typography.Text>
+                    )
+                  }
                 }
               ]}
             />

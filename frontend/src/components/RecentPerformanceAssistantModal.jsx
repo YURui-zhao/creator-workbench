@@ -91,6 +91,9 @@ export default function RecentPerformanceAssistantModal({
   onSaved,
   creator = null,
   creatorOptions = [],
+  // Creator Identity V1 Phase 5：归属锚。传入时快照读写按 creator_id 关联（同名不同人不串数据）；
+  // 未传（老调用方）时保持原有 creator 文本行为。
+  creatorId = null,
   // Alpha.3-04B：'update'（更新近期表现，全能力）/ 'classify_existing'（只补内容分类）
   mode = 'update',
   // V3-alpha.3 Playbook Phase 1：候选达人稳定身份。传入时走候选 snapshot API（按 candidate_id 归属），
@@ -106,6 +109,8 @@ export default function RecentPerformanceAssistantModal({
   const [confirmed, setConfirmed] = useState(null)
   // P2B：快照必须绑定到用户点击的雷达达人（header 入口需先选择达人）
   const [boundCreator, setBoundCreator] = useState('')
+  // Phase 5：用户从下拉里选择的达人身份（与 boundCreator 成对出现）
+  const [boundCreatorId, setBoundCreatorId] = useState(null)
   const [identityConfirmed, setIdentityConfirmed] = useState(false)
   // Alpha.2：数据观察日期（默认浏览器本地今天；用户可改为截图实际观察的那天）
   const [observedAt, setObservedAt] = useState(() => todayLocalDateOnly())
@@ -128,6 +133,20 @@ export default function RecentPerformanceAssistantModal({
   const isClassifyMode = mode === 'classify_existing'
   // 候选模式：存在稳定 candidateId 时，保存 / 读取都走候选 API（绝不按名称匹配）
   const isCandidateMode = candidateId !== null && candidateId !== undefined && candidateId !== ''
+  // Phase 5：达人选择器选项（支持 { value, label, creator, creator_id } 对象；字符串保持兼容）
+  const creatorOptionItems = (Array.isArray(creatorOptions) ? creatorOptions : []).map((item) => {
+    if (item && typeof item === 'object') {
+      return {
+        value: item.value ?? item.creator ?? '',
+        label: item.label ?? item.creator ?? '',
+        creator: item.creator ?? item.label ?? '',
+        creator_id: item.creator_id ?? null
+      }
+    }
+    return { value: item, label: item, creator: item, creator_id: null }
+  })
+  // 本次读写使用的归属锚：行内入口固定 creatorId；全局入口取用户所选达人的身份
+  const effectiveCreatorId = creator ? creatorId ?? null : boundCreatorId ?? null
   const inputRef = useRef(null)
   // 并发保护：识别进行中禁止重复点击（同一次请求不会被叠加）
   const aiInFlightRef = useRef(false)
@@ -136,6 +155,7 @@ export default function RecentPerformanceAssistantModal({
   useEffect(() => {
     if (!open) return
     setBoundCreator(String(creator ?? '').trim())
+    setBoundCreatorId(creator ? creatorId ?? null : null)
     setIdentityConfirmed(false)
     setObservedAt(todayLocalDateOnly())
     setSaveError('')
@@ -156,7 +176,7 @@ export default function RecentPerformanceAssistantModal({
     // 候选模式按 candidate_id 读取（不退回名称匹配）；历史模式行为不变
     const latestRequest = isCandidateMode
       ? getCandidateLatestSnapshot(candidateId)
-      : getLatestRecentSnapshot(targetCreator)
+      : getLatestRecentSnapshot(targetCreator, effectiveCreatorId)
     latestRequest
       .then((res) => {
         if (!active) return
@@ -262,6 +282,8 @@ export default function RecentPerformanceAssistantModal({
         identityConfirmed: true,
         observedAt: isValidDateOnly(draft.observed_at) ? draft.observed_at : ''
       })
+      // Phase 5：带归属锚时显式声明 creator_id（绝不靠名称二次解析）
+      if (effectiveCreatorId !== null) payload.creator_id = effectiveCreatorId
       // 候选模式走候选 API（服务端用 candidate.name 作为 creator，并落 candidate_id）
       const res = isCandidateMode
         ? await saveCandidateRecentSnapshot(candidateId, payload)
@@ -485,6 +507,8 @@ export default function RecentPerformanceAssistantModal({
         identityConfirmed,
         observedAt
       })
+      // Phase 5：带归属锚时显式声明 creator_id（绝不靠名称二次解析）
+      if (effectiveCreatorId !== null) payload.creator_id = effectiveCreatorId
       // 候选模式走候选 API（服务端用 candidate.name 作为 creator，并落 candidate_id）
       const res = isCandidateMode
         ? await saveCandidateRecentSnapshot(candidateId, payload)
@@ -678,10 +702,13 @@ export default function RecentPerformanceAssistantModal({
               showSearch
               optionFilterProp="label"
               onChange={(value) => {
-                setBoundCreator(value)
+                // Phase 5：选项 value 是身份键（creator_id 优先），选中后同时取得归属锚
+                const selected = creatorOptionItems.find((item) => item.value === value)
+                setBoundCreator(selected?.creator ?? String(value))
+                setBoundCreatorId(selected?.creator_id ?? null)
                 setIdentityConfirmed(false)
               }}
-              options={creatorOptions.map((name) => ({ value: name, label: name }))}
+              options={creatorOptionItems.map((item) => ({ value: item.value, label: item.label }))}
             />
           )}
         </div>

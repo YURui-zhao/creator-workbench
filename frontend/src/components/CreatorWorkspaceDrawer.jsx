@@ -98,7 +98,12 @@ export default function CreatorWorkspaceDrawer({
       footer={
         <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
           <Space size={8} wrap>
-            <Button onClick={() => onOpenAssistant?.(header.creator)}>更新近期表现</Button>
+            {/* Phase 5：把归属锚 creator_id 一并传出，快照读写按身份关联（同名不同人不串数据） */}
+            <Button
+              onClick={() => onOpenAssistant?.(header.creator, 'update', creatorItem?.creator_id ?? null)}
+            >
+              更新近期表现
+            </Button>
             <Button type="primary" onClick={() => onOpenDecision?.(creatorItem, 'record')}>
               记录决策
             </Button>

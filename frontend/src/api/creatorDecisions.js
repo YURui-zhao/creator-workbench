@@ -13,9 +13,15 @@ export function createCreatorDecision(payload) {
   return request.post('/creator-decisions', payload, { timeout: 20000 })
 }
 
-/** 查询某位达人的决策历史（时间倒序） */
-export function getCreatorDecisions(creator) {
-  return request.get('/creator-decisions', { params: { creator } })
+/**
+ * 查询某位达人的决策历史（时间倒序）
+ * Creator Identity V1 Phase 5：提供 creatorId 时按归属锚查询（同名不同人绝不串历史）；
+ * 未提供时保持原有 creator 文本查询（legacy 兼容）。
+ */
+export function getCreatorDecisions(creator, creatorId = null) {
+  const params = { creator }
+  if (creatorId !== null && creatorId !== undefined) params.creator_id = creatorId
+  return request.get('/creator-decisions', { params })
 }
 
 /** 只读预览：用实际报价重跑 P3 规则（不写库、无 AI） */

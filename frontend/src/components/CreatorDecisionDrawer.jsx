@@ -89,6 +89,9 @@ export default function CreatorDecisionDrawer({
   onSaved
 }) {
   const creator = creatorItem?.creator || ''
+  // Creator Identity V1 Phase 5：归属锚。雷达传入时决策读/写都按 creator_id 关联
+  //（同名不同人绝不串数据）；creator text 仍作为 frozen display snapshot 传给后端。
+  const creatorId = creatorItem?.creator_id ?? null
   const snapshot = creatorItem?.recent_snapshot || null
   const [view, setView] = useState(initialView)
   const [stage, setStage] = useState('contact')
@@ -117,14 +120,14 @@ export default function CreatorDecisionDrawer({
     if (!creator) return
     setHistoryLoading(true)
     try {
-      const res = await getCreatorDecisions(creator)
+      const res = await getCreatorDecisions(creator, creatorId)
       setHistory(Array.isArray(res?.data?.decisions) ? res.data.decisions : [])
     } catch {
       setHistory([])
     } finally {
       setHistoryLoading(false)
     }
-  }, [creator])
+  }, [creator, creatorId])
 
   useEffect(() => {
     if (!open) return
@@ -200,6 +203,8 @@ export default function CreatorDecisionDrawer({
     try {
       const res = await createCreatorDecision({
         creator,
+        // Phase 5：显式携带归属锚（Radar 已拥有 Creator 身份，不再依赖名称解析 / zero-match fallback）
+        creator_id: creatorId ?? null,
         decision_stage: stage,
         snapshot_id: snapshot?.id ?? null,
         current_quote_raw: stage === 'post_quote' ? quoteRaw : null,

@@ -1172,7 +1172,8 @@ async function main() {
     'C11 操作入口未重构：页面仍把「更新近期表现 / 记录决策」回调接到既有组件（Alpha.3-05 起入口在工作区）',
       /onOpenAssistant=\{openAssistant\}/.test(radarPageA3) &&
       /onOpenDecision=\{openDecision\}/.test(radarPageA3) &&
-      /const openAssistant = \(creatorName, mode = 'update'\) => \{/.test(radarPageA3) &&
+      // Phase 5：回调附带 creator_id（归属锚），同名不同人绝不串数据
+      /const openAssistant = \(creatorName, mode = 'update', creatorId = null\) => \{/.test(radarPageA3) &&
       /const openDecision = \(creatorItem, view = 'record'\) => \{/.test(radarPageA3)
   )
   check(
@@ -1674,7 +1675,8 @@ async function main() {
       ) &&
       // 「补充分类」复用现有入口，不新增编辑器 / API
       /补充分类/.test(radarPageCT) &&
-      /onOpenAssistant\?\.\(record\.creator, 'classify_existing'\)/.test(radarPageCT) &&
+      // Phase 5：补充分类入口同时携带 creator_id
+      /onOpenAssistant\?\.\(record\.creator, 'classify_existing', record\.creator_id\)/.test(radarPageCT) &&
       // 文案集中在 useContentType 工具里（页面不自己拼中位/条数）
       /商单中位/.test(fs.readFileSync(path.join(REPO_ROOT, 'frontend/src/utils/contentType.js'), 'utf8')) &&
       !/商单中位/.test(radarPageCT) &&
@@ -1718,13 +1720,16 @@ async function main() {
     'W3 页面不再有 Popover：达人昵称点击改为打开工作区',
     !/from 'antd'[\s\S]{0,400}Popover/.test(radarPageWs) &&
       !/<Popover/.test(radarPageWs) &&
-      /onClick=\{\(\) => onOpenWorkspace\?\.\(value\)\}/.test(radarPageWs) &&
-      /const openWorkspace = \(creatorName\) => setWorkspaceCreator\(creatorName \|\| null\)/.test(radarPageWs)
+      // Phase 5：点击打开工作区时传入整行（携带 creator_id），不再按名称解析
+      /onClick=\{\(\) => onOpenWorkspace\?\.\(record\)\}/.test(radarPageWs) &&
+      /const openWorkspace = \(creatorItem\) => \{/.test(radarPageWs) &&
+      /setWorkspaceKey\(radarRowKey\(creatorItem, undefined, identityMode\)\)/.test(radarPageWs)
   )
   check(
     'W4 工作区绑定当前达人，并从最新 Radar 结果解析（保存后可自动刷新）',
-    /const workspaceItem = workspaceCreator/.test(radarPageWs) &&
-      /\.find\(\(item\) => item\.creator === workspaceCreator\)/.test(radarPageWs) &&
+    // Phase 5：工作区按身份键从最新 Radar 结果解析（同名不同人绝不串数据）
+    /const workspaceItem = workspaceKey/.test(radarPageWs) &&
+      /radarRowKey\(item, undefined, identityMode\) === workspaceKey/.test(radarPageWs) &&
       /<CreatorWorkspaceDrawer/.test(radarPageWs) &&
       /open=\{Boolean\(workspaceItem\)\}/.test(radarPageWs) &&
       /creatorItem=\{workspaceItem\}/.test(radarPageWs) &&
@@ -1733,7 +1738,7 @@ async function main() {
   )
   check(
     'W5 关闭工作区只清空工作区状态（不动搜索 / 筛选 / 折叠）',
-    /onClose=\{\(\) => setWorkspaceCreator\(null\)\}/.test(radarPageWs) &&
+    /onClose=\{\(\) => setWorkspaceKey\(null\)\}/.test(radarPageWs) &&
       (radarPageWs.match(/setCollapsedGroups/g) || []).length === 2 &&
       (radarPageWs.match(/setFilters\(EMPTY_RADAR_FILTERS\)/g) || []).length === 1
   )
@@ -2028,7 +2033,8 @@ async function main() {
   )
   check(
     'Y2 预加载已有快照：读 latest snapshot → buildDraftFromSnapshot（无新增 API）',
-    /getLatestRecentSnapshot\(targetCreator\)/.test(assistantSrc) &&
+    // Phase 5：latest 读取携带归属锚 creator_id（同名不同人绝不串数据），仍无新增 http 调用
+    /getLatestRecentSnapshot\(targetCreator, effectiveCreatorId\)/.test(assistantSrc) &&
       /const nextDraft = buildDraftFromSnapshot\(snapshot\)/.test(assistantSrc) &&
       /export function buildDraftFromSnapshot\(snapshot\)/.test(draftLibSrc) &&
       // 复用既有 latest 接口，没有新增 http 调用
@@ -2083,8 +2089,13 @@ async function main() {
     'Y7 Radar 入口条件：有快照且 unknown_count > 0 才出现「补充分类」，点击进入 classify 模式',
     /if \(!snapshot\) return PLACEHOLDER/.test(radarPageClassify) &&
       /cell\.unknownCount > 0 && \(/.test(radarPageClassify) &&
-      /onOpenAssistant\?\.\(record\.creator, 'classify_existing'\)/.test(radarPageClassify) &&
-      /const openAssistant = \(creatorName, mode = 'update'\)/.test(radarPageClassify) &&
+      // Phase 5：入口同时携带归属锚 creator_id
+      /onOpenAssistant\?\.\(record\.creator, 'classify_existing', record\.creator_id\)/.test(
+        radarPageClassify
+      ) &&
+      /const openAssistant = \(creatorName, mode = 'update', creatorId = null\)/.test(
+        radarPageClassify
+      ) &&
       /mode=\{assistantMode\}/.test(radarPageClassify)
   )
   check(

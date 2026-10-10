@@ -132,6 +132,48 @@ export function loadLatestDecisionSummaries(creatorList = []) {
   return map
 }
 
+/**
+ * Creator Identity V1 Phase 5：按 creator_id 批量读取最近一次决策 summary（单条 SQL，无 N+1）。
+ * 与 loadLatestDecisionSummaries 同一序列化 / outcome 补齐逻辑，只把关联键换成归属锚 creator_id。
+ * @param {number[]} creatorIds
+ * @returns {Map<number, Object>} creator_id -> summary
+ */
+export function loadLatestDecisionSummariesByCreatorId(creatorIds = []) {
+  const ids = [
+    ...new Set(
+      (Array.isArray(creatorIds) ? creatorIds : [])
+        .map((id) => Number(id))
+        .filter((id) => Number.isInteger(id) && id > 0)
+    )
+  ]
+  const map = new Map()
+  if (!ids.length) return map
+  if (!identitySchemaReady(db) || !identityTableHasColumn(db, 'creator_decisions', 'creator_id')) {
+    return map
+  }
+  const placeholders = ids.map(() => '?').join(', ')
+  const rows = db
+    .prepare(
+      `SELECT ${DECISION_SUMMARY_COLUMNS}, creator_id
+       FROM creator_decisions
+       WHERE creator_id IN (${placeholders})
+       ORDER BY created_at DESC, id DESC`
+    )
+    .all(...ids)
+  // 每位 Creator 只保留最近一条决策，再一次性批量补齐 outcome
+  const latestByCreator = new Map()
+  for (const row of rows) {
+    const id = Number(row.creator_id)
+    if (!latestByCreator.has(id)) latestByCreator.set(id, row)
+  }
+  const latestRows = [...latestByCreator.values()]
+  const outcomeMap = loadOutcomeSummaries(latestRows)
+  for (const [id, row] of latestByCreator.entries()) {
+    map.set(id, toDecisionSummary(row, outcomeMap.get(row.id) || null))
+  }
+  return map
+}
+
 const findSnapshotRow = (snapshotId) =>
   db.prepare('SELECT * FROM creator_recent_snapshots WHERE id = ?').get(snapshotId)
 
@@ -538,20 +580,42 @@ router.post('/', (req, res) => {
  */
 router.get('/', (req, res) => {
   const creator = String(req.query?.creator ?? '').trim()
-  if (!creator) return fail(res, 400, 'creator 不能为空')
+  // Creator Identity V1 Phase 5：可选 creator_id（归属锚）——提供时优先按身份关联，
+  // 同名不同人绝不串决策历史；未提供时保持原有 creator 文本查询（legacy 兼容）。
+  const rawCreatorId = req.query?.creator_id
+  let creatorId = null
+  if (rawCreatorId !== undefined && rawCreatorId !== null && String(rawCreatorId).trim() !== '') {
+    const parsed = Number(rawCreatorId)
+    if (!Number.isInteger(parsed) || parsed <= 0) return fail(res, 400, 'creator_id 必须是正整数')
+    creatorId = parsed
+  }
+  if (!creator && creatorId === null) return fail(res, 400, 'creator 不能为空')
   if (creator.length > 100) return fail(res, 400, 'creator 长度不能超过 100')
-  const rows = db
-    .prepare(
-      `SELECT * FROM creator_decisions
-       WHERE creator = ?
-       ORDER BY created_at DESC, id DESC`
-    )
-    .all(creator)
+  const identityUsable =
+    creatorId !== null &&
+    identitySchemaReady(db) &&
+    identityTableHasColumn(db, 'creator_decisions', 'creator_id')
+  const rows = identityUsable
+    ? db
+        .prepare(
+          `SELECT * FROM creator_decisions
+           WHERE creator_id = ?
+           ORDER BY created_at DESC, id DESC`
+        )
+        .all(creatorId)
+    : db
+        .prepare(
+          `SELECT * FROM creator_decisions
+           WHERE creator = ?
+           ORDER BY created_at DESC, id DESC`
+        )
+        .all(creator)
   const outcomeMap = loadOutcomeSummaries(rows)
   // A4：同一次请求附带谈价结果（单条 SQL，避免前端 N+1）
   const negotiationMap = loadNegotiationCaseSummaries(rows)
   ok(res, {
-    creator,
+    creator: creator || null,
+    creator_id: identityUsable ? creatorId : null,
     decisions: rows.map((row) =>
       toPublicDecision(row, outcomeMap.get(row.id) || null, negotiationMap.get(row.id) || null)
     )

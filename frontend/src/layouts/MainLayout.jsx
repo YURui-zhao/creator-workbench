@@ -24,10 +24,12 @@ const HEADER_HEIGHT = 64
 
 const MENU_ITEMS = [
   { key: 'dashboard', icon: <BarChartOutlined />, label: '数据看板' },
-  { key: 'creators', icon: <TeamOutlined />, label: '达人汇总' },
+  // Creator Identity V1 Phase 5：页面已切换为 Creator Library（仅改 label，不改菜单机制）
+  { key: 'creators', icon: <TeamOutlined />, label: '达人库' },
   { key: 'repurchase-radar', icon: <RadarChartOutlined />, label: '复投雷达' },
   { key: 'creator-playbook', icon: <ExperimentOutlined />, label: '达人拓展' },
-  { key: 'records', icon: <OrderedListOutlined />, label: '投放管理' },
+  // Phase 5：与页面职责对齐（仅改 label，不改菜单机制 / key / 路由）
+  { key: 'records', icon: <OrderedListOutlined />, label: '投放记录' },
   { key: 'import-history', icon: <HistoryOutlined />, label: '导入历史' }
 ]
 

@@ -42,6 +42,8 @@ import {
   filterRadarGroups,
   isRadarFilterActive
 } from '../../utils/radarFilters.js'
+// Phase 5：行身份键统一走共享实现（id / invalid / name 三分支，与达人库同一规则）
+import { creatorIdentityKey as radarRowKey } from '../../utils/creatorCompare.js'
 
 // 历史状态 -> 展示文案（文字为主，颜色仅辅助，不依赖颜色理解）
 const STATUS_META = {
@@ -76,7 +78,7 @@ const PLACEHOLDER = <Typography.Text type="secondary">-</Typography.Text>
 /**
  * 列定义（目标 CPM 只用于提示文案，业务判定全部由后端给出）
  * @param {number} targetCpm 目标 CPM
- * @param {(creator: string) => void} onOpenAssistant 打开某位达人的「近期表现助手」
+ * @param {(creator: string, mode?: string, creatorId?: number|null) => void} onOpenAssistant 打开某位达人的「近期表现助手」
  */
 function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision, onOpenWorkspace) {
   return [
@@ -95,7 +97,7 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision, onOpenWor
               overflow: 'hidden',
               textOverflow: 'ellipsis'
             }}
-            onClick={() => onOpenWorkspace?.(value)}
+            onClick={() => onOpenWorkspace?.(record)}
           >
             {value}
           </a>
@@ -169,7 +171,9 @@ function buildRadarColumns(targetCpm, onOpenAssistant, onOpenDecision, onOpenWor
             {cell.unknownCount > 0 && (
               <a
                 style={SECONDARY_TEXT_STYLE}
-                onClick={() => onOpenAssistant?.(record.creator, 'classify_existing')}
+                onClick={() =>
+                  onOpenAssistant?.(record.creator, 'classify_existing', record.creator_id)
+                }
               >
                 补充分类
               </a>
@@ -333,6 +337,8 @@ export default function RepurchaseRadar() {
   const [assistantOpen, setAssistantOpen] = useState(false)
   // P2B：助手绑定的雷达达人（从行内入口进入时固定；header 入口为空需用户选择）
   const [assistantCreator, setAssistantCreator] = useState(null)
+  // Phase 5：助手绑定达人的 creator_id（归属锚；有值时快照读写按 creator_id 关联）
+  const [assistantCreatorId, setAssistantCreatorId] = useState(null)
   // Alpha.3-04B：助手模式（update = 更新近期表现 / classify_existing = 只补内容分类）
   const [assistantMode, setAssistantMode] = useState('update')
   const [confirmedDraft, setConfirmedDraft] = useState(null)
@@ -344,8 +350,8 @@ export default function RepurchaseRadar() {
   const [filters, setFilters] = useState(EMPTY_RADAR_FILTERS)
   // Alpha.3-03：分组折叠状态（纯组件内状态，刷新即回到「全部展开」；不写库 / 不写存储）
   const [collapsedGroups, setCollapsedGroups] = useState(DEFAULT_COLLAPSED_GROUPS)
-  // Alpha.3-05：达人判断工作区（记录达人名称，数据始终取最新 Radar 结果，保存后自动同步刷新）
-  const [workspaceCreator, setWorkspaceCreator] = useState(null)
+  // Alpha.3-05：达人判断工作区（记录达人身份键，数据始终取最新 Radar 结果，保存后自动同步刷新）
+  const [workspaceKey, setWorkspaceKey] = useState(null)
 
   const loadRadar = useCallback(async () => {
     setLoading(true)
@@ -368,6 +374,9 @@ export default function RepurchaseRadar() {
   const summary = radar?.summary
   const targetCpm = radar?.target_cpm
   const groups = radar?.groups || []
+  // Phase 5：身份模式来自后端（identity_mode）。identity 模式下行必须有 creator_id；
+  // 缺失属契约破坏 → 行键使用稳定无效键（绝不静默用名称合并同名行）。
+  const identityMode = radar?.identity_mode === true
   // B2：检索只在已加载的雷达数据上做视图过滤（保留后端原排序，不重算任何业务规则）
   const filterActive = isRadarFilterActive(filters)
   const { groups: visibleGroups, visibleCount } = useMemo(
@@ -376,9 +385,18 @@ export default function RepurchaseRadar() {
   )
   const totalCount = summary?.creator_count ?? 0
   // 达人选择器（近期表现助手）始终基于全量达人，不受检索影响
-  const creatorOptions = groups.flatMap((group) => group.creators.map((item) => item.creator))
-  const openAssistant = (creatorName, mode = 'update') => {
+  // Phase 5：选项携带身份键与归属锚（同名不同人可区分，选择后按 creator_id 读写）
+  const creatorOptions = groups
+    .flatMap((group) => group.creators)
+    .map((item) => ({
+      value: radarRowKey(item, undefined, identityMode),
+      label: item.creator,
+      creator: item.creator,
+      creator_id: item.creator_id ?? null
+    }))
+  const openAssistant = (creatorName, mode = 'update', creatorId = null) => {
     setAssistantCreator(creatorName || null)
+    setAssistantCreatorId(creatorId === null || creatorId === undefined ? null : creatorId)
     setAssistantMode(mode)
     setAssistantOpen(true)
   }
@@ -389,10 +407,20 @@ export default function RepurchaseRadar() {
     setDecisionOpen(true)
   }
   // Alpha.3-05：达人判断工作区（宽度约 75% 页面宽度）
-  const openWorkspace = (creatorName) => setWorkspaceCreator(creatorName || null)
+  // Phase 5：按身份键打开（creator_id 优先），同名不同人绝不串数据
+  const openWorkspace = (creatorItem) => {
+    if (!creatorItem) return setWorkspaceKey(null)
+    // identity 模式下缺 creator_id = 契约破坏：不是合法 Creator ownership，拒绝进入工作区
+    if (identityMode && (creatorItem.creator_id === null || creatorItem.creator_id === undefined)) {
+      return
+    }
+    return setWorkspaceKey(radarRowKey(creatorItem, undefined, identityMode))
+  }
   // 工作区数据始终从最新 Radar 结果里解析：保存近期表现 / 决策后 loadRadar() 会自动同步刷新
-  const workspaceItem = workspaceCreator
-    ? groups.flatMap((group) => group.creators).find((item) => item.creator === workspaceCreator) || null
+  const workspaceItem = workspaceKey
+    ? groups
+        .flatMap((group) => group.creators)
+        .find((item) => radarRowKey(item, undefined, identityMode) === workspaceKey) || null
     : null
   // 目标 CPM 一律取后端返回值（唯一来源在 backend/utils/creatorBusinessRules.js），前端不持有字面量
   const columns = buildRadarColumns(targetCpm, openAssistant, openDecision, openWorkspace)
@@ -479,6 +507,7 @@ export default function RepurchaseRadar() {
       <RecentPerformanceAssistantModal
         open={assistantOpen}
         creator={assistantCreator}
+        creatorId={assistantCreatorId}
         creatorOptions={creatorOptions}
         mode={assistantMode}
         onCancel={() => setAssistantOpen(false)}
@@ -504,7 +533,7 @@ export default function RepurchaseRadar() {
       <CreatorWorkspaceDrawer
         open={Boolean(workspaceItem)}
         creatorItem={workspaceItem}
-        onClose={() => setWorkspaceCreator(null)}
+        onClose={() => setWorkspaceKey(null)}
         onOpenAssistant={openAssistant}
         onOpenDecision={openDecision}
       />
@@ -642,8 +671,12 @@ export default function RepurchaseRadar() {
                 ) : (
                   <Table
                     size="small"
-                    rowKey="creator"
-                    dataSource={group.creators}
+                    rowKey="__rowKey"
+                    // Phase 5：渲染前算好行身份键（invalid 分支需要行下标区分同名行）
+                    dataSource={group.creators.map((item, index) => ({
+                      ...item,
+                      __rowKey: radarRowKey(item, index, identityMode)
+                    }))}
                     columns={columns}
                     pagination={false}
                     scroll={{ x: RADAR_TABLE_WIDTH }}

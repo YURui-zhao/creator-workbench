@@ -1628,7 +1628,8 @@ export function exportCreatorStatsToExcel(creators = [], options = {}) {
     value === null || value === undefined ? '' : Number((Number(value) || 0).toFixed(2))
   const rateCell = (value) => (value === null || value === undefined ? '' : `${value}%`)
   const data = list.map((item) => ({
-    达人昵称: item.nickname || '未命名达人',
+    // Phase 5：显示名取 Creator 权威名（identity 模式）；nickname 仅为兼容别名
+    达人昵称: item.canonical_name || item.nickname || '未命名达人',
     达人类型: item.creator_type || '未分类',
     投放次数: Number(item.total_campaigns) || 0,
     总花费: (Number(item.total_cost) || 0).toFixed(2),

@@ -11,6 +11,7 @@ import {
 import { computeCreatorPricing } from '../utils/creatorPricing.js'
 // Creator Identity V1 Phase 4：快照写入补归属锚（只读解析 / 继承，不猜）
 import {
+  creatorIdentityErrorData,
   identitySchemaReady,
   identityTableHasColumn,
   resolveCreatorIdFromText,
@@ -464,7 +465,13 @@ router.post('/', (req, res) => {
       body.creator_id !== undefined && body.creator_id !== null && String(body.creator_id).trim() !== ''
     if (explicitProvided) {
       const explicit = validateExplicitCreatorId(db, body.creator_id)
-      if (!explicit.ok) return fail(res, 400, explicit.error)
+      if (!explicit.ok) {
+        return res.status(400).json({
+          code: 400,
+          data: creatorIdentityErrorData(explicit.reason, { creator_id: explicit.creatorId ?? null }),
+          msg: explicit.error
+        })
+      }
       creatorId = explicit.creatorId
     } else {
       creatorId = resolveCreatorIdFromText(db, creator).creatorId

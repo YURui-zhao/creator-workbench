@@ -42,6 +42,7 @@ import {
 import { WORK_STATE_STATES, workStateFromLegacy } from '../utils/creatorIdentity.js'
 // Phase 4：写入路径身份归属（唯一解析入口；strict alias / 显式 creator_id 校验）
 import {
+  creatorIdentityErrorData,
   createProvisionalCreator,
   identitySchemaReady,
   identityTableHasColumn,
@@ -345,7 +346,13 @@ router.post('/', (req, res) => {
     body.creator_id !== undefined && body.creator_id !== null && String(body.creator_id).trim() !== ''
   if (explicitProvided) {
     const explicit = validateExplicitCreatorId(db, body.creator_id)
-    if (!explicit.ok) return fail(res, 400, explicit.error)
+    if (!explicit.ok) {
+      return res.status(400).json({
+        code: 400,
+        data: creatorIdentityErrorData(explicit.reason, { creator_id: explicit.creatorId ?? null }),
+        msg: explicit.error
+      })
+    }
     const activeId = findActiveCandidateIdForCreator(explicit.creatorId)
     if (activeId !== null) {
       return fail(
@@ -585,6 +592,23 @@ router.patch('/:id', (req, res) => {
   // Creator 权威 profile 只能落在同一个 creator_id 上（candidate 无归属时降级为 legacy 仅写 candidate）
   const creatorId = candidateIdentityWritable() ? Number(row.creator_id) || null : null
   const profileUpdates = updates.filter((update) => update.profile)
+
+  // 单边写入守卫：candidate 有归属锚且本次要写 profile 时，权威 Creator 必须真实可写。
+  // 否则会出现「mirror 写了、权威没写」的两套权威漂移（例如归属锚指向已删除 / 已合并的 Creator）。
+  // 这里在任何写入之前直接拒绝 → 两张表都保持 before state（不依赖事务回滚）。
+  if (creatorId !== null && profileUpdates.length > 0) {
+    const authority = validateExplicitCreatorId(db, creatorId)
+    if (!authority.ok) {
+      return res.status(409).json({
+        code: 409,
+        data: creatorIdentityErrorData(authority.reason, {
+          candidate_id: row.id,
+          creator_id: creatorId
+        }),
+        msg: `候选达人 #${row.id} 的归属 Creator #${creatorId} 不可写入（${authority.error}），资料未保存`
+      })
+    }
+  }
 
   const candidateSet = [...updates.map((update) => `${update.column} = ?`), 'updated_at = CURRENT_TIMESTAMP']
   const candidateParams = updates.map((update) => update.value)

@@ -363,27 +363,80 @@ export function resolveOrCreateCreatorForRecord(
 /**
  * 只读归属：从文本名称解析 creator_id（绝不创建）。
  * 用于 snapshot / legacy decision 这类「已有别的稳定锚，只是补一个归属」的场景。
+ * `reason` 是稳定机器可读取值（unique_alias / none / ambiguous）；
+ * 调用方据此构造稳定 identity 契约，绝不靠中文文案判断。
  */
 export function resolveCreatorIdFromText(db, rawName) {
   const resolved = resolveCreatorByStrictAlias(db, rawName)
   if (resolved.count === 1) {
-    return { creatorId: resolved.creatorIds[0], reason: 'unique_alias', normalized: resolved.normalized }
+    return {
+      creatorId: resolved.creatorIds[0],
+      reason: 'unique_alias',
+      normalized: resolved.normalized,
+      creatorIds: resolved.creatorIds
+    }
   }
-  if (resolved.count > 1) return { creatorId: null, reason: 'ambiguous', normalized: resolved.normalized }
-  return { creatorId: null, reason: 'none', normalized: resolved.normalized }
+  if (resolved.count > 1) {
+    return {
+      creatorId: null,
+      reason: 'ambiguous',
+      normalized: resolved.normalized,
+      creatorIds: resolved.creatorIds
+    }
+  }
+  return { creatorId: null, reason: 'none', normalized: resolved.normalized, creatorIds: [] }
 }
 
-/** 显式 creator_id 校验：正整数 + 存在 + 非 merged 墓碑 */
+/**
+ * 显式 creator_id 校验：正整数 + 存在 + 非 merged 墓碑。
+ * 失败时返回稳定 `reason`（schema_missing / invalid_id / not_found / merged），
+ * 供各写路径构造一致的 identity 错误契约（PHASE4 稳定化 §8 / §10）。
+ */
 export function validateExplicitCreatorId(db, rawId) {
-  if (!identitySchemaReady(db)) return { ok: false, error: '身份层尚未初始化（无 creators 表）' }
+  if (!identitySchemaReady(db)) {
+    return { ok: false, reason: 'schema_missing', error: '身份层尚未初始化（无 creators 表）' }
+  }
   const id = Number(rawId)
-  if (!Number.isInteger(id) || id <= 0) return { ok: false, error: 'creator_id 必须是正整数' }
+  if (!Number.isInteger(id) || id <= 0) {
+    return { ok: false, reason: 'invalid_id', error: 'creator_id 必须是正整数' }
+  }
   const row = db.prepare('SELECT id, canonical_name, identity_status FROM creators WHERE id = ?').get(id)
-  if (!row) return { ok: false, error: `creator_id=${id} 不存在` }
+  if (!row) return { ok: false, reason: 'not_found', creatorId: id, error: `creator_id=${id} 不存在` }
   if (row.identity_status === 'merged') {
-    return { ok: false, error: `Creator #${id} 已合并，不能作为归属锚` }
+    return {
+      ok: false,
+      reason: 'merged',
+      creatorId: id,
+      creator: row,
+      error: `Creator #${id} 已合并，不能作为归属锚`
+    }
   }
   return { ok: true, creatorId: id, creator: row }
+}
+
+/**
+ * 统一 identity 失败契约（稳定机器可读）。
+ * 保持项目既有 `{ code, data, msg }` 形状：structured 信息放在 `data`，
+ * 与 outcome 关联使用的 `data.requires_identity_confirmation` 属同一套做法。
+ * @param {string} reason ambiguous | not_found | merged | invalid_id | schema_missing
+ * @param {Object} [extra]
+ */
+export function creatorIdentityErrorData(reason, extra = {}) {
+  return { creator_identity: { reason, ...extra } }
+}
+
+/** strict alias 命中多个 Creator 时的候选列表（仅返回对外可见的基础字段） */
+export function describeCreatorsByIds(db, creatorIds = []) {
+  const ids = (Array.isArray(creatorIds) ? creatorIds : []).filter(
+    (id) => Number.isInteger(Number(id)) && Number(id) > 0
+  )
+  if (!ids.length) return []
+  const placeholders = ids.map(() => '?').join(', ')
+  return db
+    .prepare(
+      `SELECT id, canonical_name, identity_status FROM creators WHERE id IN (${placeholders}) ORDER BY id ASC`
+    )
+    .all(...ids.map(Number))
 }
 
 /** 归属锚只读访问：candidate / decision / record 行 → creator_id（永不替代事件身份） */

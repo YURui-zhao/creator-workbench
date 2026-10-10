@@ -9,6 +9,8 @@ import { loadNegotiationCaseSummaries } from './creatorNegotiationCases.js'
 import { PRICING_VERSION, TARGET_CPM } from '../utils/creatorBusinessRules.js'
 // Creator Identity V1 Phase 4：legacy 决策补归属锚（显式 creator_id 优先 / strict 唯一才自动归属）
 import {
+  creatorIdentityErrorData,
+  describeCreatorsByIds,
   identitySchemaReady,
   identityTableHasColumn,
   resolveCreatorIdFromText,
@@ -451,16 +453,30 @@ router.post('/', (req, res) => {
       String(decisionBody.creator_id).trim() !== ''
     if (explicitProvided) {
       const explicit = validateExplicitCreatorId(db, decisionBody.creator_id)
-      if (!explicit.ok) return fail(res, 400, explicit.error)
+      if (!explicit.ok) {
+        // 稳定机器可读契约：reason = invalid_id / not_found / merged / schema_missing
+        return res.status(400).json({
+          code: 400,
+          data: creatorIdentityErrorData(explicit.reason, {
+            creator_id: explicit.creatorId ?? null
+          }),
+          msg: explicit.error
+        })
+      }
       creatorId = explicit.creatorId
     } else {
       const resolved = resolveCreatorIdFromText(db, value.creator)
       if (resolved.reason === 'ambiguous') {
-        return fail(
-          res,
-          409,
-          `达人名称「${value.creator}」对应多个 Creator（身份歧义），请先明确归属后再创建决策`
-        )
+        // 身份歧义：绝不 take first match，也不落库；返回 matches 供显式选择 creator_id
+        return res.status(409).json({
+          code: 409,
+          data: creatorIdentityErrorData('ambiguous', {
+            creator_text: value.creator,
+            normalized: resolved.normalized,
+            matches: describeCreatorsByIds(db, resolved.creatorIds)
+          }),
+          msg: `达人名称「${value.creator}」对应多个 Creator（身份歧义），请先明确归属（传 creator_id）后再创建决策`
+        })
       }
       creatorId = resolved.creatorId
     }

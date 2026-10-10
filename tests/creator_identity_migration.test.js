@@ -453,6 +453,128 @@ async function main() {
   }
 
   db.close()
+
+  console.log('\n===== 10. 真实库 commit 授权护栏（A–E，非交互，真实库不受影响）=====')
+  {
+    const makeBackup = async (fixture, name) => {
+      const backupPath = path.join(tmpRoot, name)
+      await fixture.db.backup(backupPath)
+      return backupPath
+    }
+    const authOf = (over = {}) => {
+      const fixture = over.fixture ?? createFixture()
+      return { fixture, ...over }
+    }
+
+    // 基线：source == backup，sha 正确，路径一致 → PASS
+    {
+      const fixture = createFixture()
+      const backupPath = await makeBackup(fixture, 'backup-ok.db')
+      const auth = migration.authorizeRealDbCommit({
+        sourcePath: fixture.dbPath,
+        realDbPath: fixture.dbPath, // 测试用「假真实库」避免触碰真实库
+        backupPath,
+        expectedSourceSha: migration.computeFileSha256(fixture.dbPath)
+      })
+      check('A–E 全部满足 → 授权通过', auth.ok === true, JSON.stringify(auth.errors))
+      check('授权报告包含 5 项检查（A/B/C/D/E）', auth.checks.length === 5 && auth.checks.every((c) => c.pass))
+      check('授权检查不修改源库（无 creators 表）', !tableExists(fixture.db, 'creators'))
+      fixture.db.close()
+    }
+
+    // A：缺 backup-path
+    {
+      const fixture = createFixture()
+      const auth = migration.authorizeRealDbCommit({
+        sourcePath: fixture.dbPath,
+        realDbPath: fixture.dbPath,
+        backupPath: null,
+        expectedSourceSha: migration.computeFileSha256(fixture.dbPath)
+      })
+      check('缺 --backup-path → hard fail（A）', auth.ok === false && auth.checks.find((c) => c.id === 'A').pass === false)
+      fixture.db.close()
+    }
+
+    // A：backup 不存在
+    {
+      const fixture = createFixture()
+      const auth = migration.authorizeRealDbCommit({
+        sourcePath: fixture.dbPath,
+        realDbPath: fixture.dbPath,
+        backupPath: path.join(tmpRoot, 'not-there.db'),
+        expectedSourceSha: migration.computeFileSha256(fixture.dbPath)
+      })
+      check('--backup-path 指向不存在的文件 → hard fail', auth.ok === false)
+      fixture.db.close()
+    }
+
+    // D：sha 缺失 / 不匹配
+    {
+      const fixture = createFixture()
+      const backupPath = await makeBackup(fixture, 'backup-d.db')
+      const missingSha = migration.authorizeRealDbCommit({ sourcePath: fixture.dbPath, realDbPath: fixture.dbPath, backupPath, expectedSourceSha: null })
+      const wrongSha = migration.authorizeRealDbCommit({ sourcePath: fixture.dbPath, realDbPath: fixture.dbPath, backupPath, expectedSourceSha: 'a'.repeat(64) })
+      check('缺 --expected-source-sha → hard fail（D）', missingSha.ok === false && missingSha.checks.find((c) => c.id === 'D').pass === false)
+      check('sha 不匹配 → hard fail（D）', wrongSha.ok === false)
+      fixture.db.close()
+    }
+
+    // E：路径不是真实库
+    {
+      const fixture = createFixture()
+      const backupPath = await makeBackup(fixture, 'backup-e.db')
+      const auth = migration.authorizeRealDbCommit({
+        sourcePath: fixture.dbPath,
+        realDbPath: path.join(tmpRoot, 'some-other.db'),
+        backupPath,
+        expectedSourceSha: migration.computeFileSha256(fixture.dbPath)
+      })
+      check('db path 不等于真实库 → hard fail（E）', auth.ok === false && auth.checks.find((c) => c.id === 'E').pass === false)
+      fixture.db.close()
+    }
+
+    // B：备份损坏
+    {
+      const fixture = createFixture()
+      const brokenPath = path.join(tmpRoot, 'backup-broken.db')
+      fs.writeFileSync(brokenPath, Buffer.from('this is not a sqlite database'.repeat(10)))
+      const auth = migration.authorizeRealDbCommit({
+        sourcePath: fixture.dbPath,
+        realDbPath: fixture.dbPath,
+        backupPath: brokenPath,
+        expectedSourceSha: migration.computeFileSha256(fixture.dbPath)
+      })
+      check('备份损坏（integrity 无法通过）→ hard fail（B）', auth.ok === false && auth.checks.find((c) => c.id === 'B').pass === false)
+      fixture.db.close()
+    }
+
+    // C：备份与源库业务逻辑不一致
+    {
+      const fixture = createFixture()
+      const backupPath = await makeBackup(fixture, 'backup-drift.db')
+      const backupDb = new Database(backupPath)
+      backupDb.prepare('DELETE FROM creator_records WHERE id = 1').run()
+      backupDb.close()
+      const auth = migration.authorizeRealDbCommit({
+        sourcePath: fixture.dbPath,
+        realDbPath: fixture.dbPath,
+        backupPath,
+        expectedSourceSha: migration.computeFileSha256(fixture.dbPath)
+      })
+      check('备份缺少业务行（logical hash 不一致）→ hard fail（C）', auth.ok === false && auth.checks.find((c) => c.id === 'C').pass === false)
+      fixture.db.close()
+    }
+
+    // 真实库路径：CLI 层默认拒绝 + 完整 flag 才放行（不实际执行）
+    let cliBlockedWithoutFlag = false
+    try {
+      migration.guardDbPath(migration.REAL_DB_PATH, 'commit')
+    } catch {
+      cliBlockedWithoutFlag = true
+    }
+    check('真实库 commit 缺少 --allow-real-db → 拒绝', cliBlockedWithoutFlag)
+    check('真实库 sha256 可读取（授权 D 项的数据源）', /^[0-9a-f]{64}$/.test(migration.computeFileSha256(migration.REAL_DB_PATH)))
+  }
 }
 
 main()

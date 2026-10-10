@@ -140,6 +140,26 @@ async function main() {
   check('--commit 允许临时库路径', migration.guardDbPath(tmpPath, 'commit').endsWith('workbench.db'))
   check('REAL_DB_PATH 指向 backend/workbench.db', migration.REAL_DB_PATH === path.join(REPO_ROOT, 'backend', 'workbench.db'))
   check(
+    'canonicalDbPath 与 REAL_DB_PATH 等价（symlink 安全）',
+    migration.canonicalDbPath('backend/workbench.db') === migration.canonicalDbPath(migration.REAL_DB_PATH)
+  )
+  check(
+    'isRealDbPath 识别真实库与副本',
+    migration.isRealDbPath(migration.REAL_DB_PATH) === true && migration.isRealDbPath(tmpPath) === false
+  )
+  check(
+    '真实库 commit：显式 allow-real-db 才放行（默认仍拒绝）',
+    migration.guardDbPath(migration.REAL_DB_PATH, 'commit', { allowRealDb: true }) ===
+      migration.canonicalDbPath(migration.REAL_DB_PATH)
+  )
+  let realDryRunRejected = false
+  try {
+    migration.guardDbPath(migration.REAL_DB_PATH, 'dry-run', { allowRealDb: true })
+  } catch {
+    realDryRunRejected = true
+  }
+  check('allow-real-db 不能用于 dry-run（dry-run 永远用副本）', realDryRunRejected)
+  check(
     '迁移脚本不导入任何网络 / AI 模块',
     !/axios|fetch\(|deepseek|callProvider/i.test(
       fs.readFileSync(path.join(REPO_ROOT, 'backend/migrations/001_creator_identity.js'), 'utf8')

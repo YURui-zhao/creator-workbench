@@ -5,10 +5,16 @@
  * 运行方式：
  *   node backend/migrations/001_creator_identity.js --dry-run --db /tmp/<copy>/workbench.db
  *   node backend/migrations/001_creator_identity.js --commit  --db /tmp/<copy>/workbench.db
+ *   node backend/migrations/001_creator_identity.js --commit --db backend/workbench.db \
+ *        --allow-real-db --backup-path <backup.db> --expected-source-sha <sha256>
  *   （或设置 WORKBENCH_DB_PATH 指向副本）
  *
  * 安全边界（硬约束）：
- *   · 真实库 backend/workbench.db 一律拒绝（dry-run 与 commit 都拒绝）→ 必须使用副本
+ *   · 真实库 backend/workbench.db **默认拒绝**（dry-run 与 commit 都拒绝）→ 默认必须使用副本
+ *   · 真实库 commit 必须同时显式提供 --allow-real-db / --backup-path / --expected-source-sha，
+ *     并通过 A–E 全部授权检查（备份存在 + integrity ok + 备份与源库业务逻辑一致 +
+ *     期望 sha 等于执行瞬间源库 sha + canonical 路径精确等于 backend/workbench.db）；缺一即 hard fail
+ *   · dry-run 永远不需要 --allow-real-db
  *   · --dry-run：BEGIN → schema + backfill → reconciliation → invariant → ROLLBACK（副本 schema / 数据不变）
  *   · --commit：仅允许指向临时库（test-only commit mode）
  *
@@ -803,30 +809,196 @@ export function checkFrozenBaseline(preState, expected) {
 const REAL_DB_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'workbench.db')
 
 function parseArgs(argv) {
-  const args = { mode: 'dry-run', db: null }
+  const args = { mode: 'dry-run', db: null, allowRealDb: false, backupPath: null, expectedSourceSha: null }
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i]
     if (token === '--dry-run') args.mode = 'dry-run'
     else if (token === '--commit') args.mode = 'commit'
+    else if (token === '--allow-real-db') args.allowRealDb = true
     else if (token === '--db') args.db = argv[++i]
     else if (token.startsWith('--db=')) args.db = token.slice(5)
+    else if (token === '--backup-path') args.backupPath = argv[++i]
+    else if (token.startsWith('--backup-path=')) args.backupPath = token.slice(14)
+    else if (token === '--expected-source-sha') args.expectedSourceSha = argv[++i]
+    else if (token.startsWith('--expected-source-sha=')) args.expectedSourceSha = token.slice(21)
   }
   return args
 }
 
-function guardDbPath(dbPath, mode) {
-  const resolved = path.resolve(dbPath)
-  if (resolved === REAL_DB_PATH) {
-    throw new Error(
-      `拒绝在真实库上执行 migration（${mode}）：${resolved}\n` +
-        '请先复制副本：cp 或 SQLite online backup，然后 --db <副本路径>。'
-    )
+/** canonical 路径（解析 symlink / 相对路径；不存在时退化为 path.resolve） */
+export function canonicalDbPath(dbPath) {
+  const resolved = path.resolve(String(dbPath))
+  try {
+    return fs.realpathSync(resolved)
+  } catch {
+    return resolved
+  }
+}
+
+export function isRealDbPath(dbPath) {
+  return canonicalDbPath(dbPath) === canonicalDbPath(REAL_DB_PATH)
+}
+
+/**
+ * 路径护栏（默认拒绝真实库）。
+ * @param {string} dbPath
+ * @param {'dry-run'|'commit'} mode
+ * @param {{ allowRealDb?: boolean }} [options] 真实库 commit 需显式 allowRealDb
+ */
+export function guardDbPath(dbPath, mode, { allowRealDb = false } = {}) {
+  const resolved = canonicalDbPath(dbPath)
+  if (isRealDbPath(resolved)) {
+    if (!allowRealDb) {
+      throw new Error(
+        `拒绝在真实库上执行 migration（${mode}）：${resolved}\n` +
+          '默认必须使用副本（SQLite online backup 得到的副本），然后 --db <副本路径>。\n' +
+          '确需真实库 commit 时必须同时提供：--commit --allow-real-db --backup-path <path> --expected-source-sha <sha>'
+      )
+    }
+    if (mode !== 'commit') {
+      throw new Error(`--allow-real-db 只对 --commit 有效；dry-run 请使用副本（当前 mode=${mode}）`)
+    }
+    return resolved
   }
   if (mode === 'commit') {
     const inTemp = resolved.startsWith(os.tmpdir()) || resolved.includes('/tmp/')
     if (!inTemp) throw new Error(`--commit 仅允许用于临时库（当前：${resolved}）`)
   }
   return resolved
+}
+
+/** 文件 sha256（迁移前源库指纹；WAL 场景下作为「源库未被写入」的强指示） */
+export function computeFileSha256(filePath) {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex')
+}
+
+const SHA256_RE = /^[0-9a-f]{64}$/
+
+/**
+ * 真实库 commit 授权检查（A–E；非交互、可被测试自动验证；不修改任何库）。
+ *   A. backup-path 必须存在（且是文件）
+ *   B. backup integrity_check = ok
+ *   C. backup 业务表 logical hash / row count 必须与「迁移前 source」一致
+ *   D. expected-source-sha 必须等于执行瞬间 source 的 sha256
+ *   E. source canonical 路径必须精确等于 backend/workbench.db
+ * @returns {{ ok:boolean, checks:Array<{id:string,name:string,pass:boolean,detail:string}>, errors:string[] }}
+ */
+export function authorizeRealDbCommit({
+  sourcePath,
+  realDbPath = REAL_DB_PATH,
+  backupPath,
+  expectedSourceSha
+} = {}) {
+  const checks = []
+  const errors = []
+  const push = (id, name, pass, detail) => {
+    checks.push({ id, name, pass, detail })
+    if (!pass) errors.push(`${id} ${name}：${detail}`)
+  }
+
+  // E. canonical 路径精确相等
+  let canonicalSource = null
+  let canonicalReal = null
+  try {
+    canonicalSource = canonicalDbPath(sourcePath)
+    canonicalReal = canonicalDbPath(realDbPath)
+  } catch (error) {
+    canonicalSource = String(sourcePath)
+    canonicalReal = String(realDbPath)
+    push('E', 'canonical path', false, `路径解析失败：${error?.message || error}`)
+  }
+  if (!checks.length) {
+    push('E', 'canonical path', canonicalSource === canonicalReal, `${canonicalSource} vs ${canonicalReal}`)
+  }
+
+  // A. backup 存在
+  const backupExists = Boolean(backupPath) && fs.existsSync(backupPath) && fs.statSync(backupPath).isFile()
+  push('A', 'backup exists', backupExists, backupExists ? String(backupPath) : `不存在或不是文件：${backupPath ?? '(未提供 --backup-path)'}`)
+
+  // D. expected source sha
+  const expected = String(expectedSourceSha ?? '').trim().toLowerCase()
+  let actualSha = null
+  try {
+    actualSha = computeFileSha256(canonicalSource ?? sourcePath)
+  } catch (error) {
+    actualSha = null
+    push('D', 'expected source sha256', false, `无法读取源库：${error?.message || error}`)
+  }
+  if (!checks.some((c) => c.id === 'D')) {
+    const shaShapeOk = SHA256_RE.test(expected)
+    const shaMatch = shaShapeOk && actualSha === expected
+    push(
+      'D',
+      'expected source sha256',
+      shaMatch,
+      shaMatch
+        ? expected
+        : `期望=${expected || '(未提供 --expected-source-sha)'} 实际=${actualSha ?? '(读取失败)'}`
+    )
+  }
+
+  // B / C：备份可读 + 与源库业务逻辑一致
+  let backupDb = null
+  let sourceDb = null
+  if (backupExists) {
+    try {
+      backupDb = new Database(backupPath, { readonly: true, fileMustExist: true })
+      const integrity = String(backupDb.prepare('PRAGMA integrity_check').get()?.integrity_check ?? '')
+      push('B', 'backup integrity_check', integrity === 'ok', integrity || '(无法读取 integrity_check)')
+    } catch (error) {
+      push('B', 'backup integrity_check', false, `打开备份失败：${error?.message || error}`)
+    }
+  } else {
+    push('B', 'backup integrity_check', false, '备份不存在，无法校验')
+  }
+
+  if (backupDb && canonicalSource) {
+    try {
+      sourceDb = new Database(canonicalSource, { readonly: true, fileMustExist: true })
+      const sourceHash = snapshotBusinessData(sourceDb)
+      const backupHash = snapshotBusinessData(backupDb)
+      const mismatches = []
+      for (const table of Object.keys(sourceHash)) {
+        if (!backupHash[table]) {
+          mismatches.push(`${table}:missing`)
+          continue
+        }
+        if (sourceHash[table].count !== backupHash[table].count) {
+          mismatches.push(`${table}:rows ${sourceHash[table].count}≠${backupHash[table].count}`)
+          continue
+        }
+        if (sourceHash[table].hash !== backupHash[table].hash) mismatches.push(`${table}:hash`)
+      }
+      push(
+        'C',
+        'backup == source (business tables)',
+        mismatches.length === 0,
+        mismatches.length === 0 ? `${Object.keys(sourceHash).length}/${Object.keys(sourceHash).length} tables equal` : mismatches.join(', ')
+      )
+    } catch (error) {
+      push('C', 'backup == source (business tables)', false, `比较失败：${error?.message || error}`)
+    }
+  } else {
+    push('C', 'backup == source (business tables)', false, '备份或源库不可用，无法比较')
+  }
+  if (sourceDb) sourceDb.close()
+  if (backupDb) backupDb.close()
+
+  return { ok: errors.length === 0, checks, errors, sourceSha: actualSha }
+}
+
+export function printAuthorization(auth) {
+  console.log('')
+  console.log('=== Real DB authorization (A–E) ===')
+  for (const check of auth.checks) {
+    console.log(`${check.id} ${check.name.padEnd(34)} ${check.pass ? 'PASS' : 'FAIL'}  ${check.detail}`)
+  }
+  if (!auth.ok) {
+    console.log('authorization: FAIL（真实库未被打开写入）')
+    for (const error of auth.errors) console.log('  -', error)
+  } else {
+    console.log('authorization: PASS')
+  }
 }
 
 function printReport(report, baseline) {
@@ -882,9 +1054,46 @@ async function main() {
     process.exitCode = 1
     return
   }
-  const dbPath = guardDbPath(requested, args.mode)
+  const canonicalRequested = canonicalDbPath(requested)
+  const realTarget = isRealDbPath(canonicalRequested)
+
+  // 真实库：默认拒绝；commit 需要完整 A–E 授权
+  if (realTarget) {
+    if (args.mode !== 'commit') {
+      console.error(
+        `拒绝在真实库上执行 dry-run：${canonicalRequested}\n` +
+          'dry-run 请使用 SQLite online backup 得到的副本（--db <副本路径>）。'
+      )
+      console.log('REAL_MIGRATION_RESULT: BLOCKED')
+      process.exitCode = 2
+      return
+    }
+    if (!args.allowRealDb) {
+      console.error(
+        '拒绝在真实库上 commit：缺少 --allow-real-db。\n' +
+          '真实库 commit 必须同时提供：--commit --allow-real-db --backup-path <path> --expected-source-sha <sha>'
+      )
+      console.log('REAL_MIGRATION_RESULT: BLOCKED')
+      process.exitCode = 2
+      return
+    }
+    const auth = authorizeRealDbCommit({
+      sourcePath: canonicalRequested,
+      backupPath: args.backupPath,
+      expectedSourceSha: args.expectedSourceSha
+    })
+    printAuthorization(auth)
+    if (!auth.ok) {
+      console.log('REAL_MIGRATION_RESULT: BLOCKED')
+      process.exitCode = 2
+      return
+    }
+  }
+
+  const dbPath = guardDbPath(canonicalRequested, args.mode, { allowRealDb: realTarget && args.allowRealDb })
   console.log(`MIGRATION_MODE: ${args.mode}`)
   console.log(`DB_PATH: ${dbPath}`)
+  if (realTarget) console.log(`REAL_DB_TARGET: true`)
   const db = new Database(dbPath, { fileMustExist: true })
   try {
     const preState = readPreState(db)
@@ -901,11 +1110,27 @@ async function main() {
     printReport(report, baseline)
     const pass = report.ok && (baseline.applicable ? baseline.pass : true)
     console.log('')
-    console.log(`DRY_RUN_RESULT: ${pass ? 'DRY_RUN_READY' : 'DRY_RUN_FAILED'}`)
+    if (realTarget) {
+      if (pass) {
+        // 真实库：把 WAL 折回主库文件，便于备份/校验（无其他连接时安全）
+        try {
+          db.pragma('wal_checkpoint(PASSIVE)')
+        } catch {
+          /* 非致命 */
+        }
+        console.log(`REAL_MIGRATION_RESULT: COMMITTED`)
+        console.log(`post-migration source sha256: ${computeFileSha256(dbPath)}`)
+        console.log(`backup: ${args.backupPath}`)
+      } else {
+        console.log('REAL_MIGRATION_RESULT: ROLLED_BACK')
+      }
+    } else {
+      console.log(`DRY_RUN_RESULT: ${pass ? 'DRY_RUN_READY' : 'DRY_RUN_FAILED'}`)
+    }
     process.exitCode = pass ? 0 : 1
   } catch (error) {
     console.error('MIGRATION ERROR:', error?.message || error)
-    console.log('DRY_RUN_RESULT: DRY_RUN_FAILED')
+    console.log(realTarget ? 'REAL_MIGRATION_RESULT: ROLLED_BACK' : 'DRY_RUN_RESULT: DRY_RUN_FAILED')
     process.exitCode = 1
   } finally {
     db.close()
@@ -918,5 +1143,5 @@ if (isEntryPoint) {
 }
 
 // 供测试 / 其它脚本复用
-export { REAL_DB_PATH, guardDbPath, printReport }
+export { REAL_DB_PATH, printReport }
 export { WORK_STATE_STATES, CREATOR_LINK_SOURCES, LEGACY_WORK_STATE_MAP, strongerLinkSource, seedGroupKey }

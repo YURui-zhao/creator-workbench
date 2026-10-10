@@ -13,6 +13,12 @@ import { buildXlsx } from '../utils/xlsx.js'
 import { loadLatestDecisionSummaries } from './creatorDecisions.js'
 import { loadLatestSnapshotSummaries } from './recentSnapshots.js'
 import { TARGET_CPM } from '../utils/creatorBusinessRules.js'
+// Creator Identity V1 Phase 4：新 record 必须继承 / 建立 creator_id 归属锚
+import {
+  identitySchemaReady,
+  identityTableHasColumn,
+  resolveOrCreateCreatorForRecord
+} from '../utils/creatorIdentity.js'
 
 const router = Router()
 
@@ -205,6 +211,45 @@ function toRow(clean) {
 const INSERT_SQL = `INSERT INTO creator_records (${COLUMNS.join(', ')}) VALUES (${COLUMNS.map(
   () => '?'
 ).join(', ')})`
+
+// Creator Identity V1 Phase 4：带归属锚的 INSERT（只在身份层 schema + additive 列都存在时使用）
+const IDENTITY_INSERT_COLUMNS = [...COLUMNS, 'creator_id', 'creator_link_source']
+const IDENTITY_INSERT_SQL = `INSERT INTO creator_records (${IDENTITY_INSERT_COLUMNS.join(
+  ', '
+)}) VALUES (${IDENTITY_INSERT_COLUMNS.map(() => '?').join(', ')})`
+
+/**
+ * 本库是否具备 record 身份归属写入条件（老 fixture / migration 之前的库 → false，自动降级为旧契约）。
+ * 归属规则（冻结）：strict alias 0 match → 建 provisional Creator；1 → 复用；N → creator_id = NULL（不猜）。
+ */
+function recordIdentityWritable() {
+  return (
+    identitySchemaReady(db) &&
+    identityTableHasColumn(db, 'creator_records', 'creator_id') &&
+    identityTableHasColumn(db, 'creator_records', 'creator_link_source')
+  )
+}
+
+/**
+ * 写入一条 record（含归属锚），单事务：
+ * 归属解析 + 可能的 provisional Creator 创建 + record INSERT 必须原子。
+ * 身份歧义（N match）不阻塞事实写入，只把 creator_id / creator_link_source 留为 NULL。
+ * @returns {number} 新 record id
+ */
+const insertRecordWithIdentity = db.transaction((dataRow) => {
+  const attribution = resolveOrCreateCreatorForRecord(db, {
+    nickname: dataRow.nickname,
+    creatorType: dataRow.creator_type
+  })
+  const info = db
+    .prepare(IDENTITY_INSERT_SQL)
+    .run(
+      ...COLUMNS.map((col) => dataRow[col]),
+      attribution.creatorId,
+      attribution.creatorLinkSource
+    )
+  return Number(info.lastInsertRowid)
+})
 
 // 删除投放记录时同步清理导入批次映射（import_batch_records 只做「批次 ↔ 记录」关联）
 // 目的：避免记录删除后残留指向不存在 record_id 的孤儿 mapping，让批次详情统计与记录列表保持一致
@@ -2334,6 +2379,10 @@ router.post('/batch', (req, res) => {
   // 单事务：新增 INSERT + 批次日志 + 更新审计 + 已有记录 UPDATE
   // 任一步失败（含乐观并发冲突）→ 整个批次回滚，绝不 partial success
   const insert = db.prepare(INSERT_SQL)
+  // 归属锚写入条件在本批次内固定（schema 不会在事务中变化）
+  const identityWritable = recordIdentityWritable()
+  // 老 fixture 没有 creator_id 列 → 绝不 prepare 带该列的 SQL（否则直接 SQLITE_ERROR）
+  const insertWithIdentity = identityWritable ? db.prepare(IDENTITY_INSERT_SQL) : null
   const selectRecord = db.prepare(
     'SELECT id, first_play, second_week_play FROM creator_records WHERE id = ?'
   )
@@ -2348,7 +2397,22 @@ router.post('/batch', (req, res) => {
   const runAll = db.transaction((items, intents) => {
     const insertedIds = []
     for (const item of items) {
-      const info = insert.run(...COLUMNS.map((col) => item[col]))
+      // Creator Identity Phase 4：逐行做 strict 归属（0 → 新建 provisional Creator；1 → 复用；N → NULL，不猜）
+      // 同一批次内同名行会彼此复用（前一行建好的 Creator 会被后一行解析到）
+      let info
+      if (identityWritable) {
+        const attribution = resolveOrCreateCreatorForRecord(db, {
+          nickname: item.nickname,
+          creatorType: item.creator_type
+        })
+        info = insertWithIdentity.run(
+          ...COLUMNS.map((col) => item[col]),
+          attribution.creatorId,
+          attribution.creatorLinkSource
+        )
+      } else {
+        info = insert.run(...COLUMNS.map((col) => item[col]))
+      }
       insertedIds.push(Number(info.lastInsertRowid))
     }
 
@@ -2602,10 +2666,13 @@ router.post('/', (req, res) => {
   }
 
   const row = toRow(clean)
-  const info = db.prepare(INSERT_SQL).run(...COLUMNS.map((col) => row[col]))
+  // Creator Identity Phase 4：新 record 必须带上归属锚（身份歧义不阻塞事实写入）
+  const recordId = recordIdentityWritable()
+    ? insertRecordWithIdentity(row)
+    : Number(db.prepare(INSERT_SQL).run(...COLUMNS.map((col) => row[col])).lastInsertRowid)
   const created = db
     .prepare(`${SELECT_SQL} WHERE id = ?`)
-    .get(info.lastInsertRowid)
+    .get(recordId)
   ok(res, created)
 })
 

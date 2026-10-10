@@ -195,3 +195,282 @@ export function strongerLinkSource(a, b) {
   if (left === 0 && right === 0) return null
   return left >= right ? a : b
 }
+
+// ============================================================
+// Phase 4 —— DB-aware 归属工具（写入路径唯一身份解析入口）
+//
+// 冻结边界（PHASE4 §2）：
+//   · 只有 strict alias（NFKC / trim / 连续空白折叠 / case fold）可以自动归属。
+//   · 绝不 fuzzy —— 不导拼音、不算编辑距离、不去标点。
+//   · 所有函数接受 `db` 作为参数（本模块不 import db.js，避免循环依赖 / 便于测试）。
+//   · 身份层 schema 不存在（Phase 1 migration 之前的老环境 / 老 fixture）时优雅降级：
+//     解析一律返回 0 match，写入方按「没有身份层」的旧契约继续跑。
+// ============================================================
+
+/** 表是否存在（只读 introspection） */
+export function identityTableExists(db, table) {
+  try {
+    return Boolean(
+      db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)
+    )
+  } catch {
+    return false
+  }
+}
+
+/** 列是否存在（只读 introspection） */
+export function identityTableHasColumn(db, table, column) {
+  if (!identityTableExists(db, table)) return false
+  try {
+    return db
+      .prepare(`PRAGMA table_info(${table})`)
+      .all()
+      .some((row) => row.name === column)
+  } catch {
+    return false
+  }
+}
+
+/** 身份层 schema 是否就绪：creators + creator_aliases 都必须存在 */
+export function identitySchemaReady(db) {
+  return identityTableExists(db, 'creators') && identityTableExists(db, 'creator_aliases')
+}
+
+/** 某张业务表是否已经具备 creator_id 归属列（additive 列） */
+export function hasCreatorColumn(db, table) {
+  return identitySchemaReady(db) && identityTableHasColumn(db, table, 'creator_id')
+}
+
+/**
+ * strict 别名解析（DB 版本）。merged 墓碑 Creator 自动指向合并目标后去重。
+ * @returns {{ normalized: string, count: number, creatorIds: number[] }}
+ */
+export function resolveCreatorByStrictAlias(db, rawName) {
+  const normalized = normalizeAliasStrict(rawName)
+  if (!normalized || !identitySchemaReady(db)) return { normalized, count: 0, creatorIds: [] }
+  const rows = db
+    .prepare(
+      `SELECT a.creator_id AS creator_id,
+              c.identity_status AS identity_status,
+              c.merged_into_creator_id AS merged_into_creator_id
+       FROM creator_aliases a JOIN creators c ON c.id = a.creator_id
+       WHERE a.alias_normalized = ?`
+    )
+    .all(normalized)
+  const ids = new Set()
+  for (const row of rows) {
+    // merged 墓碑：归属必须落到 target，绝不把事实挂到墓碑上
+    const target =
+      row.identity_status === 'merged' &&
+      row.merged_into_creator_id !== null &&
+      row.merged_into_creator_id !== undefined
+        ? Number(row.merged_into_creator_id)
+        : Number(row.creator_id)
+    if (Number.isInteger(target) && target > 0) ids.add(target)
+  }
+  const creatorIds = [...ids].sort((a, b) => a - b)
+  return { normalized, count: creatorIds.length, creatorIds }
+}
+
+/**
+ * 创建一个 provisional Creator + strict alias。
+ * 绝不自动 confirmed；identity_status 固定 provisional。
+ * @returns {{ id:number, canonical_name:string, identity_status:string, alias_created:boolean, alias_normalized:string }}
+ */
+export function createProvisionalCreator(
+  db,
+  { name, creatorType = null, aliasSource = 'import', profile = {} } = {}
+) {
+  const canonicalName = name === null || name === undefined ? '' : String(name).trim()
+  const info = db
+    .prepare(
+      `INSERT INTO creators (
+         canonical_name, creator_type, identity_status,
+         description, distilled_description, profile_url, xingtu_id, xingtu_url
+       ) VALUES (?, ?, 'provisional', ?, ?, ?, ?, ?)`
+    )
+    .run(
+      canonicalName,
+      creatorType === null || creatorType === undefined ? null : String(creatorType),
+      profile.description ?? null,
+      profile.distilled_description ?? null,
+      profile.profile_url ?? null,
+      profile.xingtu_id ?? null,
+      profile.xingtu_url ?? null
+    )
+  const creatorId = Number(info.lastInsertRowid)
+  const normalized = normalizeAliasStrict(canonicalName)
+  let aliasCreated = false
+  if (normalized) {
+    aliasCreated =
+      db
+        .prepare(
+          `INSERT OR IGNORE INTO creator_aliases (creator_id, alias, alias_normalized, source)
+           VALUES (?, ?, ?, ?)`
+        )
+        .run(creatorId, canonicalName, normalized, aliasSource).changes > 0
+  }
+  return {
+    id: creatorId,
+    canonical_name: canonicalName,
+    identity_status: 'provisional',
+    alias_created: aliasCreated,
+    alias_normalized: normalized
+  }
+}
+
+/**
+ * 新 record 的归属决策（strict 0/1/N 三态，绝不 fuzzy）。
+ *   0 match → 建 provisional Creator + alias（source = aliasSource）；link_source = 'alias_exact'
+ *   1 match → 复用已有 Creator；link_source = 'alias_exact'
+ *   N match → creator_id = NULL / link_source = NULL（不猜；事实写入照常成功）
+ * @returns {{ creatorId:number|null, creatorLinkSource:string|null, reason:'unique_alias'|'none'|'ambiguous', created:boolean, normalized:string }}
+ */
+export function resolveOrCreateCreatorForRecord(
+  db,
+  { nickname, creatorType = null, aliasSource = 'import' } = {}
+) {
+  const resolved = resolveCreatorByStrictAlias(db, nickname)
+  if (resolved.count === 1) {
+    return {
+      creatorId: resolved.creatorIds[0],
+      creatorLinkSource: 'alias_exact',
+      reason: 'unique_alias',
+      created: false,
+      normalized: resolved.normalized
+    }
+  }
+  if (resolved.count > 1) {
+    return {
+      creatorId: null,
+      creatorLinkSource: null,
+      reason: 'ambiguous',
+      created: false,
+      normalized: resolved.normalized
+    }
+  }
+  const creator = createProvisionalCreator(db, { name: nickname, creatorType, aliasSource })
+  return {
+    creatorId: creator.id,
+    creatorLinkSource: 'alias_exact',
+    reason: 'none',
+    created: true,
+    creator,
+    normalized: resolved.normalized
+  }
+}
+
+/**
+ * 只读归属：从文本名称解析 creator_id（绝不创建）。
+ * 用于 snapshot / legacy decision 这类「已有别的稳定锚，只是补一个归属」的场景。
+ */
+export function resolveCreatorIdFromText(db, rawName) {
+  const resolved = resolveCreatorByStrictAlias(db, rawName)
+  if (resolved.count === 1) {
+    return { creatorId: resolved.creatorIds[0], reason: 'unique_alias', normalized: resolved.normalized }
+  }
+  if (resolved.count > 1) return { creatorId: null, reason: 'ambiguous', normalized: resolved.normalized }
+  return { creatorId: null, reason: 'none', normalized: resolved.normalized }
+}
+
+/** 显式 creator_id 校验：正整数 + 存在 + 非 merged 墓碑 */
+export function validateExplicitCreatorId(db, rawId) {
+  if (!identitySchemaReady(db)) return { ok: false, error: '身份层尚未初始化（无 creators 表）' }
+  const id = Number(rawId)
+  if (!Number.isInteger(id) || id <= 0) return { ok: false, error: 'creator_id 必须是正整数' }
+  const row = db.prepare('SELECT id, canonical_name, identity_status FROM creators WHERE id = ?').get(id)
+  if (!row) return { ok: false, error: `creator_id=${id} 不存在` }
+  if (row.identity_status === 'merged') {
+    return { ok: false, error: `Creator #${id} 已合并，不能作为归属锚` }
+  }
+  return { ok: true, creatorId: id, creator: row }
+}
+
+/** 归属锚只读访问：candidate / decision / record 行 → creator_id（永不替代事件身份） */
+export function creatorForCandidate(_db, row) {
+  const id = Number(row?.creator_id)
+  return Number.isInteger(id) && id > 0 ? id : null
+}
+
+export function creatorForDecision(_db, row) {
+  const id = Number(row?.creator_id)
+  return Number.isInteger(id) && id > 0 ? id : null
+}
+
+export function creatorForRecord(_db, row) {
+  const id = Number(row?.creator_id)
+  return Number.isInteger(id) && id > 0 ? id : null
+}
+
+// ---------- Import rollback：孤立自动 seed 清理 ----------
+// 自动 import 新建别名的来源标记（人工 / 播种别名绝不删）
+export const AUTO_IMPORT_ALIAS_SOURCE = 'import'
+
+// 会引用 creator 的事实表（任一存在 → 不是孤立空壳）
+const CREATOR_FACT_TABLES = [
+  'creator_records',
+  'creator_candidates',
+  'creator_recent_snapshots',
+  'creator_decisions',
+  'creator_negotiation_cases'
+]
+
+/**
+ * 该 Creator 是否是「自动 import 生成、且已经完全孤立」的空壳？
+ * 条件全部满足才返回 true（任一不满足 → 保守保留）：
+ *   · identity_status = provisional
+ *   · 无任何 record / candidate / snapshot / decision / negotiation case
+ *   · 无 merge 关系（任一方向）
+ *   · 至少一条 alias，且全部 alias.source === 'import'（无人工身份资产）
+ */
+export function isOrphanAutoImportedCreator(db, creatorId) {
+  if (!identitySchemaReady(db)) return false
+  const id = Number(creatorId)
+  if (!Number.isInteger(id) || id <= 0) return false
+  const creator = db.prepare('SELECT id, identity_status FROM creators WHERE id = ?').get(id)
+  if (!creator || creator.identity_status !== 'provisional') return false
+  for (const table of CREATOR_FACT_TABLES) {
+    if (!identityTableHasColumn(db, table, 'creator_id')) continue
+    const n = db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE creator_id = ?`).get(id).n
+    if (Number(n) > 0) return false
+  }
+  if (identityTableExists(db, 'creator_merges')) {
+    const merged = db
+      .prepare(
+        'SELECT COUNT(*) AS n FROM creator_merges WHERE source_creator_id = ? OR target_creator_id = ?'
+      )
+      .get(id, id).n
+    if (Number(merged) > 0) return false
+  }
+  const aliases = db.prepare('SELECT id, source FROM creator_aliases WHERE creator_id = ?').all(id)
+  if (!aliases.length) return false
+  if (aliases.some((alias) => String(alias.source ?? '') !== AUTO_IMPORT_ALIAS_SOURCE)) return false
+  return true
+}
+
+/**
+ * 清理「自动 import 生成、rollback 后完全孤立」的空壳 Creator + 其 alias。
+ * 无法百分百确认是孤立自动 seed → 保留（绝不误删）。
+ * 只读判断 + 精确 DELETE；调用方负责放进事务。
+ * @returns {{ removedCreatorIds:number[], removedAliasIds:number[] }}
+ */
+export function cleanupOrphanAutoCreatedCreators(db, creatorIds = []) {
+  const removedCreatorIds = []
+  const removedAliasIds = []
+  if (!identitySchemaReady(db)) return { removedCreatorIds, removedAliasIds }
+  const ids = [...new Set((Array.isArray(creatorIds) ? creatorIds : []).map(Number))]
+    .filter((id) => Number.isInteger(id) && id > 0)
+    .sort((a, b) => a - b)
+  for (const id of ids) {
+    if (!isOrphanAutoImportedCreator(db, id)) continue
+    const aliasIds = db
+      .prepare('SELECT id FROM creator_aliases WHERE creator_id = ?')
+      .all(id)
+      .map((row) => Number(row.id))
+    db.prepare('DELETE FROM creator_aliases WHERE creator_id = ?').run(id)
+    db.prepare('DELETE FROM creators WHERE id = ?').run(id)
+    removedCreatorIds.push(id)
+    removedAliasIds.push(...aliasIds)
+  }
+  return { removedCreatorIds, removedAliasIds }
+}

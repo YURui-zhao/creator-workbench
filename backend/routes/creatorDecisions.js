@@ -7,6 +7,13 @@ import { assessCurrentQuote } from '../utils/currentQuoteAssessment.js'
 import { loadOutcomeSummaries } from './creatorDecisionOutcomes.js'
 import { loadNegotiationCaseSummaries } from './creatorNegotiationCases.js'
 import { PRICING_VERSION, TARGET_CPM } from '../utils/creatorBusinessRules.js'
+// Creator Identity V1 Phase 4：legacy 决策补归属锚（显式 creator_id 优先 / strict 唯一才自动归属）
+import {
+  identitySchemaReady,
+  identityTableHasColumn,
+  resolveCreatorIdFromText,
+  validateExplicitCreatorId
+} from '../utils/creatorIdentity.js'
 
 const router = Router()
 
@@ -431,30 +438,77 @@ router.post('/', (req, res) => {
     }
   }
 
+  // Creator Identity Phase 4：legacy 决策（Radar 入口）归属锚
+  //   显式 creator_id 优先；否则 strict alias 唯一才自动归属；N → 409（歧义不猜）；0 → 不临时造人（NULL）
+  const decisionBody = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {}
+  let creatorId = null
+  const decisionIdentityWritable =
+    identitySchemaReady(db) && identityTableHasColumn(db, 'creator_decisions', 'creator_id')
+  if (decisionIdentityWritable) {
+    const explicitProvided =
+      decisionBody.creator_id !== undefined &&
+      decisionBody.creator_id !== null &&
+      String(decisionBody.creator_id).trim() !== ''
+    if (explicitProvided) {
+      const explicit = validateExplicitCreatorId(db, decisionBody.creator_id)
+      if (!explicit.ok) return fail(res, 400, explicit.error)
+      creatorId = explicit.creatorId
+    } else {
+      const resolved = resolveCreatorIdFromText(db, value.creator)
+      if (resolved.reason === 'ambiguous') {
+        return fail(
+          res,
+          409,
+          `达人名称「${value.creator}」对应多个 Creator（身份歧义），请先明确归属后再创建决策`
+        )
+      }
+      creatorId = resolved.creatorId
+    }
+  }
+
+  const decisionColumns = [
+    'creator',
+    'decision_stage',
+    'snapshot_id',
+    'current_quote_raw',
+    'current_quote',
+    'ip_judgement',
+    'human_decision',
+    'decision_note',
+    'historical_evidence_json',
+    'recent_evidence_json',
+    'pricing_evidence_json',
+    'target_cpm',
+    'pricing_version',
+    'system_context_version'
+  ]
+  const decisionValues = [
+    value.creator,
+    value.decisionStage,
+    value.snapshotId,
+    value.currentQuoteRaw,
+    currentQuote,
+    value.ipJudgement,
+    value.humanDecision,
+    value.decisionNote,
+    JSON.stringify(historicalEvidence),
+    snapshotRow ? JSON.stringify(buildRecentEvidence(snapshotRow)) : null,
+    pricingEvidence ? JSON.stringify(pricingEvidence) : null,
+    TARGET_CPM,
+    PRICING_VERSION,
+    SYSTEM_CONTEXT_VERSION
+  ]
+  if (decisionIdentityWritable) {
+    decisionColumns.push('creator_id')
+    decisionValues.push(creatorId)
+  }
+
   const info = db
     .prepare(
-      `INSERT INTO creator_decisions (
-         creator, decision_stage, snapshot_id, current_quote_raw, current_quote, ip_judgement,
-         human_decision, decision_note, historical_evidence_json, recent_evidence_json,
-         pricing_evidence_json, target_cpm, pricing_version, system_context_version
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO creator_decisions (${decisionColumns.join(', ')})
+       VALUES (${decisionColumns.map(() => '?').join(', ')})`
     )
-    .run(
-      value.creator,
-      value.decisionStage,
-      value.snapshotId,
-      value.currentQuoteRaw,
-      currentQuote,
-      value.ipJudgement,
-      value.humanDecision,
-      value.decisionNote,
-      JSON.stringify(historicalEvidence),
-      snapshotRow ? JSON.stringify(buildRecentEvidence(snapshotRow)) : null,
-      pricingEvidence ? JSON.stringify(pricingEvidence) : null,
-      TARGET_CPM,
-      PRICING_VERSION,
-      SYSTEM_CONTEXT_VERSION
-    )
+    .run(...decisionValues)
 
   const saved = db.prepare('SELECT * FROM creator_decisions WHERE id = ?').get(info.lastInsertRowid)
   // 新创建的决策必然还没有 outcome 关联（append-only，关联是后续独立动作）

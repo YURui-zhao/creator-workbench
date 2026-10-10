@@ -1,8 +1,22 @@
 import { Router } from 'express'
 import db from '../db.js'
+// Creator Identity V1 Phase 4：rollback 时安全清理「自动 import 生成且已完全孤立」的空壳 Creator
+import { cleanupOrphanAutoCreatedCreators } from '../utils/creatorIdentity.js'
 
 const router = Router()
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+
+/** creator_records 是否已有归属列（Phase 1 migration 之前的老库 → false，保持旧 rollback 行为） */
+function hasRecordCreatorColumn() {
+  try {
+    return db
+      .prepare('PRAGMA table_info(creator_records)')
+      .all()
+      .some((column) => column.name === 'creator_id')
+  } catch {
+    return false
+  }
+}
 
 // ---------- 统一响应格式 { code, data, msg }（与现有接口一致） ----------
 function ok(res, data) {
@@ -252,11 +266,25 @@ router.post('/batches/:id/rollback', (req, res) => {
         .prepare('SELECT record_id FROM import_batch_records WHERE batch_id = ?')
         .all(batchId)
       const removeRecord = db.prepare('DELETE FROM creator_records WHERE id = ?')
+      // 删除前先记下这些记录当前的归属锚（rollback 后用于判断是否留下空壳 Creator）
+      const owners = new Map()
+      if (hasRecordCreatorColumn()) {
+        const selectOwner = db.prepare('SELECT creator_id FROM creator_records WHERE id = ?')
+        for (const mapping of mappings) {
+          const owner = selectOwner.get(mapping.record_id)
+          if (owner && owner.creator_id !== null && owner.creator_id !== undefined) {
+            owners.set(Number(mapping.record_id), Number(owner.creator_id))
+          }
+        }
+      }
       let deletedCount = 0
       for (const mapping of mappings) {
         const info = removeRecord.run(mapping.record_id)
         if (info.changes > 0) deletedCount += 1
       }
+      // ③ Creator Identity Phase 4：只有「自动 import 新建 + 现已完全孤立」的空壳才清理。
+      //    任一其它事实 / 人工身份资产存在 → 保留（宁可留下空壳，也绝不误删身份）。
+      const cleaned = cleanupOrphanAutoCreatedCreators(db, [...owners.values()])
       const clearedMappingCount = db
         .prepare('DELETE FROM import_batch_records WHERE batch_id = ?')
         .run(batchId).changes
@@ -269,7 +297,9 @@ router.post('/batches/:id/rollback', (req, res) => {
         revertedUpdateCount,
         skippedUpdateCount,
         clearedMappingCount,
-        itemsKept
+        itemsKept,
+        removedCreatorCount: cleaned.removedCreatorIds.length,
+        removedAliasCount: cleaned.removedAliasIds.length
       }
     })(id)
   } catch (error) {
@@ -285,6 +315,8 @@ router.post('/batches/:id/rollback', (req, res) => {
     clearedMappingCount: result.clearedMappingCount,
     scannedMappingCount: result.scannedMappingCount,
     itemsKept: result.itemsKept,
+    removedCreatorCount: result.removedCreatorCount,
+    removedAliasCount: result.removedAliasCount,
     recordCount: 0,
     message:
       result.deletedCount > 0 || result.revertedUpdateCount > 0

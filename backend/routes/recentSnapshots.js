@@ -9,6 +9,13 @@ import {
   normalizeContentType
 } from '../utils/recentPerformanceStats.js'
 import { computeCreatorPricing } from '../utils/creatorPricing.js'
+// Creator Identity V1 Phase 4：快照写入补归属锚（只读解析 / 继承，不猜）
+import {
+  identitySchemaReady,
+  identityTableHasColumn,
+  resolveCreatorIdFromText,
+  validateExplicitCreatorId
+} from '../utils/creatorIdentity.js'
 
 const router = Router()
 
@@ -359,44 +366,74 @@ export function getLatestSnapshotByCandidate(candidateId) {
  * @param {{ candidateId?: number|null }} [options]
  * @returns {Object} 落库后的原始行
  */
-export function insertRecentSnapshot(value, { candidateId = null } = {}) {
+export function insertRecentSnapshot(value, { candidateId = null, creatorId = null } = {}) {
   const { creator, recognizedRaw, xingtuPriceRaw, plays, observedAt } = value
   const price = parsePriceText(xingtuPriceRaw)
   const normalized = normalizeSnapshotPlays(plays)
   const stats = computeRecentPerformanceStats(normalized.validPlaysInOrder)
 
+  // Creator Identity Phase 4：creator_id 是归属锚（缺列 / 老库 → 不写，保持旧契约）
+  const identityWritable =
+    identitySchemaReady(db) && identityTableHasColumn(db, 'creator_recent_snapshots', 'creator_id')
+  const columns = [
+    'creator',
+    'candidate_id',
+    'recognized_creator_name_raw',
+    'source_type',
+    'xingtu_price_raw',
+    'xingtu_price',
+    'plays_json',
+    'recognized_count',
+    'valid_count',
+    'excluded_count',
+    'unresolved_count',
+    'analysis_count',
+    'median_play',
+    'p25_play',
+    'p75_play',
+    'recent_median_play',
+    'prior_median_play',
+    'trend_ratio',
+    'trend_label',
+    'stats_status',
+    'stats_version',
+    'observed_at'
+  ]
+  const params = [
+    creator,
+    candidateId,
+    recognizedRaw,
+    'screenshot',
+    price.raw_text,
+    price.value,
+    JSON.stringify(normalized.plays),
+    normalized.recognized_count,
+    normalized.valid_count,
+    normalized.excluded_count,
+    normalized.unresolved_count,
+    stats.analysis_count,
+    stats.median_play,
+    stats.p25_play,
+    stats.p75_play,
+    stats.recent_median_play,
+    stats.prior_median_play,
+    stats.trend_ratio,
+    stats.trend_label,
+    stats.stats_status,
+    STATS_VERSION,
+    observedAt
+  ]
+  if (identityWritable) {
+    columns.push('creator_id')
+    params.push(creatorId ?? null)
+  }
+
   const info = db
     .prepare(
-      `INSERT INTO creator_recent_snapshots (
-         creator, candidate_id, recognized_creator_name_raw, source_type, xingtu_price_raw, xingtu_price, plays_json,
-         recognized_count, valid_count, excluded_count, unresolved_count, analysis_count,
-         median_play, p25_play, p75_play, recent_median_play, prior_median_play,
-         trend_ratio, trend_label, stats_status, stats_version, observed_at
-       ) VALUES (?, ?, ?, 'screenshot', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO creator_recent_snapshots (${columns.join(', ')})
+       VALUES (${columns.map(() => '?').join(', ')})`
     )
-    .run(
-      creator,
-      candidateId,
-      recognizedRaw,
-      price.raw_text,
-      price.value,
-      JSON.stringify(normalized.plays),
-      normalized.recognized_count,
-      normalized.valid_count,
-      normalized.excluded_count,
-      normalized.unresolved_count,
-      stats.analysis_count,
-      stats.median_play,
-      stats.p25_play,
-      stats.p75_play,
-      stats.recent_median_play,
-      stats.prior_median_play,
-      stats.trend_ratio,
-      stats.trend_label,
-      stats.stats_status,
-      STATS_VERSION,
-      observedAt
-    )
+    .run(...params)
 
   return db.prepare('SELECT * FROM creator_recent_snapshots WHERE id = ?').get(info.lastInsertRowid)
 }
@@ -418,8 +455,24 @@ router.post('/', (req, res) => {
     return fail(res, 400, `达人「${creator}」不存在于当前投放记录中，无法保存近期表现快照`)
   }
 
+  // Creator Identity Phase 4：历史快照补归属锚
+  //   显式 creator_id 优先；否则 strict alias 唯一才归属；0 / N → NULL（绝不猜，也绝不阻塞快照）
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {}
+  let creatorId = null
+  if (identitySchemaReady(db) && identityTableHasColumn(db, 'creator_recent_snapshots', 'creator_id')) {
+    const explicitProvided =
+      body.creator_id !== undefined && body.creator_id !== null && String(body.creator_id).trim() !== ''
+    if (explicitProvided) {
+      const explicit = validateExplicitCreatorId(db, body.creator_id)
+      if (!explicit.ok) return fail(res, 400, explicit.error)
+      creatorId = explicit.creatorId
+    } else {
+      creatorId = resolveCreatorIdFromText(db, creator).creatorId
+    }
+  }
+
   // 历史达人快照：candidate_id 始终为 NULL（候选达人走 creatorCandidates 路由）
-  const saved = insertRecentSnapshot(validated.value, { candidateId: null })
+  const saved = insertRecentSnapshot(validated.value, { candidateId: null, creatorId })
   ok(res, toPublicSnapshot(saved))
 })
 

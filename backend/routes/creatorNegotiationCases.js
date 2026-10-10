@@ -11,6 +11,8 @@ import {
   isValidDateOnly,
   toPublicNegotiationCase
 } from '../utils/negotiationCase.js'
+// Creator Identity V1 Phase 4：谈价案例只从强事件锚（decision_id / record_id）继承归属锚
+import { identitySchemaReady, identityTableHasColumn } from '../utils/creatorIdentity.js'
 
 /**
  * 谈判结果沉淀（V3-alpha.2 A4）
@@ -253,34 +255,56 @@ router.post('/', (req, res) => {
 
   let saved
   try {
+    // Creator Identity Phase 4：live case 的归属锚 = decision_id → decision.creator_id（绝不按 creator 文本匹配）
+    const caseColumns = [
+      'creator',
+      'decision_id',
+      'snapshot_id',
+      'xingtu_price_snapshot',
+      'current_quote_snapshot',
+      'negotiated_price',
+      'negotiated_at',
+      'reason_tags_json',
+      'reason_note',
+      'strategy_note',
+      'target_cpm',
+      'target_price_snapshot',
+      'reference_low_snapshot',
+      'reference_high_snapshot',
+      'source_type',
+      'record_id',
+      'source_note'
+    ]
+    const caseValues = [
+      decision.creator,
+      decisionId,
+      decision.snapshot_id ?? null,
+      xingtuPriceSnapshot,
+      currentQuoteSnapshot,
+      negotiatedPrice,
+      negotiatedAt,
+      JSON.stringify(reasonTags),
+      reasonNote || null,
+      strategyNote || null,
+      targetCpm,
+      targetPriceSnapshot,
+      referenceLowSnapshot,
+      referenceHighSnapshot,
+      'live',
+      null,
+      fields.sourceNote
+    ]
+    // 归属锚：decision.creator_id 为 NULL 时保持 NULL（事实仍由 decision_id 锚定，绝不阻塞谈价事实）
+    if (identitySchemaReady(db) && identityTableHasColumn(db, 'creator_negotiation_cases', 'creator_id')) {
+      caseColumns.push('creator_id')
+      caseValues.push(decision.creator_id ?? null)
+    }
     const info = db
       .prepare(
-        `INSERT INTO creator_negotiation_cases (
-           creator, decision_id, snapshot_id, xingtu_price_snapshot, current_quote_snapshot,
-           negotiated_price, negotiated_at, reason_tags_json, reason_note, strategy_note,
-           target_cpm, target_price_snapshot, reference_low_snapshot, reference_high_snapshot
-           , source_type, record_id, source_note
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO creator_negotiation_cases (${caseColumns.join(', ')})
+         VALUES (${caseColumns.map(() => '?').join(', ')})`
       )
-      .run(
-        decision.creator,
-        decisionId,
-        decision.snapshot_id ?? null,
-        xingtuPriceSnapshot,
-        currentQuoteSnapshot,
-        negotiatedPrice,
-        negotiatedAt,
-        JSON.stringify(reasonTags),
-        reasonNote || null,
-        strategyNote || null,
-        targetCpm,
-        targetPriceSnapshot,
-        referenceLowSnapshot,
-        referenceHighSnapshot,
-        'live',
-        null,
-        fields.sourceNote
-      )
+      .run(...caseValues)
     saved = db.prepare('SELECT * FROM creator_negotiation_cases WHERE id = ?').get(info.lastInsertRowid)
   } catch (error) {
     if (String(error?.message || '').includes('UNIQUE')) {
@@ -335,36 +359,58 @@ router.post('/historical-backfill', (req, res) => {
 
   let saved
   try {
+    // Creator Identity Phase 4：historical_backfill 的归属锚 = record_id → record.creator_id（绝不按 creator 文本匹配）
+    const caseColumns = [
+      'creator',
+      'decision_id',
+      'snapshot_id',
+      'xingtu_price_snapshot',
+      'current_quote_snapshot',
+      'negotiated_price',
+      'negotiated_at',
+      'reason_tags_json',
+      'reason_note',
+      'strategy_note',
+      'target_cpm',
+      'target_price_snapshot',
+      'reference_low_snapshot',
+      'reference_high_snapshot',
+      'source_type',
+      'record_id',
+      'source_note'
+    ]
+    const caseValues = [
+      // creator 使用 record.nickname 的服务端快照（前端提交的同名字段一律忽略）
+      record.nickname ?? null,
+      null,
+      null,
+      fields.xingtuPriceSnapshot,
+      fields.currentQuoteSnapshot,
+      fields.negotiatedPrice,
+      fields.negotiatedAt,
+      JSON.stringify(fields.reasonTags),
+      fields.reasonNote || null,
+      fields.strategyNote || null,
+      // Historical Backfill V0.1：不用今天的系统规则反推历史当时不存在的 pricing evidence
+      null,
+      null,
+      null,
+      null,
+      'historical_backfill',
+      recordId,
+      fields.sourceNote
+    ]
+    // 归属锚：record.creator_id 为 NULL 时保持 NULL（事实仍由 record_id 锚定，绝不阻塞历史补录）
+    if (identitySchemaReady(db) && identityTableHasColumn(db, 'creator_negotiation_cases', 'creator_id')) {
+      caseColumns.push('creator_id')
+      caseValues.push(record.creator_id ?? null)
+    }
     const info = db
       .prepare(
-        `INSERT INTO creator_negotiation_cases (
-           creator, decision_id, snapshot_id, xingtu_price_snapshot, current_quote_snapshot,
-           negotiated_price, negotiated_at, reason_tags_json, reason_note, strategy_note,
-           target_cpm, target_price_snapshot, reference_low_snapshot, reference_high_snapshot,
-           source_type, record_id, source_note
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO creator_negotiation_cases (${caseColumns.join(', ')})
+         VALUES (${caseColumns.map(() => '?').join(', ')})`
       )
-      .run(
-        // creator 使用 record.nickname 的服务端快照（前端提交的同名字段一律忽略）
-        record.nickname ?? null,
-        null,
-        null,
-        fields.xingtuPriceSnapshot,
-        fields.currentQuoteSnapshot,
-        fields.negotiatedPrice,
-        fields.negotiatedAt,
-        JSON.stringify(fields.reasonTags),
-        fields.reasonNote || null,
-        fields.strategyNote || null,
-        // Historical Backfill V0.1：不用今天的系统规则反推历史当时不存在的 pricing evidence
-        null,
-        null,
-        null,
-        null,
-        'historical_backfill',
-        recordId,
-        fields.sourceNote
-      )
+      .run(...caseValues)
     saved = db.prepare('SELECT * FROM creator_negotiation_cases WHERE id = ?').get(info.lastInsertRowid)
   } catch (error) {
     if (String(error?.message || '').includes('UNIQUE')) {

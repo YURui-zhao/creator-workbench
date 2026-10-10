@@ -40,6 +40,13 @@ import {
 } from '../utils/creatorWorkStateRead.js'
 // Phase 3：Work State 唯一写入目标 = candidate_work_state_events（append-only）
 import { WORK_STATE_STATES, workStateFromLegacy } from '../utils/creatorIdentity.js'
+// Phase 4：写入路径身份归属（唯一解析入口；strict alias / 显式 creator_id 校验）
+import {
+  createProvisionalCreator,
+  identitySchemaReady,
+  identityTableHasColumn,
+  validateExplicitCreatorId
+} from '../utils/creatorIdentity.js'
 
 // Work State 写入前置条件：candidate_work_state_events 必须存在（Phase 1 migration 建表）
 const WORK_STATE_SCHEMA_MISSING =
@@ -233,10 +240,59 @@ function loadCreatorLight(candidateRow) {
   return row ? { id: row.id, canonical_name: row.canonical_name, identity_status: row.identity_status } : null
 }
 
+// ---------- Creator Identity V1 Phase 4：Profile 归属权威 = creators.* ----------
+// candidate 上的同名 profile 列降级为 compatibility mirror（同一事务同步，绝不 divergence）。
+const CREATOR_PROFILE_FIELDS = Object.freeze([
+  'creator_type',
+  'profile_url',
+  'xingtu_url',
+  'xingtu_id',
+  'description',
+  'distilled_description'
+])
+
+/** candidate 是否具备身份归属写入条件（老 fixture → false，自动降级为旧契约） */
+function candidateIdentityWritable() {
+  return (
+    identitySchemaReady(db) &&
+    identityTableHasColumn(db, 'creator_candidates', 'creator_id')
+  )
+}
+
+/** 读取 Creator 当前 profile（权威值），用于 candidate mirror 初始化 / 比对 */
+function loadCreatorProfile(creatorId) {
+  if (creatorId === null || creatorId === undefined) return null
+  return (
+    db
+      .prepare(
+        `SELECT creator_type, profile_url, xingtu_url, xingtu_id, description, distilled_description
+         FROM creators WHERE id = ?`
+      )
+      .get(creatorId) || null
+  )
+}
+
+/**
+ * 该 Creator 是否已有进行中的拓展 workflow（唯一 active candidate 不变的 DB 侧保护是一致的）。
+ * @returns {number|null} 已存在的 active candidate id
+ */
+function findActiveCandidateIdForCreator(creatorId) {
+  const row = db
+    .prepare("SELECT id FROM creator_candidates WHERE creator_id = ? AND status = 'active'")
+    .get(creatorId)
+  return row ? Number(row.id) : null
+}
+
 /**
  * POST /api/creator-candidates
- * body: { name, creator_type?, profile_url?, description?, status? }
+ * body: { name, creator_type?, profile_url?, description?, status?, creator_id? }
  * name 不唯一：允许创建两个同名 candidate（id 不同）。
+ *
+ * Creator Identity V1 Phase 4（写入闭环）：
+ *   · 显式 creator_id：校验存在且未 merged → 复用 Creator；同 Creator 已有 active candidate → 409
+ *   · 未传 creator_id（旧入口）：**新建 provisional Creator + alias**，
+ *     即使 strict name 与某个历史 Creator 相同也绝不自动确认身份（同名 ≠ 同人）
+ *   · profile 权威写入 creators.*，candidate 同名列为 compatibility mirror（同事务）
  */
 router.post('/', (req, res) => {
   const body = req.body
@@ -260,14 +316,114 @@ router.post('/', (req, res) => {
     body.status === undefined || body.status === null ? 'active' : readStatus(body.status, errors)
   if (errors.length) return fail(res, 400, errors[0])
 
-  const info = db
-    .prepare(
-      `INSERT INTO creator_candidates (name, creator_type, profile_url, xingtu_url, xingtu_id, description, distilled_description, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(name, creatorType, profileUrl, xingtuUrl, xingtuId, description, distilled, status)
+  // 本次请求提供的 profile 值（null = 未提供 / 明确清空）
+  const providedProfile = {
+    creator_type: creatorType,
+    profile_url: profileUrl,
+    xingtu_url: xingtuUrl,
+    xingtu_id: xingtuId,
+    description,
+    distilled_description: distilled
+  }
+  const identityWritable = candidateIdentityWritable()
 
-  ok(res, toPublicCandidate(findCandidateRow(info.lastInsertRowid)))
+  if (!identityWritable) {
+    // 老环境（身份层未初始化）：保持旧契约，不写归属列
+    const info = db
+      .prepare(
+        `INSERT INTO creator_candidates (name, creator_type, profile_url, xingtu_url, xingtu_id, description, distilled_description, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(name, creatorType, profileUrl, xingtuUrl, xingtuId, description, distilled, status)
+    return ok(res, toPublicCandidate(findCandidateRow(info.lastInsertRowid)))
+  }
+
+  // ① 归属锚：显式 creator_id 复用 / 否则新建 provisional Creator
+  let creatorId = null
+  let profileValues = providedProfile
+  const explicitProvided =
+    body.creator_id !== undefined && body.creator_id !== null && String(body.creator_id).trim() !== ''
+  if (explicitProvided) {
+    const explicit = validateExplicitCreatorId(db, body.creator_id)
+    if (!explicit.ok) return fail(res, 400, explicit.error)
+    const activeId = findActiveCandidateIdForCreator(explicit.creatorId)
+    if (activeId !== null) {
+      return fail(
+        res,
+        409,
+        `达人「${explicit.creator.canonical_name}」已有进行中的拓展（candidate #${activeId}），请先归档后再发起新的拓展`
+      )
+    }
+    creatorId = explicit.creatorId
+    // candidate mirror：请求提供的值优先，未提供则继承 Creator 当前 profile（保持 mirror 一致）
+    const mirror = loadCreatorProfile(creatorId) || {}
+    profileValues = {}
+    for (const field of CREATOR_PROFILE_FIELDS) {
+      const provided = providedProfile[field]
+      profileValues[field] = provided === null || provided === undefined ? mirror[field] ?? null : provided
+    }
+  }
+
+  const writeCandidate = db.transaction(() => {
+    if (creatorId === null) {
+      // 未指定 creator_id：strict name 相同也绝不自动确认 → 建新的 provisional Creator
+      const created = createProvisionalCreator(db, {
+        name,
+        creatorType,
+        aliasSource: 'candidate',
+        profile: {
+          description,
+          distilled_description: distilled,
+          profile_url: profileUrl,
+          xingtu_id: xingtuId,
+          xingtu_url: xingtuUrl
+        }
+      })
+      creatorId = created.id
+    } else {
+      // 显式复用：把请求里明确提供的 profile 写入 Creator 权威（绝不覆盖未提供字段）
+      const providedFields = CREATOR_PROFILE_FIELDS.filter(
+        (field) => providedProfile[field] !== null && providedProfile[field] !== undefined
+      )
+      if (providedFields.length) {
+        const sets = providedFields.map((field) => `${field} = ?`)
+        db.prepare(
+          `UPDATE creators SET ${sets.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+        ).run(...providedFields.map((field) => providedProfile[field]), creatorId)
+      }
+    }
+    // candidate 行：profile 列 = mirror（与 Creator 权威同值，绝不 divergence）
+    const info = db
+      .prepare(
+        `INSERT INTO creator_candidates (name, creator_type, profile_url, xingtu_url, xingtu_id, description, distilled_description, status, creator_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        name,
+        profileValues.creator_type,
+        profileValues.profile_url,
+        profileValues.xingtu_url,
+        profileValues.xingtu_id,
+        profileValues.description,
+        profileValues.distilled_description,
+        status,
+        creatorId
+      )
+    return Number(info.lastInsertRowid)
+  })
+
+  let newId
+  try {
+    newId = writeCandidate()
+  } catch (error) {
+    // 并发下的最终保护：partial unique index 仍然只允许一个 active candidate
+    if (/UNIQUE/i.test(String(error?.message || ''))) {
+      return fail(res, 409, '该达人已有进行中的拓展 workflow，请先归档后再发起新的拓展')
+    }
+    throw error
+  }
+
+  ok(res, toPublicCandidate(findCandidateRow(newId)))
 })
 
 /**
@@ -352,6 +508,10 @@ router.get('/:id', (req, res) => {
  * PATCH /api/creator-candidates/:id
  * body: { name?, creator_type?, profile_url?, description?, status? }
  * 只更新显式传入的字段；null 表示清空可选字段；状态仅 active / archived。
+ *
+ * Creator Identity V1 Phase 4：profile 权威 = creators.*。
+ *   当 candidate 有 creator_id 时，profile 字段与 candidate mirror 在同一事务内一起写，
+ *   保证「权威值 == mirror」，绝不会出现两套权威 / divergence。name / status 属于 workflow，不写 Creator。
  */
 router.patch('/:id', (req, res) => {
   const row = findCandidateRow(req.params.id)
@@ -360,34 +520,30 @@ router.patch('/:id', (req, res) => {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return fail(res, 400, '请求体必须是对象')
   }
-  const fields = []
-  const params = []
+  // updates: { column, value, profile } —— profile=true 的列同时属于 Creator 权威 profile
+  const updates = []
   const errors = []
   const hasOwn = (key) => Object.prototype.hasOwnProperty.call(body, key)
+  const push = (column, value, profile = false) => updates.push({ column, value, profile })
 
   if ('name' in body) {
     const name = readName(body.name, errors)
     if (name !== null) {
-      fields.push('name = ?')
-      params.push(name)
+      push('name', name)
     }
   }
   if ('creator_type' in body) {
-    fields.push('creator_type = ?')
-    params.push(readOptionalText(body.creator_type, 'creator_type', CREATOR_TYPE_MAX, errors))
+    push('creator_type', readOptionalText(body.creator_type, 'creator_type', CREATOR_TYPE_MAX, errors), true)
   }
   if ('profile_url' in body) {
-    fields.push('profile_url = ?')
-    params.push(readOptionalText(body.profile_url, 'profile_url', PROFILE_URL_MAX, errors))
+    push('profile_url', readOptionalText(body.profile_url, 'profile_url', PROFILE_URL_MAX, errors), true)
   }
   if (hasOwn('xingtu_url')) {
-    fields.push('xingtu_url = ?')
-    params.push(readOptionalUrl(body.xingtu_url, 'xingtu_url', XINGTU_URL_MAX, errors))
+    push('xingtu_url', readOptionalUrl(body.xingtu_url, 'xingtu_url', XINGTU_URL_MAX, errors), true)
   }
   // 星图 ID（正式字段，字符串；空串规范为 null；与 description 无关，不影响 distilled_description）
   if (hasOwn('xingtu_id')) {
-    fields.push('xingtu_id = ?')
-    params.push(readOptionalXingtuId(body.xingtu_id, errors))
+    push('xingtu_id', readOptionalXingtuId(body.xingtu_id, errors), true)
   }
 
   // description（人工备注）是唯一事实来源；比较「实际是否变化」用于过期蒸馏清理
@@ -397,23 +553,24 @@ router.patch('/:id', (req, res) => {
     ? readOptionalText(body.description, 'description', DESCRIPTION_MAX, errors)
     : currentDescription
   if (hasDescription) {
-    fields.push('description = ?')
-    params.push(nextDescription)
+    push('description', nextDescription, true)
   }
   const descriptionChanged = hasDescription && nextDescription !== currentDescription
 
   // distilled_description 是派生字段：显式提供则直接写入
   const hasDistilled = hasOwn('distilled_description')
   if (hasDistilled) {
-    fields.push('distilled_description = ?')
-    params.push(readOptionalText(body.distilled_description, 'distilled_description', DISTILLED_MAX, errors))
+    push(
+      'distilled_description',
+      readOptionalText(body.distilled_description, 'distilled_description', DISTILLED_MAX, errors),
+      true
+    )
   }
 
   if ('status' in body) {
     const status = readStatus(body.status, errors)
     if (status !== null) {
-      fields.push('status = ?')
-      params.push(status)
+      push('status', status)
     }
   }
   if (errors.length) return fail(res, 400, errors[0])
@@ -421,13 +578,33 @@ router.patch('/:id', (req, res) => {
   // 关键一致性：人工备注真正改变、且本次没有提供新的蒸馏结果时，自动清除过期派生文本。
   // 只清派生文本，不删除任何 candidate / snapshot 历史；备注未变化则不清空。
   if (descriptionChanged && !hasDistilled) {
-    fields.push('distilled_description = ?')
-    params.push(null)
+    push('distilled_description', null, true)
   }
-  if (!fields.length) return fail(res, 400, '没有可更新的字段')
+  if (!updates.length) return fail(res, 400, '没有可更新的字段')
 
-  fields.push('updated_at = CURRENT_TIMESTAMP')
-  db.prepare(`UPDATE creator_candidates SET ${fields.join(', ')} WHERE id = ?`).run(...params, row.id)
+  // Creator 权威 profile 只能落在同一个 creator_id 上（candidate 无归属时降级为 legacy 仅写 candidate）
+  const creatorId = candidateIdentityWritable() ? Number(row.creator_id) || null : null
+  const profileUpdates = updates.filter((update) => update.profile)
+
+  const candidateSet = [...updates.map((update) => `${update.column} = ?`), 'updated_at = CURRENT_TIMESTAMP']
+  const candidateParams = updates.map((update) => update.value)
+
+  db.transaction(() => {
+    db.prepare(`UPDATE creator_candidates SET ${candidateSet.join(', ')} WHERE id = ?`).run(
+      ...candidateParams,
+      row.id
+    )
+    if (creatorId !== null && profileUpdates.length) {
+      const creatorSet = [
+        ...profileUpdates.map((update) => `${update.column} = ?`),
+        'updated_at = CURRENT_TIMESTAMP'
+      ]
+      db.prepare(`UPDATE creators SET ${creatorSet.join(', ')} WHERE id = ?`).run(
+        ...profileUpdates.map((update) => update.value),
+        creatorId
+      )
+    }
+  })()
   ok(res, toPublicCandidate(findCandidateRow(row.id)))
 })
 
@@ -458,7 +635,11 @@ router.post('/:id/recent-snapshots', (req, res) => {
   const validated = validateSnapshotPayload({ ...body, creator: row.name })
   if (!validated.ok) return fail(res, 400, validated.message)
 
-  const saved = insertRecentSnapshot(validated.value, { candidateId: row.id })
+  // Creator Identity Phase 4：candidate 快照继承归属锚（candidate.creator_id）
+  const saved = insertRecentSnapshot(validated.value, {
+    candidateId: row.id,
+    creatorId: row.creator_id ?? null
+  })
   ok(res, toPublicSnapshot(saved))
 })
 
@@ -886,30 +1067,52 @@ router.post('/:id/post-quote-decisions', (req, res) => {
   const recentEvidence = buildCandidateRecentEvidence(row.id, snapshot)
   const pricingEvidence = buildCandidatePricingEvidence(snapshot, priceReference, { currentQuote })
 
+  // Creator Identity Phase 4：candidate decision 的归属锚 = candidate.creator_id（事件身份仍是 decision_id）
+  const decisionIdentityWritable = identityTableHasColumn(db, 'creator_decisions', 'creator_id')
+  const decisionColumns = [
+    'creator',
+    'candidate_id',
+    'decision_stage',
+    'snapshot_id',
+    'current_quote_raw',
+    'current_quote',
+    'ip_judgement',
+    'human_decision',
+    'decision_note',
+    'historical_evidence_json',
+    'recent_evidence_json',
+    'pricing_evidence_json',
+    'target_cpm',
+    'pricing_version',
+    'system_context_version'
+  ]
+  const decisionValues = [
+    row.name,
+    row.id,
+    'post_quote',
+    snapshotRow.id,
+    currentQuoteRaw,
+    currentQuote,
+    null,
+    humanDecision,
+    decisionNote,
+    JSON.stringify({ has_prior_collaboration: false }),
+    JSON.stringify(recentEvidence),
+    JSON.stringify(pricingEvidence),
+    TARGET_CPM,
+    CANDIDATE_POST_QUOTE_PRICING_VERSION,
+    CANDIDATE_POST_QUOTE_SYSTEM_CONTEXT_VERSION
+  ]
+  if (decisionIdentityWritable) {
+    decisionColumns.push('creator_id')
+    decisionValues.push(row.creator_id ?? null)
+  }
   const info = db
     .prepare(
-      `INSERT INTO creator_decisions (
-         creator, candidate_id, decision_stage, snapshot_id, current_quote_raw, current_quote, ip_judgement,
-         human_decision, decision_note, historical_evidence_json, recent_evidence_json,
-         pricing_evidence_json, target_cpm, pricing_version, system_context_version
-       ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO creator_decisions (${decisionColumns.join(', ')})
+       VALUES (${decisionColumns.map(() => '?').join(', ')})`
     )
-    .run(
-      row.name,
-      row.id,
-      'post_quote',
-      snapshotRow.id,
-      currentQuoteRaw,
-      currentQuote,
-      humanDecision,
-      decisionNote,
-      JSON.stringify({ has_prior_collaboration: false }),
-      JSON.stringify(recentEvidence),
-      JSON.stringify(pricingEvidence),
-      TARGET_CPM,
-      CANDIDATE_POST_QUOTE_PRICING_VERSION,
-      CANDIDATE_POST_QUOTE_SYSTEM_CONTEXT_VERSION
-    )
+    .run(...decisionValues)
 
   const saved = db.prepare('SELECT * FROM creator_decisions WHERE id = ?').get(info.lastInsertRowid)
   ok(res, toPublicDecision(saved, null, null))

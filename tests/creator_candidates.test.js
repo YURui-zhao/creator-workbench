@@ -532,7 +532,7 @@ async function main() {
         .map((l) => `${Object.keys(l.route.methods)[0].toUpperCase()} ${l.route.path}`)
         .sort()
         .join(' | ') ===
-        'GET / | GET /:id | GET /:id/decisions | GET /:id/price-reference | GET /:id/recent-snapshots/latest | PATCH /:id | POST / | POST /:id/decisions | POST /:id/post-quote-decisions | POST /:id/recent-snapshots',
+        'GET / | GET /:id | GET /:id/decisions | GET /:id/price-reference | GET /:id/recent-snapshots/latest | PATCH /:id | POST / | POST /:id/decisions | POST /:id/post-quote-decisions | POST /:id/recent-snapshots | POST /:id/work-state',
       candidateRouter.stack
         .filter((l) => l.route)
         .map((l) => `${Object.keys(l.route.methods)[0].toUpperCase()} ${l.route.path}`)

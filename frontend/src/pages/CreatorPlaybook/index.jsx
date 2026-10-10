@@ -24,11 +24,12 @@ import {
 } from 'antd'
 import { PlusOutlined, ReloadOutlined, SearchOutlined, UserAddOutlined } from '@ant-design/icons'
 import {
-  createCandidateDecision,
   createCandidatePostQuoteDecision,
+  createCandidateWorkState,
   createCreatorCandidate,
   getCandidateLatestSnapshot,
   getCandidatePriceReference,
+  getCreatorCandidate,
   listCandidateDecisions,
   listCreatorCandidates,
   updateCreatorCandidate
@@ -47,16 +48,14 @@ import {
   applyCandidateEditValues,
   applyXingtuIdFormValues
 } from '../../utils/creatorCandidateForm.js'
-// 达人拓展 IA：三个工作盒子只由最新 candidate_review 派生（纯函数，便于单测）
+// 达人拓展：Work State 直接消费服务端 candidate.work_state（Phase 3 起不再由 decisions 派生）
 import {
-  WORK_STATE_CANDIDATE_REVIEW_STAGE,
   WORK_STATE_FILTER_ALL,
   WORK_STATE_FILTER_OPTIONS,
   WORK_STATE_LABELS,
   WORK_STATE_OPTIONS,
   WORK_STATE_TAG_COLORS,
   buildLinkedCollaborationRecords,
-  deriveWorkState,
   filterCandidates,
   summarizeWorkStates,
   workStateOf
@@ -207,8 +206,9 @@ export default function CreatorPlaybook() {
   // A. 列表顶部：名称 substring 搜索 + 三个工作盒子筛选（单选，互斥）
   const [searchKeyword, setSearchKeyword] = useState('')
   const [workStateFilter, setWorkStateFilter] = useState(WORK_STATE_FILTER_ALL)
-  // 每个 candidate 的当前 Work State（由最新 candidate_review 派生；列表筛选 / 计数用）
-  const [workStateMap, setWorkStateMap] = useState({})
+  // Phase 3：Work State 直接来自服务端 candidate.work_state（列表接口一次返回，无 N+1）；
+  // 这里只保存「当前处理」的 append-only 历史（work_state_history，来自 candidate detail）。
+  const [workStateHistory, setWorkStateHistory] = useState([])
   // 当前合作 / 已关联合作记录：两个独立的折叠区块（当前合作默认展开，合作记录默认折叠）
   const [cooperationKeys, setCooperationKeys] = useState(['cooperation'])
   const [linkedRecordKeys, setLinkedRecordKeys] = useState([])
@@ -350,28 +350,25 @@ export default function CreatorPlaybook() {
     loadDecisions(selectedId)
   }, [selectedId, loadDecisions])
 
-  // A. 列表的工作盒子筛选：需要「每个 candidate 的最新 candidate_review」。
-  // 严格按 candidate_id 逐条读取 append-only 历史（不新增后端接口、不按昵称猜、不新增 DB 字段）。
-  const loadWorkStates = useCallback(async (list) => {
-    const rows = (Array.isArray(list) ? list : []).filter((item) => item && item.id !== null && item.id !== undefined)
-    if (!rows.length) return
-    const entries = await Promise.all(
-      rows.map(async (item) => {
-        try {
-          const res = await listCandidateDecisions(item.id)
-          return [item.id, deriveWorkState(res?.data?.decisions || [])]
-        } catch {
-          // 读取失败不伪造状态：按「无 candidate_review」的默认语义展示（推进中）
-          return [item.id, deriveWorkState([])]
-        }
-      })
-    )
-    setWorkStateMap((prev) => ({ ...prev, ...Object.fromEntries(entries) }))
+  // Phase 3：列表的工作盒子筛选 / 计数 / Tag 直接用候选行上的 work_state（服务端派生）。
+  // 这里只按 candidate_id 读取「当前处理」历史（work_state_history），不再为 Work State 拉 decisions。
+  const loadWorkStateHistory = useCallback(async (candidateId) => {
+    if (!candidateId) {
+      setWorkStateHistory([])
+      return
+    }
+    try {
+      const res = await getCreatorCandidate(candidateId)
+      setWorkStateHistory(res?.data?.work_state_history || [])
+    } catch {
+      // 历史读取失败不影响当前状态展示（当前状态来自列表接口的 work_state）
+      setWorkStateHistory([])
+    }
   }, [])
 
   useEffect(() => {
-    loadWorkStates(candidates)
-  }, [candidates, loadWorkStates])
+    loadWorkStateHistory(selectedId)
+  }, [selectedId, loadWorkStateHistory])
 
   // 切换候选时收起历史 / 清空待提交的决定
   useEffect(() => {
@@ -423,15 +420,11 @@ export default function CreatorPlaybook() {
       filterCandidates({
         candidates,
         keyword: searchKeyword,
-        workState: workStateFilter,
-        workStateByCandidate: workStateMap
+        workState: workStateFilter
       }),
-    [candidates, searchKeyword, workStateFilter, workStateMap]
+    [candidates, searchKeyword, workStateFilter]
   )
-  const workStateCounts = useMemo(
-    () => summarizeWorkStates(candidates, workStateMap),
-    [candidates, workStateMap]
-  )
+  const workStateCounts = useMemo(() => summarizeWorkStates(candidates), [candidates])
 
   const handleCreate = async () => {
     if (creating) return
@@ -587,16 +580,24 @@ export default function CreatorPlaybook() {
     if (!selected || !pendingDecision || savingDecision) return
     setSavingDecision(true)
     try {
-      await createCandidateDecision(selected.id, {
-        human_decision: pendingDecision.value,
-        decision_note: decisionNote.trim() ? decisionNote.trim() : null
+      // Phase 3：写入 candidate_work_state_events（不再创建 candidate_review decision）
+      const res = await createCandidateWorkState(selected.id, {
+        state: pendingDecision.value,
+        note: decisionNote.trim() ? decisionNote.trim() : null
       })
-      message.success('决定已记录')
+      const updated = res?.data?.candidate
+      const event = res?.data?.work_state_event
+      message.success('当前处理已更新')
       setPendingDecision(null)
       setDecisionNote('')
-      // 新增一条 decision（不 UPDATE 旧 decision），并同步刷新该 candidate 的当前 Work State
-      const refreshed = await loadDecisions(selected.id)
-      setWorkStateMap((prev) => ({ ...prev, [selected.id]: deriveWorkState(refreshed) }))
+      // 不做乐观更新：仅在服务端返回后更新本地状态，保证 UI 与 DB event 一致
+      if (updated) {
+        setCandidates((prev) => prev.map((item) => (item.id === updated.id ? { ...item, ...updated } : item)))
+      }
+      if (event) {
+        // append-only：新事件插到最前（与 detail 契约「最新 → 最旧」一致），不重拉 decisions
+        setWorkStateHistory((prev) => [event, ...prev.filter((item) => item.id !== event.id)])
+      }
     } catch {
       // 失败提示由 request 响应拦截器统一给出，这里不再重复 toast
     } finally {
@@ -611,19 +612,22 @@ export default function CreatorPlaybook() {
   })()
   // 量化判断全部由纯函数规则引擎给出（页面只负责展示，不重复计算业务规则）
   const assessment = snapshot ? buildCreatorPlaybookAssessment(snapshot) : null
-  // B. 当前处理（Work State）：只由「最新 candidate_review」派生；post_quote 决策不参与
-  const currentWorkState = useMemo(() => deriveWorkState(decisions), [decisions])
-  // 历史人工决定（只统计 candidate_review，报价阶段决策不混入 Work State 历史）
-  const reviewDecisions = useMemo(
-    () => decisions.filter((item) => item.decision_stage === WORK_STATE_CANDIDATE_REVIEW_STAGE),
-    [decisions]
-  )
+  // B. 当前处理（Work State）：直接消费服务端值（candidate_work_state_events 最新一条；无事件 → advancing）
+  const currentWorkState = useMemo(() => {
+    const base = workStateOf(selected)
+    return {
+      value: base.value,
+      label: base.label,
+      note: selected?.work_state_note ?? null,
+      updatedAt: selected?.work_state_updated_at ?? null,
+      source: selected?.work_state_source ?? null
+    }
+  }, [selected])
   // F. 已关联合作记录：只使用 outcome 显式关联的投放记录（不按昵称猜、不自动连接历史 record）
   const linkedCollaborationRecords = useMemo(() => buildLinkedCollaborationRecords(decisions), [decisions])
-  // Phase 4D：最近一次 review / 报价阶段决策（decisions 已按时间倒序）
-  const latestReviewDecision = decisions.find((item) => item.decision_stage === 'candidate_review') || null
   const latestPostQuoteDecision = decisions.find((item) => item.decision_stage === 'post_quote') || null
-  const reviewContactConfirmed = latestReviewDecision?.human_decision === 'contact'
+  // Phase 3：报价 CTA 的主/次层级跟随当前处理状态（服务端 Work State），不再读 legacy candidate_review
+  const reviewContactConfirmed = currentWorkState.value === 'advancing'
   // Phase 4E：只以「最新 post_quote」为当前状态（不越过更晚的 negotiate / pause 去找早期 proceed）
   const latestPostQuoteEligible =
     Boolean(latestPostQuoteDecision) &&
@@ -836,8 +840,8 @@ export default function CreatorPlaybook() {
                           <Space size={6} wrap>
                             <Typography.Text strong>{item.name}</Typography.Text>
                             {item.status === 'archived' && <Tag>已归档</Tag>}
-                            <Tag color={WORK_STATE_TAG_COLORS[workStateOf(workStateMap, item.id).value]}>
-                              {workStateOf(workStateMap, item.id).label}
+                            <Tag color={WORK_STATE_TAG_COLORS[workStateOf(item).value]}>
+                              {workStateOf(item).label}
                             </Tag>
                           </Space>
                         }
@@ -910,11 +914,11 @@ export default function CreatorPlaybook() {
                     </Button>
                   ))}
                   <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                    只由最新一次人工决定派生；本轮谈价结果不会自动改变工作状态
+                    只由最新一条当前处理记录派生；本轮谈价结果不会自动改变工作状态
                   </Typography.Text>
-                  {decisionsLoading && (
+                  {(savingDecision || decisionsLoading) && (
                     <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                      同步中…
+                      {savingDecision ? '保存中…' : '同步中…'}
                     </Typography.Text>
                   )}
                 </Space>
@@ -927,28 +931,28 @@ export default function CreatorPlaybook() {
                   ) : (
                     <Typography.Text type="secondary">暂无状态备注</Typography.Text>
                   )}
-                  {currentWorkState.decidedAt && (
+                  {currentWorkState.updatedAt && (
                     <Typography.Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>
-                      {String(currentWorkState.decidedAt).slice(0, 16)}
+                      {String(currentWorkState.updatedAt).slice(0, 16)}
                     </Typography.Text>
                   )}
                 </div>
-                {/* 历史人工决定（append-only 审计；报价阶段决策单独展示，不混入） */}
-                {reviewDecisions.length > 1 && (
+                {/* 当前处理历史（Phase 3：来自服务端 work_state_history，最新 → 最旧；legacy_state 仅技术审计不展示） */}
+                {workStateHistory.length > 1 && (
                   <div style={{ marginTop: 6 }}>
                     <a style={{ fontSize: 12 }} onClick={() => setHistoryExpanded((value) => !value)}>
-                      {historyExpanded ? '收起历史决定' : `查看历史决定（${reviewDecisions.length - 1}）`}
+                      {historyExpanded ? '收起历史记录' : `查看历史记录（${workStateHistory.length - 1}）`}
                     </a>
                     {historyExpanded && (
                       <List
                         size="small"
-                        dataSource={reviewDecisions.slice(1)}
+                        dataSource={workStateHistory.slice(1)}
                         renderItem={(item) => (
                           <List.Item style={{ paddingLeft: 0, paddingRight: 0 }}>
                             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                               {String(item.created_at || '').slice(0, 16)} ·{' '}
-                              {WORK_STATE_LABELS[item.human_decision] || item.human_decision_label}
-                              {item.decision_note ? ` · ${item.decision_note}` : ''}
+                              {WORK_STATE_LABELS[item.state] || item.state}
+                              {item.note ? ` · ${item.note}` : ''}
                             </Typography.Text>
                           </List.Item>
                         )}

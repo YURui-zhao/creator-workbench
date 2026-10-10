@@ -49,8 +49,17 @@ export function getCandidatePriceReference(candidateId) {
 }
 
 /**
- * candidate_review 人工决定（Phase 4B，append-only）
- * 只提交 { human_decision, decision_note? }；creator / candidate_id / decision_stage 由服务端决定。
+ * Work State 写入（Phase 3 唯一写入路径，append-only）
+ * 只提交 { state: 'advancing'|'observing'|'paused', note? }；candidate_id / created_at 由服务端决定。
+ * 返回 { work_state_event, candidate }：candidate 与 list/detail 同一 contract，可直接用于更新本地状态。
+ */
+export function createCandidateWorkState(candidateId, payload) {
+  return request.post(`/creator-candidates/${candidateId}/work-state`, payload)
+}
+
+/**
+ * @deprecated Phase 3 起 candidate_review decision 已废弃（服务端只做 legacy 翻译，不再写 creator_decisions）。
+ * 请使用 createCandidateWorkState。保留此 helper 仅为兼容旧调用方。
  */
 export function createCandidateDecision(candidateId, payload) {
   return request.post(`/creator-candidates/${candidateId}/decisions`, payload)

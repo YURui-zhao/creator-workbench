@@ -1,9 +1,19 @@
 #!/usr/bin/env node
-// Creator Decision Playbook V0.1 - Phase 4B Candidate Review Decision 回归测试
+// Creator Identity V1 Phase 3 —— candidate「当前处理」写入回归测试
 //
 // 运行方式：node tests/creator_candidate_decisions.test.js
 // 隔离方式：WORKBENCH_DB_PATH 指向临时数据库（先于 import backend/db.js 设置），结束后删除。
 // 网络：拦截 http/https/net/tls/fetch —— 本能力纯确定性，不调用 AI、不访问网络。
+//
+// 【Phase 3 语义变更（本文件的重点）】
+//   · candidate_review decision 已废弃：POST /api/creator-candidates/:id/decisions
+//     不再写入 creator_decisions，而是翻译成 candidate_work_state_events：
+//       contact → advancing / observe → observing / hold → paused
+//   · Work State 读契约见 tests/candidate_work_state_read.test.js
+//   · Work State 写契约（POST /:id/work-state、append-only、非法值、note）见
+//     tests/candidate_work_state_write.test.js
+//   · 本文件覆盖：Phase 1 之前的安全降级（503）、legacy endpoint 兼容形状、enum/伪造防护、
+//     append-only + latest 排序、candidate 改名 / 同名隔离、旧 /api/creator-decisions 流程不变、无 AI / 无网络
 
 const fs = require('node:fs')
 const http = require('node:http')
@@ -16,7 +26,7 @@ const { pathToFileURL } = require('node:url')
 
 const root = path.resolve(__dirname, '..')
 
-const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'candidate-decisions-'))
+const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'candidate-work-state-legacy-'))
 process.env.WORKBENCH_DB_PATH = path.join(TMP_DIR, 'isolated.db')
 
 let passCount = 0
@@ -44,13 +54,13 @@ function forbidNetwork() {
   for (const [target, method] of replacements) {
     target[method] = () => {
       blocked.push(method)
-      throw new Error('candidate decision test forbids network requests')
+      throw new Error('candidate work state legacy test forbids network requests')
     }
   }
   const originalFetch = global.fetch
   global.fetch = () => {
     blocked.push('fetch')
-    throw new Error('candidate decision test forbids network requests')
+    throw new Error('candidate work state legacy test forbids network requests')
   }
   return {
     blocked,
@@ -92,6 +102,9 @@ async function main() {
     const snapshots = await import(
       pathToFileURL(path.join(root, 'backend/routes/recentSnapshots.js')).href
     )
+    const migration = await import(
+      pathToFileURL(path.join(root, 'backend/migrations/001_creator_identity.js')).href
+    )
     const db = (await import(pathToFileURL(path.join(root, 'backend/db.js')).href)).default
 
     const candidateRouter = candidates.default
@@ -113,12 +126,12 @@ async function main() {
     const saveCandidateSnapshot = findHandler(candidateRouter, '/:id/recent-snapshots', 'post')
     const listCandidateDecisions = findHandler(candidateRouter, '/:id/decisions', 'get')
     const createCandidateDecision = findHandler(candidateRouter, '/:id/decisions', 'post')
-    const priceRef = findHandler(candidateRouter, '/:id/price-reference', 'get')
+    const createWorkState = findHandler(candidateRouter, '/:id/work-state', 'post')
     const legacyCreateDecision = findHandler(decisionRouter, '/', 'post')
     const legacyListDecisions = findHandler(decisionRouter, '/', 'get')
     const legacyLatestSnapshot = findHandler(snapshots.default, '/latest', 'get')
 
-    // ---------- 历史投放池（供 Historical Price Reference 冻结） ----------
+    // ---------- 历史投放池 ----------
     const insertRecord = db.prepare(
       `INSERT INTO creator_records (time_cycle, nickname, creator_type, total_cost, publish_date, first_play, second_week_play)
        VALUES ('2026-W40', ?, ?, ?, '2026-08-20', ?, ?)`
@@ -127,9 +140,6 @@ async function main() {
       Number(insertRecord.run(nickname, type, cost, first, sw).lastInsertRowid)
     addRecord('历史甲', '科普', 1500, 50000, 50000)
     addRecord('历史乙', '历史类', 1080, 54000, 54000)
-    addRecord('历史丙', '个人成长类', 0, 48000, 48000)
-    addRecord('历史丁', '科普', 2100, 60000, 60000)
-    addRecord('历史戊', '科普', 900, 45000, 45000)
     addRecord('旧达人', '科普', 1000, 30000, 30000) // 供旧 contact/post_quote 回归
 
     // ---------- candidates ----------
@@ -148,130 +158,155 @@ async function main() {
       play(80000, 'organic', 5), play(90000, 'organic', 6), play(12000, 'unknown', 7)
     ], '¥5,000')
     const candB = await mkCand('同名达人', '科普', [play(99999, 'sponsored', 1)], '¥3,000')
-    const candSp0 = await mkCand('无商单达人', '科普', [play(80000, 'organic', 1), play(90000, 'organic', 2)], null)
-    const candSp1 = await mkCand('单商单达人', '科普', [play(50000, 'sponsored', 1)], null)
-    const candBigPrice = await mkCand('高金额达人', '科普', [play(20000, 'sponsored', 1)], '¥20,000')
     const candNoSnap = await mkCand('无快照达人', '科普', null, null)
 
     const snapshotIdOf = (candidateId) =>
       db.prepare('SELECT id FROM creator_recent_snapshots WHERE candidate_id = ?').get(candidateId)?.id ?? null
+    const decisionsCount = () => db.prepare('SELECT COUNT(*) AS n FROM creator_decisions').get().n
+    const reviewCount = () => db.prepare("SELECT COUNT(*) AS n FROM creator_decisions WHERE decision_stage='candidate_review'").get().n
+    const eventsCount = () => db.prepare('SELECT COUNT(*) AS n FROM candidate_work_state_events').get().n
 
-    console.log('===== 1. 无 creator_record 也可创建 candidate decision =====')
-    check('候选不在 creator_records', db.prepare('SELECT COUNT(*) AS n FROM creator_records WHERE nickname = ?').get('同名达人').n === 0)
-    const dNoSnap = await callRoute(createCandidateDecision, {
-      params: { id: String(candNoSnap.id) },
-      body: { human_decision: 'hold', decision_note: '先观察' }
-    })
-    check('无历史投放的 candidate 可保存 decision', dNoSnap.status === 200, JSON.stringify(dNoSnap.msg))
-    check('candidate_id 正确', dNoSnap.data?.candidate_id === candNoSnap.id)
-    check('creator 由服务端 candidate.name 写入', dNoSnap.data?.creator === '无快照达人')
-    check('decision_stage 固定 candidate_review', dNoSnap.data?.decision_stage === 'candidate_review')
-    check('human_decision_label = 暂不推进', dNoSnap.data?.human_decision_label === '暂不推进')
-    check('无 snapshot：snapshot_id / recent / pricing 均为 null', dNoSnap.data?.snapshot_id === null && dNoSnap.data?.recent_evidence === null && dNoSnap.data?.pricing_evidence === null)
+    console.log('===== 1. Phase 1 之前：Work State 写入安全降级（绝不落 legacy decisions）=====')
+    check('events 表尚不存在（fixture 为 Phase 1 之前形状）',
+      !db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE name='candidate_work_state_events'").get())
+    const decisionsBefore = decisionsCount()
+    const preWorkState = await callRoute(createWorkState, { params: { id: String(candA.id) }, body: { state: 'paused' } })
+    check('POST /work-state → 503（明确提示先执行 migration，不 500）',
+      preWorkState.status === 503 && /migration/.test(String(preWorkState.msg)))
+    const preLegacy = await callRoute(createCandidateDecision, { params: { id: String(candA.id) }, body: { human_decision: 'hold' } })
+    check('legacy POST /decisions 同样 503（不再写 creator_decisions）',
+      preLegacy.status === 503 && decisionsCount() === decisionsBefore)
 
-    console.log('\n===== 2. 前端不能伪造 identity / stage =====')
+    console.log('\n===== 2. 执行 Phase 1 migration（临时库）→ Work State 写入就绪 =====')
+    const migrated = migration.runMigration(db, { mode: 'commit' })
+    check('migration commit 成功', migrated.ok === true)
+    check('events 表已建立', eventsCount() === 0)
+    check('candidate 归属 creator（additive）',
+      Number.isInteger(db.prepare('SELECT creator_id FROM creator_candidates WHERE id = ?').get(candA.id).creator_id))
+
+    console.log('\n===== 3. legacy endpoint 兼容 shim：contact / observe / hold =====')
+    const beforeLegacy = { decisions: decisionsCount(), review: reviewCount(), events: eventsCount() }
+    const mapCases = [['contact', 'advancing'], ['observe', 'observing'], ['hold', 'paused']]
+    for (const [human, expected] of mapCases) {
+      const res = await callRoute(createCandidateDecision, {
+        params: { id: String(candB.id) },
+        body: { human_decision: human, decision_note: `note-${human}` }
+      })
+      check(`legacy ${human} → ${expected}`, res.status === 200 && res.data.work_state === expected && res.data.work_state_event?.state === expected)
+      check(`legacy ${human} 响应保留旧形状（decision_stage / human_decision / label / note）`,
+        res.data.decision_stage === 'candidate_review' &&
+          res.data.human_decision === human &&
+          res.data.human_decision_label === decisions.HUMAN_DECISION_LABELS[human] &&
+          res.data.decision_note === `note-${human}`)
+      check(`legacy ${human} 标记 deprecated 且指向新 endpoint`,
+        res.data.deprecated === true && /work-state/.test(String(res.data.deprecated_message)))
+      check(`legacy ${human} 不再产生 evidence / pricing / snapshot`,
+        res.data.snapshot_id === null && res.data.recent_evidence === null &&
+          res.data.pricing_evidence === null && res.data.target_cpm === null &&
+          res.data.pricing_version === null && res.data.historical_evidence === null)
+    }
+    check('legacy 写入只增加 events（+3）', eventsCount() === beforeLegacy.events + 3)
+    check('legacy 写入不新增 creator_decisions', decisionsCount() === beforeLegacy.decisions)
+    check('legacy 写入不新增 candidate_review', reviewCount() === beforeLegacy.review)
+    check('legacy 原值记录在 legacy_state（技术审计）',
+      db.prepare("SELECT COUNT(*) AS n FROM candidate_work_state_events WHERE legacy_state IN ('contact','observe','hold')").get().n === 3)
+    check('legacy_state 与 state 映射一致',
+      db.prepare("SELECT COUNT(*) AS n FROM candidate_work_state_events WHERE legacy_state='observe' AND state='observing'").get().n === 1)
+    check('无 snapshot 的 candidate 也能记录 Work State（不再要求近期表现）',
+      (await callRoute(createWorkState, { params: { id: String(candNoSnap.id) }, body: { state: 'observing', note: 'n' } })).status === 200)
+    check('有 snapshot 也不产生 evidence（Work State 与 snapshot 无关）',
+      !db.prepare('PRAGMA table_info(candidate_work_state_events)').all().some((col) => /snapshot|evidence|pricing/.test(col.name)))
+
+    console.log('\n===== 4. 前端不能伪造 identity / stage / state =====')
     const forged = await callRoute(createCandidateDecision, {
       params: { id: String(candA.id) },
-      body: { human_decision: 'contact', candidate_id: 999, creator: '伪造名称', decision_stage: 'post_quote' }
+      body: {
+        human_decision: 'contact',
+        candidate_id: 999,
+        creator: '伪造名称',
+        decision_stage: 'post_quote',
+        state: 'paused',
+        legacy_state: 'hold'
+      }
     })
-    check('伪造 candidate_id 被忽略', forged.data?.candidate_id === candA.id)
-    check('伪造 creator 被忽略', forged.data?.creator === '同名达人')
+    check('伪造 candidate_id 被忽略（用路径 candidate）', forged.data?.candidate_id === candA.id)
+    check('伪造 creator 被忽略（服务端用 candidate.name）', forged.data?.creator === '同名达人')
     check('伪造 decision_stage 被忽略', forged.data?.decision_stage === 'candidate_review')
+    check('伪造 state 被忽略（沿用 human_decision 映射）',
+      forged.data?.work_state === 'advancing' && forged.data?.work_state_event?.state === 'advancing')
+    check('伪造 legacy_state 被忽略（记录真实映射来源）',
+      db.prepare('SELECT legacy_state FROM candidate_work_state_events WHERE id = ?').get(forged.data.work_state_event.id).legacy_state === 'contact')
 
-    console.log('\n===== 3. candidate_review enum 与旧 enum =====')
+    console.log('\n===== 5. enum 不变 + 非法值 / 404 =====')
     check('只接受 contact / observe / hold', JSON.stringify(decisions.CANDIDATE_REVIEW_DECISIONS) === JSON.stringify(['contact', 'observe', 'hold']))
-    for (const bad of ['contact_now', 'skip_for_now', 'repurchase', 'pause', '']) {
+    for (const bad of ['contact_now', 'skip_for_now', 'repurchase', 'pause', 'advancing', '']) {
       const r = await callRoute(createCandidateDecision, { params: { id: String(candA.id) }, body: { human_decision: bad } })
       check(`拒绝非法 human_decision「${bad}」`, r.status === 400)
     }
-    check('缺少 human_decision -> 400（系统不会自动选择）', (await callRoute(createCandidateDecision, { params: { id: String(candA.id) }, body: {} })).status === 400)
+    check('缺少 human_decision -> 400', (await callRoute(createCandidateDecision, { params: { id: String(candA.id) }, body: {} })).status === 400)
     check('旧 DECISION_STAGES 不变', JSON.stringify(decisions.DECISION_STAGES) === JSON.stringify(['contact', 'post_quote']))
-    check('旧 CONTACT_DECISIONS 不变', JSON.stringify(decisions.CONTACT_DECISIONS) === JSON.stringify(['contact_now', 'observe', 'skip_for_now']))
-    check('旧 POST_QUOTE_DECISIONS 不变', JSON.stringify(decisions.POST_QUOTE_DECISIONS) === JSON.stringify(['repurchase', 'small_test', 'negotiate', 'pause']))
-    check('旧 label 未被覆盖', decisions.HUMAN_DECISION_LABELS.contact_now === '开始建联' && decisions.HUMAN_DECISION_LABELS.skip_for_now === '暂不联系' && decisions.HUMAN_DECISION_LABELS.pause === '暂缓')
-    check('新增 label：contact=继续联系 / hold=暂不推进', decisions.HUMAN_DECISION_LABELS.contact === '继续联系' && decisions.HUMAN_DECISION_LABELS.hold === '暂不推进')
-    check('旧 POST 不接受 candidate_review stage', (await callRoute(legacyCreateDecision, { body: { creator: '旧达人', decision_stage: 'candidate_review', human_decision: 'contact' } })).status === 400)
+    check('旧 CONTACT_DECISIONS / POST_QUOTE_DECISIONS 不变',
+      JSON.stringify(decisions.CONTACT_DECISIONS) === JSON.stringify(['contact_now', 'observe', 'skip_for_now']) &&
+        JSON.stringify(decisions.POST_QUOTE_DECISIONS) === JSON.stringify(['repurchase', 'small_test', 'negotiate', 'pause']))
+    check('旧 label 未被覆盖',
+      decisions.HUMAN_DECISION_LABELS.contact_now === '开始建联' &&
+        decisions.HUMAN_DECISION_LABELS.skip_for_now === '暂不联系' &&
+        decisions.HUMAN_DECISION_LABELS.pause === '暂缓' &&
+        decisions.HUMAN_DECISION_LABELS.contact === '继续联系' &&
+        decisions.HUMAN_DECISION_LABELS.hold === '暂不推进')
+    check('旧 POST 不接受 candidate_review stage',
+      (await callRoute(legacyCreateDecision, { body: { creator: '旧达人', decision_stage: 'candidate_review', human_decision: 'contact' } })).status === 400)
     check('候选不存在 -> 404', (await callRoute(createCandidateDecision, { params: { id: '99999' }, body: { human_decision: 'hold' } })).status === 404)
+    check('candidate 列表接口不再返回 legacy decisions 作为 Work State（字段仍 additive）',
+      (await callRoute(findHandler(candidateRouter, '/', 'get'), {})).data.candidates.every((item) => WORK_STATES.includes(item.work_state)))
 
-    console.log('\n===== 4. snapshot 由服务端按 candidate_id 取 latest =====')
-    const dA = await callRoute(createCandidateDecision, { params: { id: String(candA.id) }, body: { human_decision: 'observe' } })
-    const dB = await callRoute(createCandidateDecision, { params: { id: String(candB.id) }, body: { human_decision: 'observe' } })
-    check('candidate A 使用自己的 snapshot', dA.data?.snapshot_id === snapshotIdOf(candA.id) && dA.data?.snapshot_id !== snapshotIdOf(candB.id))
-    check('candidate B（同名）使用自己的 snapshot', dB.data?.snapshot_id === snapshotIdOf(candB.id))
-    check('recent_evidence.candidate_id / snapshot_id 正确', dA.data?.recent_evidence?.candidate_id === candA.id && dA.data?.recent_evidence?.snapshot_id === snapshotIdOf(candA.id))
+    console.log('\n===== 6. append-only + latest 排序（新表） =====')
+    const beforeAppend = eventsCount()
+    const e1 = await callRoute(createWorkState, { params: { id: String(candA.id) }, body: { state: 'observing', note: '第一次' } })
+    const e2 = await callRoute(createWorkState, { params: { id: String(candA.id) }, body: { state: 'advancing', note: '第二次' } })
+    check('两次写入产生两条不同 event（不 UPDATE）', eventsCount() === beforeAppend + 2 && e1.data.work_state_event.id !== e2.data.work_state_event.id)
+    check('新 event 成为 latest', e2.data.candidate.work_state === 'advancing' && e2.data.candidate.work_state_note === '第二次')
+    const detailA = await callRoute(findHandler(candidateRouter, '/:id', 'get'), { params: { id: String(candA.id) } })
+    // candA 到此刻共 3 条 event：§4 伪造防护写入的 legacy contact + §6 的 e1/e2
+    check('detail.history 最新 → 最旧（append-only 全量保留）',
+      detailA.data.work_state_history.length === 3 &&
+        detailA.data.work_state_history[0].note === '第二次' &&
+        detailA.data.work_state_history[1].note === '第一次')
+    check('GET /:id/decisions 只返回真实业务决策（candidate_review 不再出现）',
+      (await callRoute(listCandidateDecisions, { params: { id: String(candA.id) } })).data.decisions.every((row) => row.decision_stage !== 'candidate_review'))
 
-    console.log('\n===== 5. recent evidence 冻结事实 =====')
-    const re = dA.data?.recent_evidence || {}
-    check('median_play 冻结（7 样本去极值 -> 53000）', re.median_play === 53000, String(re.median_play))
-    check('mean_play 从 plays 派生（非 null）', typeof re.mean_play === 'number' && Math.abs(re.mean_play - 390000 / 7) < 1e-6, String(re.mean_play))
-    check('sponsored 事实冻结', re.sponsored_count === 4 && re.sponsored_median_play === 52000)
-    check('organic 事实冻结', re.organic_count === 2 && re.organic_median_play === 85000)
-    check('unknown_count 冻结', re.unknown_count === 1)
-    check('observed_at / valid_count / stats_version 冻结', re.observed_at === OBSERVED_AT && re.valid_count === 7 && re.source_stats_version === 'recent-performance-v1')
-    check('不加 Rule Engine 判断文案（无 scale / stability seed）', !('scale' in re) && !('stability' in re) && re.playbook_rule_version === 'creator-playbook-v0.1')
+    console.log('\n===== 7. candidate 改名不断链 =====')
+    const beforeRename = await callRoute(findHandler(candidateRouter, '/:id', 'get'), { params: { id: String(candA.id) } })
+    await callRoute(patchCandidate, { params: { id: String(candA.id) }, body: { name: '改名后达人' } })
+    const afterRename = await callRoute(findHandler(candidateRouter, '/:id', 'get'), { params: { id: String(candA.id) } })
+    check('改名后 Work State 与历史不变（events 只按 candidate_id 关联）',
+      afterRename.data.work_state === beforeRename.data.work_state &&
+        afterRename.data.work_state_history.length === beforeRename.data.work_state_history.length)
+    const renamedWrite = await callRoute(createWorkState, { params: { id: String(candA.id) }, body: { state: 'paused' } })
+    check('改名后仍可写（candidate_id 稳定）', renamedWrite.status === 200 && renamedWrite.data.candidate.work_state === 'paused')
+    check('events 表没有 creator 文本列（不复制名称）',
+      !db.prepare('PRAGMA table_info(candidate_work_state_events)').all().some((col) => /creator|name/.test(col.name)))
 
-    console.log('\n===== 6. pricing evidence：CPM15-20 与 TARGET_CPM=30 分开 =====')
-    const pe = dA.data?.pricing_evidence || {}
-    check('target_cpm 列仍为共享常量 30', dA.data?.target_cpm === 30)
-    check('CPM15-20 只出现在 pricing_evidence', pe.playbook_estimate?.cpm_low === 15 && pe.playbook_estimate?.cpm_high === 20)
-    check('estimate = sponsored中位 × 15-20 / 1000（52000 -> 780 / 1040）', pe.playbook_estimate?.estimate_low === 780 && pe.playbook_estimate?.estimate_high === 1040)
-    check('sponsored>=3 -> confidence normal', pe.playbook_estimate?.confidence === 'normal')
-    check('xingtu_price 冻结（5000）', pe.xingtu_price === 5000)
-    check('high_amount_risk = false（5000 未过万）', pe.high_amount_risk === false)
-    check('pricing_version / system_context_version 使用新版本', dA.data?.pricing_version === 'creator-playbook-pricing-v0.1' && dA.data?.system_context_version === 'candidate-review-v0.1')
-    const dBig = await callRoute(createCandidateDecision, { params: { id: String(candBigPrice.id) }, body: { human_decision: 'observe' } })
-    check('sponsored=1 -> confidence low', dBig.data?.pricing_evidence?.playbook_estimate?.confidence === 'low')
-    check('high_amount_risk = true（20000 > 10000）', dBig.data?.pricing_evidence?.high_amount_risk === true)
-    const dSp0 = await callRoute(createCandidateDecision, { params: { id: String(candSp0.id) }, body: { human_decision: 'observe' } })
-    check('sponsored=0 -> 不生成 estimate（low/high = null）', dSp0.data?.pricing_evidence?.playbook_estimate?.estimate_low === null && dSp0.data?.pricing_evidence?.playbook_estimate?.estimate_high === null)
-    const dSp1 = await callRoute(createCandidateDecision, { params: { id: String(candSp1.id) }, body: { human_decision: 'observe' } })
-    check('sponsored=1 -> 生成 estimate 且 confidence low', dSp1.data?.pricing_evidence?.playbook_estimate?.estimate_low === 750 && dSp1.data?.pricing_evidence?.playbook_estimate?.confidence === 'low')
+    console.log('\n===== 8. 同名 candidate 不串 =====')
+    const detailB = await callRoute(findHandler(candidateRouter, '/:id', 'get'), { params: { id: String(candB.id) } })
+    const listA = await callRoute(findHandler(candidateRouter, '/', 'get'), {})
+    const rowA = listA.data.candidates.find((item) => item.id === candA.id)
+    const rowB = listA.data.candidates.find((item) => item.id === candB.id)
+    // A：§4 伪造(1) + §6 e1/e2(2) + §7 改名后写入(1) = 4 ；B：§3 legacy contact/observe/hold = 3
+    const eventsOf = (candidateId) =>
+      Number(db.prepare('SELECT COUNT(*) AS n FROM candidate_work_state_events WHERE candidate_id = ?').get(candidateId).n)
+    check('A / B 的 event 各自独立（A=4, B=3）', eventsOf(candA.id) === 4 && eventsOf(candB.id) === 3, `A=${eventsOf(candA.id)} B=${eventsOf(candB.id)}`)
+    check('B 的 history 全量保留 3 条', detailB.data.work_state_history.length === 3)
+    check('同名候选各自状态独立', rowA.work_state === 'paused' && rowB.work_state === 'paused')
+    check('events 全部挂在存在的 candidate 上',
+      db.prepare('SELECT COUNT(*) AS n FROM candidate_work_state_events e WHERE NOT EXISTS (SELECT 1 FROM creator_candidates c WHERE c.id = e.candidate_id)').get().n === 0)
+    check('snapshot 关联未被 Work State 影响（A 仍有自己的 snapshot）', snapshotIdOf(candA.id) !== null && snapshotIdOf(candB.id) !== null)
 
-    console.log('\n===== 7. historical evidence / price reference 冻结 =====')
-    check('historical_evidence = has_prior_collaboration:false', JSON.stringify(dA.data?.historical_evidence) === JSON.stringify({ has_prior_collaboration: false }))
-    check('historical evidence 不重复塞 target_cpm', !('target_cpm' in (dA.data?.historical_evidence || {})))
-    const hpr = pe.historical_price_reference || {}
-    check('historical price reference available + target', hpr.available === true && hpr.target_play === 52000)
-    check('selected_case_count 冻结（5）', hpr.selected_case_count === 5)
-    check('summary 冻结（非 null）', Boolean(hpr.summary) && typeof hpr.summary.cost_median === 'number')
-    check('selected_record_ids 冻结（5 个）', Array.isArray(hpr.selected_record_ids) && hpr.selected_record_ids.length === 5)
-    const liveRef = await callRoute(priceRef, { params: { id: String(candA.id) } })
-    check('与 Phase 3B 同一实现（record_ids 一致）', JSON.stringify(hpr.selected_record_ids) === JSON.stringify(liveRef.data.cases.map((c) => c.record_id)))
-
-    console.log('\n===== 8. append-only + 排序 =====')
-    const beforeCount = db.prepare('SELECT COUNT(*) AS n FROM creator_decisions WHERE candidate_id = ?').get(candA.id).n
-    const dObserve = await callRoute(createCandidateDecision, { params: { id: String(candA.id) }, body: { human_decision: 'observe', decision_note: '第一次' } })
-    const dContact = await callRoute(createCandidateDecision, { params: { id: String(candA.id) }, body: { human_decision: 'contact', decision_note: '第二次' } })
-    const listA = await callRoute(listCandidateDecisions, { params: { id: String(candA.id) } })
-    check('observe -> contact 产生两行（不 UPDATE）', db.prepare('SELECT COUNT(*) AS n FROM creator_decisions WHERE candidate_id = ?').get(candA.id).n === beforeCount + 2)
-    check('两条 decision id 不同', dObserve.data?.id !== dContact.data?.id)
-    check('latest 排序稳定（最新在前）', listA.data.decisions[0].id === dContact.data.id)
-    check('历史保留旧记录', listA.data.decisions.some((x) => x.id === dObserve.data.id))
-    check('GET 返回 candidate_id / creator / stage / note / snapshot_id / created_at', listA.data.decisions.every((x) => 'candidate_id' in x && 'creator' in x && 'decision_stage' in x && 'decision_note' in x && 'snapshot_id' in x && 'created_at' in x))
-
-    console.log('\n===== 9. candidate 改名不断链 =====')
-    const oldDecisions = (await callRoute(listCandidateDecisions, { params: { id: String(candA.id) } })).data.decisions
-    const oldIds = oldDecisions.map((x) => x.id)
-    await callRoute(patchCandidate, { params: { id: String(candA.id) }, body: { name: '新名字' } })
-    const afterRename = (await callRoute(listCandidateDecisions, { params: { id: String(candA.id) } })).data.decisions
-    check('改名后仍能返回旧 decision', oldIds.every((id) => afterRename.some((x) => x.id === id)))
-    check('旧 decision.creator 保持旧名（不 UPDATE）', afterRename.find((x) => x.id === oldIds[0]).creator === '同名达人')
-    const dRenamed = await callRoute(createCandidateDecision, { params: { id: String(candA.id) }, body: { human_decision: 'hold' } })
-    check('新 decision 使用新名字', dRenamed.data?.creator === '新名字' && dRenamed.data?.candidate_id === candA.id)
-    check('新旧 decision 同属 candidate_id', afterRename.every((x) => x.candidate_id === candA.id) && dRenamed.data.candidate_id === candA.id)
-
-    console.log('\n===== 10. 同名 candidate 不串 =====')
-    const listB = await callRoute(listCandidateDecisions, { params: { id: String(candB.id) } })
-    const finalA = (await callRoute(listCandidateDecisions, { params: { id: String(candA.id) } })).data.decisions
-    check('A 的列表不含 B 的 decision', !finalA.some((x) => x.id === dB.data.id))
-    check('B 的列表不含 A 的 decision', !listB.data.decisions.some((x) => x.candidate_id !== candB.id))
-    check('B 只返回自己的 decision', listB.data.decisions.every((x) => x.candidate_id === candB.id && x.creator === '同名达人'))
-
-    console.log('\n===== 11. 无推荐 / 无 AI / 旧 Decision 兼容 =====')
-    check('response 不含 should_invest / recommendation_score / similarity', !/should_invest|recommendation_score|similarity|recommended_price/.test(JSON.stringify(dA.body)))
+    console.log('\n===== 9. 无推荐 / 无 AI / 旧 Decision 流程兼容 =====')
+    check('response 不含 should_invest / recommendation_score / similarity',
+      !/should_invest|recommendation_score|similarity|recommended_price/.test(JSON.stringify(e2.body)))
     const routeSource = fs.readFileSync(path.join(root, 'backend/routes/creatorCandidates.js'), 'utf8')
-    check('candidate decision 不引用 AI 服务', !/deepseek|callProviderVision|extract-creator-screenshot/i.test(routeSource))
-    // 旧 contact 流程仍可用（creator 存在于 creator_records + 历史 snapshot）
+    check('candidate Work State 写入不引用 AI 服务', !/deepseek|callProviderVision|extract-creator-screenshot/i.test(routeSource))
     const histSnap = await callRoute(
       findHandler(snapshots.default, '/', 'post'),
       { body: { creator: '旧达人', recognized_creator_name_raw: '旧达人', observed_at: OBSERVED_AT, plays: [play(30000, 'sponsored', 1)] } }
@@ -279,28 +314,36 @@ async function main() {
     const legacyDecision = await callRoute(legacyCreateDecision, {
       body: { creator: '旧达人', decision_stage: 'contact', human_decision: 'contact_now', ip_judgement: 'strong' }
     })
-    check('旧 contact decision 仍可创建', legacyDecision.status === 200, JSON.stringify(legacyDecision.msg))
+    check('旧 contact decision 仍可创建（历史达人流程未变）', legacyDecision.status === 200, JSON.stringify(legacyDecision.msg))
     check('旧 decision.candidate_id = null', legacyDecision.data?.candidate_id === null)
     const legacyList = await callRoute(legacyListDecisions, { query: { creator: '旧达人' } })
     check('旧 GET /api/creator-decisions 行为不变', legacyList.status === 200 && legacyList.data.decisions.some((x) => x.id === legacyDecision.data.id))
-    check('旧 decision 不出现在任何 candidate decision 列表', !finalA.some((x) => x.id === legacyDecision.data.id))
     check('legacy latest snapshot 行为不变', (await callRoute(legacyLatestSnapshot, { query: { creator: '旧达人' } })).data.snapshot?.id === histSnap.data.id)
+
+    console.log('\n===== 10. Phase 3 硬要求：candidate_review 不再增长 =====')
+    check('本轮所有写入后 candidate_review 行数 = 迁移前（0 条新增）', reviewCount() === beforeLegacy.review, String(reviewCount()))
+    check('creator_decisions 仅由旧历史达人流程增加（candidate 侧 0 新增）', decisionsCount() === beforeLegacy.decisions + 1, String(decisionsCount()))
     check('未发生任何外部网络请求', networkGuard.blocked.length === 0, JSON.stringify(networkGuard.blocked))
   } finally {
     networkGuard.restore()
   }
 }
 
+// 与后端 WORK_STATE_STATES 同步的本地常量（避免测试直接依赖内部模块导出）
+const WORK_STATES = ['advancing', 'observing', 'paused']
+
 main()
   .catch((error) => {
     console.error('测试执行异常：', error)
+    failCount += 1
+    failures.push(`执行异常：${error?.message || error}`)
     process.exitCode = 1
   })
   .finally(() => {
     try {
       fs.rmSync(TMP_DIR, { recursive: true, force: true })
     } catch {
-      // 清理失败不影响测试结论
+      /* ignore */
     }
     const total = passCount + failCount
     const rate = total ? ((passCount / total) * 100).toFixed(1) : '0.0'

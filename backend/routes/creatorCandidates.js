@@ -18,6 +18,7 @@ import {
   CANDIDATE_REVIEW_PRICING_VERSION,
   CANDIDATE_REVIEW_STAGE,
   CANDIDATE_REVIEW_SYSTEM_CONTEXT_VERSION,
+  HUMAN_DECISION_LABELS,
   MAX_NOTE_LENGTH,
   toPublicDecision
 } from './creatorDecisions.js'
@@ -29,6 +30,7 @@ import { loadOutcomeSummaries } from './creatorDecisionOutcomes.js'
 import { loadNegotiationCaseSummaries } from './creatorNegotiationCases.js'
 // Phase 2：服务端 Work State 只读派生（新表优先 / legacy fallback，两表绝不混合）
 import {
+  WORK_STATE_TABLE,
   hasColumn,
   hasTable,
   latestWorkStateCte,
@@ -36,6 +38,12 @@ import {
   resolveWorkState,
   workStateMode
 } from '../utils/creatorWorkStateRead.js'
+// Phase 3：Work State 唯一写入目标 = candidate_work_state_events（append-only）
+import { WORK_STATE_STATES, workStateFromLegacy } from '../utils/creatorIdentity.js'
+
+// Work State 写入前置条件：candidate_work_state_events 必须存在（Phase 1 migration 建表）
+const WORK_STATE_SCHEMA_MISSING =
+  'Work State 尚未初始化（candidate_work_state_events 不存在）：请先执行 Creator Identity Phase 1 migration。'
 
 /**
  * 候选达人身份层（V3-alpha.3 Playbook Phase 1）
@@ -689,15 +697,100 @@ function buildCandidatePricingEvidence(snapshot, priceReference, { currentQuote 
 }
 
 /**
+ * Work State 写入（Phase 3 的唯一实现）——append-only INSERT 到 candidate_work_state_events。
+ *
+ * 冻结规则：
+ *   · 不写 creator_decisions、不生成 pricing / evidence / snapshot（Work State 不是业务决策）
+ *   · 不 UPDATE 旧 event；同一状态连续写入允许（不 silent dedupe）
+ *   · candidate.status 不参与（archived 也可记录状态）
+ * @param {{id:number,name:string}} row 已确认存在的 candidate 行
+ * @param {string} state advancing | observing | paused
+ * @param {string|null} note 可选备注
+ * @param {string|null} legacyState 仅 legacy 兼容路径写入（技术审计用）
+ */
+function insertWorkStateEvent(row, state, note, legacyState = null) {
+  const info = db
+    .prepare(
+      `INSERT INTO candidate_work_state_events (candidate_id, state, legacy_state, note)
+       VALUES (?, ?, ?, ?)`
+    )
+    .run(row.id, state, legacyState, note)
+  const event = db
+    .prepare(
+      'SELECT id, candidate_id, state, legacy_state, note, created_at FROM candidate_work_state_events WHERE id = ?'
+    )
+    .get(info.lastInsertRowid)
+  return {
+    event,
+    // 刚写入的 event 必然是新 latest（created_at DESC, id DESC）；直接用它构造响应，保证 UI 与 DB 一致
+    workState: {
+      state: event.state,
+      legacy_state: event.legacy_state ?? null,
+      note: event.note ?? null,
+      created_at: event.created_at ?? null,
+      source: 'events'
+    }
+  }
+}
+
+/** 读回 candidate 对外对象（与 list/detail 同一序列化，字段完全一致） */
+function candidatePayloadWithWorkState(candidateId, workState) {
+  const fresh = findCandidateRow(candidateId)
+  return toPublicCandidateWithWorkState(fresh, workState, loadCreatorLight(fresh))
+}
+
+/**
+ * POST /api/creator-candidates/:id/work-state
+ * body: { state: 'advancing' | 'observing' | 'paused', note?: string }
+ * 返回 { work_state_event, candidate }（candidate 与 list/detail 同一 contract）
+ */
+router.post('/:id/work-state', (req, res) => {
+  const row = findCandidateRow(req.params.id)
+  if (!row) return fail(res, 404, `候选达人不存在（id=${req.params.id}）`)
+  if (!hasTable(db, WORK_STATE_TABLE)) return fail(res, 503, WORK_STATE_SCHEMA_MISSING)
+  const body = req.body
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return fail(res, 400, '请求体必须是对象')
+  }
+  const state = String(body.state ?? '').trim()
+  if (!WORK_STATE_STATES.includes(state)) {
+    return fail(res, 400, `state 必须为：${WORK_STATE_STATES.join(' / ')}`)
+  }
+  const errors = []
+  const note = readOptionalText(body.note, 'note', MAX_NOTE_LENGTH, errors)
+  if (errors.length) return fail(res, 400, errors[0])
+
+  const { event, workState } = insertWorkStateEvent(row, state, note)
+  ok(res, {
+    work_state_event: {
+      id: event.id,
+      candidate_id: event.candidate_id,
+      state: event.state,
+      note: event.note ?? null,
+      created_at: event.created_at ?? null
+    },
+    candidate: candidatePayloadWithWorkState(row.id, workState)
+  })
+})
+
+/**
  * POST /api/creator-candidates/:id/decisions
- * candidate_review 阶段的人工决定（append-only）：
- *   · creator / candidate_id / decision_stage / snapshot_id 全部由服务端决定，前端不能伪造
- *   · human_decision 只接受 contact / observe / hold，由用户显式选择（系统 / AI / 规则不推断）
- *   · 不要求有 recent snapshot；无快照时 snapshot_id / recent / pricing evidence 均为 NULL
+ *
+ * 【Phase 3 起：deprecated 兼容 shim，语义已变更】
+ * 旧调用方用 candidate_review 的 contact / observe / hold 表达「当前处理」。
+ * Phase 3 之后 Work State 的唯一持久化目标是 candidate_work_state_events，
+ * 因此本 endpoint **绝不再写入 creator_decisions**（不双写），而是翻译为 work state event：
+ *   contact → advancing / observe → observing / hold → paused
+ * （legacy 原值写入 event.legacy_state，仅技术审计，普通 UI 不展示。）
+ *
+ * 响应保留旧客户端必要字段（id / candidate_id / creator / human_decision / decision_note / created_at…），
+ * 但 evidence / pricing / snapshot 字段一律为 null（不再产生），并附带 deprecated 标记与 work_state_event。
+ * 新前端已直接使用 POST /:id/work-state；本 shim 仅为兼容仍存在的旧调用方。
  */
 router.post('/:id/decisions', (req, res) => {
   const row = findCandidateRow(req.params.id)
   if (!row) return fail(res, 404, `候选达人不存在（id=${req.params.id}）`)
+  if (!hasTable(db, WORK_STATE_TABLE)) return fail(res, 503, WORK_STATE_SCHEMA_MISSING)
   const body = req.body
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return fail(res, 400, '请求体必须是对象')
@@ -710,40 +803,45 @@ router.post('/:id/decisions', (req, res) => {
   const decisionNote = readOptionalText(body.decision_note, 'decision_note', MAX_NOTE_LENGTH, errors)
   if (errors.length) return fail(res, 400, errors[0])
 
-  // snapshot 由服务端按 candidate_id 取 latest（前端不能指定 snapshot_id）
-  const snapshotRow = getLatestSnapshotByCandidate(row.id)
-  const snapshot = snapshotRow ? toPublicSnapshot(snapshotRow) : null
-  const priceReference = buildPriceReference(row)
+  const state = workStateFromLegacy(humanDecision)
+  if (!state) return fail(res, 400, `human_decision「${humanDecision}」无法映射到 Work State`)
 
-  const historicalEvidence = { has_prior_collaboration: false }
-  const recentEvidence = snapshot ? buildCandidateRecentEvidence(row.id, snapshot) : null
-  const pricingEvidence = snapshot ? buildCandidatePricingEvidence(snapshot, priceReference) : null
-
-  const info = db
-    .prepare(
-      `INSERT INTO creator_decisions (
-         creator, candidate_id, decision_stage, snapshot_id, current_quote_raw, current_quote, ip_judgement,
-         human_decision, decision_note, historical_evidence_json, recent_evidence_json,
-         pricing_evidence_json, target_cpm, pricing_version, system_context_version
-       ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
-      row.name,
-      row.id,
-      CANDIDATE_REVIEW_STAGE,
-      snapshotRow ? snapshotRow.id : null,
-      humanDecision,
-      decisionNote,
-      JSON.stringify(historicalEvidence),
-      recentEvidence ? JSON.stringify(recentEvidence) : null,
-      pricingEvidence ? JSON.stringify(pricingEvidence) : null,
-      TARGET_CPM,
-      CANDIDATE_REVIEW_PRICING_VERSION,
-      CANDIDATE_REVIEW_SYSTEM_CONTEXT_VERSION
-    )
-
-  const saved = db.prepare('SELECT * FROM creator_decisions WHERE id = ?').get(info.lastInsertRowid)
-  ok(res, toPublicDecision(saved, null, null))
+  const { event, workState } = insertWorkStateEvent(row, state, decisionNote, humanDecision)
+  ok(res, {
+    // ---- 旧字段（保留形状；evidence 相关一律 null —— Phase 3 后不再产生）----
+    id: event.id,
+    creator: row.name,
+    candidate_id: row.id,
+    decision_stage: CANDIDATE_REVIEW_STAGE,
+    snapshot_id: null,
+    current_quote_raw: null,
+    current_quote: null,
+    ip_judgement: null,
+    human_decision: humanDecision,
+    human_decision_label: HUMAN_DECISION_LABELS[humanDecision] ?? humanDecision,
+    decision_note: event.note ?? null,
+    historical_evidence: null,
+    recent_evidence: null,
+    pricing_evidence: null,
+    target_cpm: null,
+    pricing_version: null,
+    system_context_version: null,
+    created_at: event.created_at ?? null,
+    outcome: null,
+    negotiation_case: null,
+    // ---- Phase 3 新语义 ----
+    deprecated: true,
+    deprecated_message:
+      'candidate_review decision 已废弃：请改用 POST /api/creator-candidates/:id/work-state（本次请求已写入 candidate_work_state_events，未写入 creator_decisions）',
+    work_state: workState.state,
+    work_state_event: {
+      id: event.id,
+      candidate_id: event.candidate_id,
+      state: event.state,
+      note: event.note ?? null,
+      created_at: event.created_at ?? null
+    }
+  })
 })
 
 /**

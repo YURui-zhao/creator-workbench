@@ -205,9 +205,22 @@ async function main() {
     console.log('\n===== 7. 兼容 / 无推荐字段 =====')
     check('response 无 recommendation_score / should_invest', !/recommendation_score|should_invest|recommended_price|similarity/.test(JSON.stringify(forged.body)))
     const reviewStillWorks = await callRoute(createReviewDecision, { params: { id: String(candMain.id) }, body: { human_decision: 'contact' } })
-    check('Phase 4B candidate_review 决策仍可用', reviewStillWorks.status === 200 && reviewStillWorks.data?.decision_stage === 'candidate_review')
+    // Phase 3：candidate_review 不再写入 creator_decisions。
+    // 本 fixture 未执行 Phase 1 migration（无 candidate_work_state_events）→ 服务端明确 503 降级；
+    // 迁移后的库则会写入 work state event（deprecated shim）。两种情况都绝不再新增 decision 行。
+    check(
+      'Phase 3：candidate_review 不再写入 creator_decisions（未迁移库 → 503 明确降级）',
+      reviewStillWorks.status === 503 ||
+        (reviewStillWorks.status === 200 && reviewStillWorks.data?.deprecated === true),
+      `status=${reviewStillWorks.status}`
+    )
     const all = await callRoute(listDecisions, { params: { id: String(candMain.id) } })
-    check('GET /:id/decisions 统一返回两种 stage', new Set(all.data.decisions.map((x) => x.decision_stage)).size >= 2)
+    check(
+      'GET /:id/decisions 只返回真实业务决策（post_quote；candidate_review 不再进入该表）',
+      all.data.decisions.length >= 1 && all.data.decisions.every((x) => x.decision_stage === 'post_quote')
+    )
+    check('creator_decisions 中 candidate_review 行数为 0',
+      db.prepare("SELECT COUNT(*) AS n FROM creator_decisions WHERE candidate_id = ? AND decision_stage = 'candidate_review'").get(candMain.id).n === 0)
     check('未发生任何外部网络请求', blocked.length === 0, JSON.stringify(blocked))
     check('隔离库位于临时目录', process.env.WORKBENCH_DB_PATH.startsWith(os.tmpdir()))
   } finally {

@@ -62,10 +62,10 @@ function main() {
   check(
     '候选 API 模块未新增重复接口',
     JSON.stringify(apiExports) === JSON.stringify([
-      'createCandidateDecision', 'createCandidatePostQuoteDecision', 'createCreatorCandidate',
-      'getCandidateLatestSnapshot', 'getCandidatePriceReference', 'getCreatorCandidate',
-      'listCandidateDecisions', 'listCreatorCandidates', 'saveCandidateRecentSnapshot',
-      'updateCreatorCandidate'
+      'createCandidateDecision', 'createCandidatePostQuoteDecision', 'createCandidateWorkState',
+      'createCreatorCandidate', 'getCandidateLatestSnapshot', 'getCandidatePriceReference',
+      'getCreatorCandidate', 'listCandidateDecisions', 'listCreatorCandidates',
+      'saveCandidateRecentSnapshot', 'updateCreatorCandidate'
     ].sort()),
     JSON.stringify(apiExports)
   )
@@ -130,23 +130,29 @@ function main() {
   check('高播放标签只消费 Rule Engine（assessment.highPlaySignal.label）', /assessment\.highPlaySignal\.label/.test(page))
   check('估价说明只消费 Rule Engine（页面不自行拼装商单/日常文案）', /assessment\.estimate\.explanation/.test(page) && !/商单样本仅/.test(page))
 
-  console.log('\n===== 9. 当前处理 / Work State（Phase 4B 之上的 IA 收敛） =====')
-  check('页面调用 candidate decision API', /createCandidateDecision\(selected\.id,/.test(page) && /listCandidateDecisions\(candidateId\)/.test(page))
-  // Work State 三选一：contact → 推进中 / observe → 观察中 / hold → 暂缓池（纯函数来自 utils/creatorWorkState.js）
+  console.log('\n===== 9. 当前处理 / Work State（Phase 3：写入 candidate_work_state_events） =====')
+  check(
+    '页面用 work-state 写入 API（不再创建 candidate_review decision）',
+    /createCandidateWorkState\(selected\.id,/.test(page) && !/createCandidateDecision\(selected\.id,/.test(page)
+  )
+  check('页面仍按需读取 decisions（当前合作 / 已关联合作记录用，不用于 Work State）',
+    /listCandidateDecisions\(candidateId\)/.test(page))
+  // Work State 三选一：服务端 state advancing / observing / paused → 推进中 / 观察中 / 暂缓池
   check(
     '三个工作状态按钮（推进中 / 观察中 / 暂缓池）',
     /推进中/.test(page) && /观察中/.test(page) && /暂缓池/.test(page) && /WORK_STATE_OPTIONS\.map/.test(page)
   )
   check(
-    '三个状态按钮只消费 Work State 派生值（不在页面本地重算 candidate_review 语义）',
+    '三个状态按钮只消费服务端 Work State（不在页面本地派生 candidate_review）',
     /currentWorkState\.value === option\.value/.test(page) &&
-      /deriveWorkState\(decisions\)/.test(page) &&
-      !/CANDIDATE_REVIEW_OPTIONS/.test(page)
+      /workStateOf\(selected\)/.test(page) &&
+      !/deriveWorkState|CANDIDATE_REVIEW_OPTIONS/.test(page)
   )
   check('无默认选中（pendingDecision 初始为 null，且按钮由点击显式发起）', /useState\(null\)[\s\S]{0,40}pendingDecision|const \[pendingDecision, setPendingDecision\] = useState\(null\)/.test(page) && /onClick=\{\(\) => openDecision\(option\)\}/.test(page))
-  check('轻量确认 Modal：你选择 / 决策备注 / 记录决定', /你选择：/.test(page) && /决策备注（可选）/.test(page) && /okText="记录决定"/.test(page))
-  check('状态备注展示最新 candidate_review.decision_note', /状态备注：/.test(page) && /currentWorkState\.note/.test(page))
-  check('多条历史可折叠查看（只统计 candidate_review）', /查看历史决定（/.test(page) && /historyExpanded/.test(page) && /reviewDecisions\.slice\(1\)/.test(page))
+  check('轻量确认 Modal：你选择 / 状态备注 / 记录决定', /你选择：/.test(page) && /决策备注（可选）/.test(page) && /okText="记录决定"/.test(page))
+  check('状态备注展示服务端 work_state_note', /状态备注：/.test(page) && /work_state_note/.test(page) && /currentWorkState\.note/.test(page))
+  check('多条历史可折叠查看（来自服务端 work_state_history）',
+    /查看历史记录（/.test(page) && /historyExpanded/.test(page) && /workStateHistory\.slice\(1\)/.test(page))
   check('决定文案单一来源（消费 human_decision_label，不本地映射）', /human_decision_label/.test(page) && !/contact:\s*'继续联系'/.test(page))
   check('页面不做推荐 / 不自动选择 / 不出现评分字段', !/shouldInvest|recommendation_score|推荐决定|建议选择/.test(page))
 

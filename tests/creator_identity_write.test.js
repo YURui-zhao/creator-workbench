@@ -407,10 +407,15 @@ async function main() {
       body: { name: '带简介', creator_id: profileCreator, description: '作者简介X' }
     })
     check(
-      '显式 creator_id 创建时提供的 profile 写入 Creator 权威且 candidate mirror 同值',
+      '显式 creator_id 创建 workflow 不修改 Creator Profile（description 保持权威值）+ mirror 与权威一致',
       explicitProfile.status === 200 &&
-        q1('SELECT description FROM creators WHERE id = ?', profileCreator).description === '作者简介X' &&
-        q1('SELECT description FROM creator_candidates WHERE id = ?', explicitProfile.data.id).description === '作者简介X'
+        q1('SELECT description FROM creators WHERE id = ?', profileCreator).description === null &&
+        q1('SELECT description FROM creator_candidates WHERE id = ?', explicitProfile.data.id).description === null
+    )
+    check(
+      '被忽略的 profile 字段在响应中显式上报（不静默丢弃请求值）',
+      Array.isArray(explicitProfile.body?.ignored_profile_fields) &&
+        explicitProfile.body.ignored_profile_fields.includes('description')
     )
 
     console.log('\n===== 7. Recent Snapshot 归属 =====')

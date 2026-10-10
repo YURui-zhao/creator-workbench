@@ -315,6 +315,159 @@ async function main() {
         creatorOf(candCreatorId).canonical_name === canonicalBefore
     )
 
+    console.log('\n===== §1 Explicit Workflow Creation：不得反向修改已有 Creator Profile =====')
+    // fixture：一个拥有完整权威 profile 的 Creator（用 implicit 创建初始化，再归档以便继续开新 workflow）
+    const seed = await call(createCandidate, {
+      body: {
+        name: '权威达人',
+        description: 'authoritative',
+        creator_type: '历史',
+        profile_url: 'creator-url',
+        xingtu_id: 'creator-id',
+        xingtu_url: 'https://xingtu.example.com/creator',
+        distilled_description: 'creator-distilled'
+      }
+    })
+    const AUTH = candidateOf(seed.data.id).creator_id
+    await call(patchCandidate, { params: { id: String(seed.data.id) }, body: { status: 'archived' } })
+    const authBefore = creatorOf(AUTH)
+    const authSnapshot = () => {
+      const c = creatorOf(AUTH)
+      return PROFILE_FIELDS.map((f) => `${f}=${JSON.stringify(c[f] ?? null)}`).join('|')
+    }
+    const authAtStart = authSnapshot()
+    check(
+      'fixture：Creator 权威 profile 已完整（6 字段非空）',
+      PROFILE_FIELDS.every((f) => (authBefore[f] ?? null) !== null),
+      authAtStart
+    )
+
+    // Case A：不传 profile → Creator 完全不变，mirror == Creator
+    const caseAThen = await call(createCandidate, {
+      body: { name: 'A 新 workflow', creator_id: AUTH }
+    })
+    check(
+      'Case A：explicit creator_id + 不传 profile → Creator 完全不变，mirror == Creator',
+      caseAThen.status === 200 &&
+        authSnapshot() === authAtStart &&
+        mirrorDiff(caseAThen.data.id).length === 0 &&
+        candidateOf(caseAThen.data.id).description === 'authoritative'
+    )
+    check('Case A：无被忽略字段时不额外返回 ignored_profile_fields', caseAThen.body?.ignored_profile_fields === undefined)
+    await call(patchCandidate, { params: { id: String(caseAThen.data.id) }, body: { status: 'archived' } })
+
+    // Case B：description = "" → 不得清空 Creator 权威
+    const caseBThen = await call(createCandidate, {
+      body: { name: 'B 新 workflow', creator_id: AUTH, description: '' }
+    })
+    check(
+      'Case B：explicit + description="" → Creator 不得被清空（与 PATCH 的清空语义区分：这是创建 workflow）',
+      caseBThen.status === 200 &&
+        creatorOf(AUTH).description === 'authoritative' &&
+        authSnapshot() === authAtStart &&
+        mirrorDiff(caseBThen.data.id).length === 0
+    )
+    await call(patchCandidate, { params: { id: String(caseBThen.data.id) }, body: { status: 'archived' } })
+
+    // Case C：stale candidate value → 不得覆盖 Creator
+    const caseCThen = await call(createCandidate, {
+      body: { name: 'C 新 workflow', creator_id: AUTH, description: 'stale candidate value' }
+    })
+    check(
+      'Case C：explicit + stale description → Creator 权威不被覆盖，mirror 仍等于权威',
+      caseCThen.status === 200 &&
+        creatorOf(AUTH).description === 'authoritative' &&
+        candidateOf(caseCThen.data.id).description === 'authoritative' &&
+        mirrorDiff(caseCThen.data.id).length === 0
+    )
+    check(
+      'Case C：被忽略字段上报（description）',
+      (caseCThen.body?.ignored_profile_fields || []).includes('description')
+    )
+    await call(patchCandidate, { params: { id: String(caseCThen.data.id) }, body: { status: 'archived' } })
+
+    // Case D：四个 profile 字段全部给出不同值 → Creator 一律不被改写
+    const caseDThen = await call(createCandidate, {
+      body: {
+        name: 'D 新 workflow',
+        creator_id: AUTH,
+        creator_type: '完全不同的类型',
+        profile_url: 'different-url',
+        xingtu_id: 'different-id',
+        xingtu_url: 'https://xingtu.example.com/different'
+      }
+    })
+    check(
+      'Case D：explicit + creator_type/profile_url/xingtu_id/xingtu_url 全不同 → Creator 一个字段都没被改写',
+      caseDThen.status === 200 &&
+        authSnapshot() === authAtStart &&
+        mirrorDiff(caseDThen.data.id).length === 0 &&
+        candidateOf(caseDThen.data.id).creator_type === '历史' &&
+        candidateOf(caseDThen.data.id).xingtu_id === 'creator-id'
+    )
+    check(
+      'Case D：四个冲突字段全部上报为 ignored',
+      ['creator_type', 'profile_url', 'xingtu_id', 'xingtu_url'].every((f) =>
+        (caseDThen.body?.ignored_profile_fields || []).includes(f)
+      )
+    )
+    await call(patchCandidate, { params: { id: String(caseDThen.data.id) }, body: { status: 'archived' } })
+
+    // Case E：candidate 创建失败 → Creator 完全不变
+    db.exec(
+      `CREATE TRIGGER inject_explicit_cand_fail BEFORE INSERT ON creator_candidates
+       WHEN NEW.name = '__INJECT_CAND_FAIL__'
+       BEGIN SELECT RAISE(ABORT, 'injected explicit candidate failure'); END`
+    )
+    const caseEThen = await call(createCandidate, {
+      body: { name: '__INJECT_CAND_FAIL__', creator_id: AUTH, description: 'should-not-land' }
+    })
+    check(
+      'Case E：创建 workflow 失败 → Creator 完全不变（含 profile 与 updated_at 语义）',
+      caseEThen.status !== 200 &&
+        authSnapshot() === authAtStart &&
+        q1("SELECT COUNT(*) AS n FROM creator_candidates WHERE name = '__INJECT_CAND_FAIL__'").n === 0
+    )
+    db.exec('DROP TRIGGER inject_explicit_cand_fail')
+
+    // Case F：implicit（无 creator_id）仍以 request profile 初始化**新生** Creator
+    const caseFThen = await call(createCandidate, {
+      body: { name: 'F 全新人物', description: 'F-desc', creator_type: 'F-type' }
+    })
+    const FID = candidateOf(caseFThen.data.id).creator_id
+    check(
+      'Case F：implicit 创建 → request profile 初始化新 Creator + mirror 一致（新人物语义保留）',
+      caseFThen.status === 200 &&
+        creatorOf(FID).description === 'F-desc' &&
+        creatorOf(FID).creator_type === 'F-type' &&
+        candidateOf(caseFThen.data.id).description === 'F-desc' &&
+        mirrorDiff(caseFThen.data.id).length === 0
+    )
+    check('Case F：implicit 路径不产生 ignored_profile_fields', caseFThen.body?.ignored_profile_fields === undefined)
+
+    // Case G：契约边界（merged / missing / active duplicate）→ 保持上一轮契约且不改 Creator
+    const mergedForG = db
+      .prepare("INSERT INTO creators (canonical_name, identity_status, merged_into_creator_id) VALUES ('G墓碑','merged',?)")
+      .run(AUTH).lastInsertRowid
+    const gMerged = await call(createCandidate, { body: { name: 'G1', creator_id: mergedForG, description: 'x' } })
+    const gMissing = await call(createCandidate, { body: { name: 'G2', creator_id: 888888, description: 'x' } })
+    const gActive = await call(createCandidate, { body: { name: 'G3 占位 workflow', creator_id: AUTH } })
+    const gDup = await call(createCandidate, { body: { name: 'G4 重复 workflow', creator_id: AUTH, description: 'x' } })
+    check(
+      'Case G：merged → 400 reason=merged；missing → 400 reason=not_found；active duplicate → 409',
+      gMerged.status === 400 &&
+        gMerged.data?.creator_identity?.reason === 'merged' &&
+        gMissing.status === 400 &&
+        gMissing.data?.creator_identity?.reason === 'not_found' &&
+        gActive.status === 200 &&
+        gDup.status === 409
+    )
+    check(
+      'Case G：三种边界都不修改 Creator（仍是开始时那 6 个权威值）',
+      authSnapshot() === authAtStart && creatorOf(AUTH).description === 'authoritative'
+    )
+    await call(patchCandidate, { params: { id: String(gActive.data.id) }, body: { status: 'archived' } })
+
     console.log('\n===== §2b Authority Guard：归属锚不可写时必须拒绝（不产生单边写入） =====')
     // merged 墓碑：FK 拦不住，必须由应用层拒绝（绝不把 profile 写到墓碑上）
     const tombstoneTarget = q1("SELECT id FROM creators WHERE canonical_name = '权威甲'").id
@@ -404,23 +557,23 @@ async function main() {
       candidateOf(candId).description === beforeA.candDesc && mirrorDiff(candId).length === 0
     )
 
-    // Case B：candidate mirror 写入失败（Creator 权威已先写）→ 整体回滚
-    const injectCreator = (await call(createRecord, { body: recordRow('注入目标达人') })).data.id
-    const injectCreatorId = q1('SELECT creator_id FROM creator_records WHERE id = ?', injectCreator).creator_id
-    const beforeB = creatorOf(injectCreatorId).description
+    // Case B：implicit 创建时 candidate 写入失败 → 同一事务里刚建的 provisional Creator 必须一起回滚
+    // （显式复用路径已不写 Creator，因此用 implicit 路径验证「Creator + candidate 原子」）
+    const creatorsBeforeB = q1('SELECT COUNT(*) AS n FROM creators').n
     db.exec(
       `CREATE TRIGGER inject_candidate_insert_fail BEFORE INSERT ON creator_candidates
        WHEN NEW.description = '__INJECT_MIRROR_FAIL__'
        BEGIN SELECT RAISE(ABORT, 'injected candidate insert failure'); END`
     )
     const caseB = await call(createCandidate, {
-      body: { name: '注入候选', creator_id: injectCreatorId, description: '__INJECT_MIRROR_FAIL__' }
+      body: { name: '注入候选', description: '__INJECT_MIRROR_FAIL__' }
     })
     check(
-      'Case B：candidate 镜像写入失败 → Creator 权威写入同时回滚（不出现单边成功）',
+      'Case B：candidate 写入失败 → 同事务新建的 provisional Creator 一起回滚（不留孤儿 Creator）',
       caseB.status !== 200 &&
-        creatorOf(injectCreatorId).description === beforeB &&
-        q1('SELECT COUNT(*) AS n FROM creator_candidates WHERE creator_id = ?', injectCreatorId).n === 0,
+        q1('SELECT COUNT(*) AS n FROM creators').n === creatorsBeforeB &&
+        q1("SELECT COUNT(*) AS n FROM creators WHERE canonical_name = '注入候选'").n === 0 &&
+        q1("SELECT COUNT(*) AS n FROM creator_aliases WHERE alias_normalized = '注入候选'").n === 0,
       `status=${caseB.status} threw=${caseB.threw}`
     )
     db.exec('DROP TRIGGER inject_candidate_insert_fail')
@@ -618,12 +771,43 @@ async function main() {
     const backendSources = sourceFiles(BACKEND_DIR).filter((f) => !f.includes(path.join('backend', 'migrations')))
     const read = (f) => fs.readFileSync(f, 'utf8')
     const rel = (f) => path.relative(REPO_ROOT, f)
+    // 源码守卫必须只看「代码」，不看注释：否则一句说明文字就能让守卫误报 / 漏报
+    const stripComments = (src) =>
+      src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:\w])\/\/[^\n]*/g, '$1')
 
     const creatorsUpdateWriters = backendSources.filter((f) => /UPDATE\s+creators\s+SET/i.test(read(f))).map(rel)
     check(
       'UPDATE creators SET 只出现在 creatorCandidates.js（唯一权威写入口）',
       creatorsUpdateWriters.length === 1 && creatorsUpdateWriters[0].endsWith('routes/creatorCandidates.js'),
       JSON.stringify(creatorsUpdateWriters)
+    )
+    // 源码级守卫（§6）：Creator 权威写入只允许存在于 PATCH 路径。
+    // 若未来有人在 candidate 创建路径重新引入 Creator 写入，这里会立刻变红。
+    const candidateRaw = read(path.join(BACKEND_DIR, 'routes/creatorCandidates.js'))
+    const candidateSource = stripComments(candidateRaw)
+    const creatorUpdateStatements = candidateSource.match(/UPDATE\s+creators\s+SET/g) || []
+    check(
+      '源码级守卫：creatorCandidates.js 中 UPDATE creators SET 恰好 1 处（PATCH 权威路径）',
+      creatorUpdateStatements.length === 1,
+      `count=${creatorUpdateStatements.length}`
+    )
+    // 定位用「原始源码」（区间工具在注释行上），再对切片去注释
+    const createStart = candidateRaw.indexOf("router.post('/',")
+    const createEnd = candidateRaw.indexOf('GET /api/creator-candidates?status=')
+    const createHandlerSource = createStart >= 0 && createEnd > createStart
+      ? stripComments(candidateRaw.slice(createStart, createEnd))
+      : ''
+    // 切片必须真的包含 create handler（否则空切片会让下面的断言“假通过”）
+    check(
+      '源码级守卫：已正确定位 candidate 创建 handler 源码区间',
+      createHandlerSource.includes('explicitProvided') &&
+        createHandlerSource.includes('createProvisionalCreator(') &&
+        createHandlerSource.includes('INSERT INTO creator_candidates')
+    )
+    check(
+      '源码级守卫：candidate 创建 handler 内不出现任何 Creator 写入语句（UPDATE / 裸 INSERT）',
+      !/UPDATE\s+creators\s+SET/i.test(createHandlerSource) &&
+        !/INSERT\s+INTO\s+creators/i.test(createHandlerSource)
     )
     const candidatesUpdateWriters = backendSources
       .filter((f) => /UPDATE\s+creator_candidates\s+SET/i.test(read(f)))

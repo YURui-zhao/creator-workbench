@@ -342,6 +342,8 @@ router.post('/', (req, res) => {
   // ① 归属锚：显式 creator_id 复用 / 否则新建 provisional Creator
   let creatorId = null
   let profileValues = providedProfile
+  // 显式复用已有 Creator 时，被忽略的 profile 字段（绝不静默覆盖 Creator 权威）
+  let ignoredProfileFields = []
   const explicitProvided =
     body.creator_id !== undefined && body.creator_id !== null && String(body.creator_id).trim() !== ''
   if (explicitProvided) {
@@ -362,18 +364,26 @@ router.post('/', (req, res) => {
       )
     }
     creatorId = explicit.creatorId
-    // candidate mirror：请求提供的值优先，未提供则继承 Creator 当前 profile（保持 mirror 一致）
-    const mirror = loadCreatorProfile(creatorId) || {}
+    // 冻结语义：创建 workflow ≠ 编辑 Creator Profile。
+    // 复用已有 Creator 时，candidate mirror 一律从 Creator 权威读回；
+    // 请求里的 profile 字段绝不写回 Creator（要改资料请走正式路径 PATCH /api/creator-candidates/:id）。
+    const authoritative = loadCreatorProfile(creatorId) || {}
     profileValues = {}
     for (const field of CREATOR_PROFILE_FIELDS) {
-      const provided = providedProfile[field]
-      profileValues[field] = provided === null || provided === undefined ? mirror[field] ?? null : provided
+      profileValues[field] = authoritative[field] ?? null
     }
+    // 与权威不同且明确提供的字段 → 忽略，并在响应中上报（可观测，不静默）
+    ignoredProfileFields = CREATOR_PROFILE_FIELDS.filter((field) => {
+      const provided = providedProfile[field]
+      if (provided === null || provided === undefined) return false
+      return provided !== (authoritative[field] ?? null)
+    })
   }
 
   const writeCandidate = db.transaction(() => {
     if (creatorId === null) {
-      // 未指定 creator_id：strict name 相同也绝不自动确认 → 建新的 provisional Creator
+      // 未指定 creator_id：这是新人物 → strict name 相同也绝不自动确认 → 建新的 provisional Creator，
+      // 并用 request profile 初始化这个**新生** Creator（不是覆盖已有权威）
       const created = createProvisionalCreator(db, {
         name,
         creatorType,
@@ -387,18 +397,8 @@ router.post('/', (req, res) => {
         }
       })
       creatorId = created.id
-    } else {
-      // 显式复用：把请求里明确提供的 profile 写入 Creator 权威（绝不覆盖未提供字段）
-      const providedFields = CREATOR_PROFILE_FIELDS.filter(
-        (field) => providedProfile[field] !== null && providedProfile[field] !== undefined
-      )
-      if (providedFields.length) {
-        const sets = providedFields.map((field) => `${field} = ?`)
-        db.prepare(
-          `UPDATE creators SET ${sets.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-        ).run(...providedFields.map((field) => providedProfile[field]), creatorId)
-      }
     }
+    // 显式复用分支绝不 UPDATE creators —— workflow creation 不是 Creator Profile 编辑
     // candidate 行：profile 列 = mirror（与 Creator 权威同值，绝不 divergence）
     const info = db
       .prepare(
@@ -430,7 +430,17 @@ router.post('/', (req, res) => {
     throw error
   }
 
-  ok(res, toPublicCandidate(findCandidateRow(newId)))
+  const created = toPublicCandidate(findCandidateRow(newId))
+  if (ignoredProfileFields.length) {
+    // 可观测：这些请求字段被忽略（以 Creator 权威为准），要改资料请用 PATCH
+    return res.json({
+      code: 200,
+      data: created,
+      msg: 'success',
+      ignored_profile_fields: ignoredProfileFields
+    })
+  }
+  ok(res, created)
 })
 
 /**

@@ -1,33 +1,21 @@
 import { useEffect, useMemo, useState } from 'react'
-import {
-  Alert,
-  Button,
-  Checkbox,
-  DatePicker,
-  Divider,
-  Input,
-  Modal,
-  Space,
-  Tag,
-  Typography,
-  message
-} from 'antd'
+import { Alert, Button, DatePicker, Divider, Input, Modal, Space, Tag, Typography, message } from 'antd'
 import dayjs from 'dayjs'
 import { createHistoricalNegotiationCase } from '../api/creatorNegotiationCases'
-import { harvestNegotiationExperience } from '../api/ai'
+import NegotiationExperienceForm from './NegotiationExperienceForm.jsx'
 import { getErrorMessage } from '../utils/request'
 import { calcCpm } from '../utils/calc'
 import { formatCpm, formatMoney, formatPlays } from '../utils/format'
 import { isValidDateOnly, todayLocalDateOnly } from '../utils/recentPerformanceSave.js'
 import {
   NEGOTIATION_REASON_TAG_LABELS,
-  NEGOTIATION_REASON_TAGS,
   formatChangePercent,
-  formatQuoteChange
 } from '../utils/negotiationCaseDisplay.js'
 
 const rowStyle = { display: 'flex', justifyContent: 'space-between', gap: 12 }
-const MAX_SOURCE_NOTE_LENGTH = 2000
+
+// 谈价经验（共享领域结构）的空白初值
+const EMPTY_EXPERIENCE = { sourceNote: '', reasonTags: [], reasonNote: '', strategyNote: '' }
 
 function readOnlyRows(record) {
   const latest =
@@ -66,13 +54,8 @@ export default function HistoricalNegotiationCaseModal({
   const [quoteRaw, setQuoteRaw] = useState('')
   const [priceRaw, setPriceRaw] = useState('')
   const [negotiatedAt, setNegotiatedAt] = useState(() => todayLocalDateOnly())
-  const [sourceNote, setSourceNote] = useState('')
-  const [reasonTags, setReasonTags] = useState([])
-  const [reasonNote, setReasonNote] = useState('')
-  const [strategyNote, setStrategyNote] = useState('')
-  const [aiSuggestion, setAiSuggestion] = useState(null)
-  const [aiLoading, setAiLoading] = useState(false)
-  const [aiError, setAiError] = useState('')
+  // 谈价经验（共享领域结构）：source_note / reason_tags / reason_note / strategy_note
+  const [experience, setExperience] = useState(() => EMPTY_EXPERIENCE)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
 
@@ -84,46 +67,12 @@ export default function HistoricalNegotiationCaseModal({
     setQuoteRaw('')
     setPriceRaw('')
     setNegotiatedAt(todayLocalDateOnly())
-    setSourceNote('')
-    setReasonTags([])
-    setReasonNote('')
-    setStrategyNote('')
-    setAiSuggestion(null)
-    setAiError('')
+    setExperience(EMPTY_EXPERIENCE)
     setError('')
   }, [open, record?.id])
 
   const contextRows = useMemo(() => readOnlyRows(record), [record])
-  const canSave =
-    !isReadOnly && priceRaw.trim() !== '' && isValidDateOnly(negotiatedAt) && !saving && !aiLoading
-
-  const handleHarvest = async () => {
-    if (!sourceNote.trim()) {
-      setAiError('请先填写历史谈价原始备注，再让 AI 整理')
-      return
-    }
-    setAiLoading(true)
-    setAiError('')
-    try {
-      // 只发送 source_note（数据最小化）；AI 输出仅作为建议，不写库
-      const res = await harvestNegotiationExperience(sourceNote.trim())
-      setAiSuggestion(res?.data || null)
-    } catch (err) {
-      setAiError(getErrorMessage(err, 'AI 整理失败，可继续人工填写并保存'))
-    } finally {
-      setAiLoading(false)
-    }
-  }
-
-  const applySuggestion = () => {
-    if (!aiSuggestion) return
-    setReasonTags(aiSuggestion.reason_tags || [])
-    setReasonNote(aiSuggestion.reason_note || '')
-    setStrategyNote(aiSuggestion.strategy_note || '')
-    setAiSuggestion(null)
-    // AI 建议只是写入当前表单（尚未持久化）；历史谈价案例仍需用户显式保存
-    message.success('已应用到表单，保存历史谈价案例后才会写入系统。')
-  }
+  const canSave = !isReadOnly && priceRaw.trim() !== '' && isValidDateOnly(negotiatedAt) && !saving
 
   const handleSave = async () => {
     if (!canSave) return
@@ -136,10 +85,10 @@ export default function HistoricalNegotiationCaseModal({
         negotiated_at: negotiatedAt,
         xingtu_price_snapshot: xingtuRaw.trim() || null,
         current_quote_snapshot: quoteRaw.trim() || null,
-        source_note: sourceNote.trim() || null,
-        reason_tags: reasonTags,
-        reason_note: reasonNote ? reasonNote : null,
-        strategy_note: strategyNote ? strategyNote : null
+        source_note: experience.sourceNote.trim() || null,
+        reason_tags: experience.reasonTags,
+        reason_note: experience.reasonNote ? experience.reasonNote : null,
+        strategy_note: experience.strategyNote ? experience.strategyNote : null
       })
       message.success('历史谈价案例已补录')
       onSaved?.(res?.data || null)
@@ -347,106 +296,17 @@ export default function HistoricalNegotiationCaseModal({
           </div>
         </div>
 
-        <div>
-          <Typography.Text type="secondary">历史谈价原始备注（可选）</Typography.Text>
-          <Input.TextArea
-            value={sourceNote}
-            rows={4}
-            maxLength={MAX_SOURCE_NOTE_LENGTH}
-            showCount
-            placeholder="可粘贴当时的聊天摘要 / 备注 / 有证据的回忆，例如：达人最开始报价5000，我先没有急着回复，后面以预算有限+后续合作预期继续谈，最后口头确认4500。"
-            onChange={(event) => setSourceNote(event.target.value)}
-          />
-          <div style={{ marginTop: 6 }}>
-            <Button size="small" loading={aiLoading} disabled={isReadOnly} onClick={handleHarvest}>
-              AI整理谈价经验
-            </Button>
-            <Typography.Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>
-              可选；只发送这段原始备注，结果仅作建议，需你确认后才填入
+        {/* 谈价经验（共享领域表单：source_note / AI整理 / 原因标签 / 补充说明 / 依据过程） */}
+        <NegotiationExperienceForm
+          value={experience}
+          onChange={setExperience}
+          saveLabel="历史谈价案例"
+          hint={
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              谈价原始备注由人工维护；AI 整理只在点击后调用，结果仅作建议。
             </Typography.Text>
-          </div>
-          {aiError && (
-            <Alert type="warning" showIcon style={{ marginTop: 6 }} message={aiError} />
-          )}
-          {aiSuggestion && (
-            <div
-              style={{ marginTop: 8, border: '1px solid #f0f0f0', borderRadius: 8, padding: 10 }}
-            >
-              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                AI整理建议（尚未保存）
-              </Typography.Text>
-              <Space direction="vertical" size={4} style={{ display: 'flex', marginTop: 6 }}>
-                <div style={rowStyle}>
-                  <Typography.Text type="secondary">建议原因标签</Typography.Text>
-                  <Typography.Text>
-                    {(aiSuggestion.reason_tags || []).length
-                      ? aiSuggestion.reason_tags
-                          .map((tag) => NEGOTIATION_REASON_TAG_LABELS[tag] || tag)
-                          .join('、')
-                      : '无'}
-                  </Typography.Text>
-                </div>
-                <div style={rowStyle}>
-                  <Typography.Text type="secondary">建议补充说明</Typography.Text>
-                  <Typography.Text>{aiSuggestion.reason_note || '无'}</Typography.Text>
-                </div>
-                <div style={rowStyle}>
-                  <Typography.Text type="secondary">建议谈价依据 / 过程</Typography.Text>
-                  <Typography.Text>{aiSuggestion.strategy_note || '无'}</Typography.Text>
-                </div>
-              </Space>
-              <Space style={{ marginTop: 8 }}>
-                <Button size="small" type="primary" onClick={applySuggestion}>
-                  应用到表单
-                </Button>
-                <Button size="small" onClick={() => setAiSuggestion(null)}>
-                  放弃
-                </Button>
-              </Space>
-              <Typography.Text
-                type="secondary"
-                style={{ display: 'block', fontSize: 12, marginTop: 8 }}
-              >
-                应用到表单不会写入系统；保存历史谈价案例后才会持久化。
-              </Typography.Text>
-            </div>
-          )}
-        </div>
-
-        <div>
-          <Typography.Text type="secondary">谈价原因 / 背景（可选，可多选）</Typography.Text>
-          <div style={{ marginTop: 6 }}>
-            <Checkbox.Group value={reasonTags} onChange={(values) => setReasonTags(values)}>
-              <Space direction="vertical" size={4}>
-                {NEGOTIATION_REASON_TAGS.map((tag) => (
-                  <Checkbox key={tag.value} value={tag.value}>
-                    {tag.label}
-                  </Checkbox>
-                ))}
-              </Space>
-            </Checkbox.Group>
-          </div>
-        </div>
-
-        <div>
-          <Typography.Text type="secondary">补充说明（可选）</Typography.Text>
-          <Input.TextArea
-            value={reasonNote}
-            rows={2}
-            maxLength={500}
-            onChange={(event) => setReasonNote(event.target.value)}
-          />
-        </div>
-
-        <div>
-          <Typography.Text type="secondary">谈价依据 / 过程（可选）</Typography.Text>
-          <Input.TextArea
-            value={strategyNote}
-            rows={2}
-            maxLength={500}
-            onChange={(event) => setStrategyNote(event.target.value)}
-          />
-        </div>
+          }
+        />
 
         {error && <Alert type="error" showIcon message={error} />}
 

@@ -470,7 +470,7 @@ async function main() {
       rLive.payload?.data?.record_id === null &&
       rLive.payload?.data?.decision_id === legacyDecisionId
   )
-  // candidate 决策：post_quote + proceed 不可记录谈价（Phase 4F-B 规则保持）
+  // candidate 决策：Unification V0.2 允许报价阶段决策（proceed / small_test / pause）记录已发生谈价
   const candidateDecisionId = Number(
     db
       .prepare(
@@ -483,11 +483,39 @@ async function main() {
       .run().lastInsertRowid
   )
   const rLiveCandidate = call(postLive, {
-    body: { decision_id: candidateDecisionId, negotiated_price: 1800, negotiated_at: '2026-10-09' }
+    body: {
+      decision_id: candidateDecisionId,
+      negotiated_price: 1800,
+      negotiated_at: '2026-10-09',
+      // P0：retrofit（proceed）必须人工填写谈前报价
+      current_quote_snapshot: 2000
+    }
   })
   check(
-    '24：candidate proceed 仍不可记录 live 谈价（只允许 negotiate）',
-    rLiveCandidate.statusCode === 400 && /继续议价/.test(rLiveCandidate.payload?.msg || '')
+    '24：candidate proceed 可记录 live 谈价（V0.2：谈价可能在系统外完成）',
+    rLiveCandidate.statusCode === 200 &&
+      rLiveCandidate.payload?.data?.source_type === 'live' &&
+      rLiveCandidate.payload?.data?.record_id === null &&
+      rLiveCandidate.payload?.data?.current_quote_snapshot === 2000
+  )
+  // 但非报价阶段决策（candidate_review）仍不可挂谈价案例（不伪造报价阶段）
+  const reviewDecisionId = Number(
+    db
+      .prepare(
+        `INSERT INTO creator_decisions
+           (creator, candidate_id, decision_stage, snapshot_id, current_quote, human_decision,
+            historical_evidence_json, target_cpm, pricing_version, created_at)
+         VALUES ('候选达人', 1, 'candidate_review', NULL, NULL, 'contact',
+                 '{}', 30, 'candidate-review-v0.1', '2026-10-09 07:53:56')`
+      )
+      .run().lastInsertRowid
+  )
+  const rReviewDecision = call(postLive, {
+    body: { decision_id: reviewDecisionId, negotiated_price: 1800, negotiated_at: '2026-10-09' }
+  })
+  check(
+    '24b：candidate_review 决策仍不可挂谈价案例（不伪造报价阶段）',
+    rReviewDecision.statusCode === 400 && /已拿到报价/.test(rReviewDecision.payload?.msg || '')
   )
 
   // historical_backfill 与 live 可共存于同一张表
@@ -499,7 +527,7 @@ async function main() {
     .get().n
   check(
     '23b：同一张 creator_negotiation_cases 同时存在 live 与 historical_backfill',
-    historicalCount >= 6 && liveCount === 1 && countCases() === historicalCount + liveCount,
+    historicalCount >= 6 && liveCount >= 2 && countCases() === historicalCount + liveCount,
     `historical=${historicalCount} live=${liveCount}`
   )
 
@@ -541,11 +569,11 @@ async function main() {
       listByDecision.payload.data.cases.length === 1 &&
       listByDecision.payload.data.cases[0].decision_id === legacyDecisionId
   )
-  const historicalOnly = callGet({ source_type: 'live' })
+  const liveOnly = callGet({ source_type: 'live' })
   check(
-    '2b：source_type=live 只返回 1 条 live case',
-    historicalOnly.payload.data.cases.length === 1 &&
-      historicalOnly.payload.data.cases[0].decision_id === legacyDecisionId
+    '2b：source_type=live 只返回 live case（不含任何 historical_backfill）',
+    liveOnly.payload.data.cases.length === liveCount &&
+      liveOnly.payload.data.cases.every((item) => item.source_type === 'live')
   )
   check(
     '7：historical case 不需要 decision_id（record_id 存在、decision_id 为 null）',
@@ -570,6 +598,11 @@ async function main() {
     path.join(REPO_ROOT, 'frontend/src/components/HistoricalNegotiationCaseModal.jsx'),
     'utf8'
   )
+  // Unification V0.2：谈价经验（source_note / AI整理 / 原因标签 / 补充说明 / 依据过程）已抽到共享组件
+  const sharedFormSrc = fs.readFileSync(
+    path.join(REPO_ROOT, 'frontend/src/components/NegotiationExperienceForm.jsx'),
+    'utf8'
+  )
   // 取某个组件内函数的函数体（简单花括号配对）
   const extractBody = (source, declaration) => {
     const start = source.indexOf(declaration)
@@ -587,20 +620,32 @@ async function main() {
     return ''
   }
 
-  check('1：不再出现误导性的「保存整理结果」', !modalSrc.includes('保存整理结果'))
-  check('2：AI 预览标题为「AI整理建议（尚未保存）」', modalSrc.includes('AI整理建议（尚未保存）'))
-  check('3：按钮文案为「应用到表单」', modalSrc.includes('应用到表单'))
-  check('3b：最终保存按钮明确叫「保存历史谈价案例」', modalSrc.includes('保存历史谈价案例'))
-
-  const applyBody = extractBody(modalSrc, 'const applySuggestion')
   check(
-    '4：应用到表单只写当前表单状态，不调用 historical backfill POST',
+    '1：不再出现误导性的「保存整理结果」',
+    !modalSrc.includes('保存整理结果') && !sharedFormSrc.includes('保存整理结果')
+  )
+  check('2：AI 预览标题为「AI整理建议（尚未保存）」', sharedFormSrc.includes('AI整理建议（尚未保存）'))
+  check('3：按钮文案为「应用到表单」', sharedFormSrc.includes('应用到表单'))
+  check('3b：最终保存按钮明确叫「保存历史谈价案例」', modalSrc.includes('保存历史谈价案例'))
+  check(
+    '3c：历史回填与候选 live 共用同一谈价经验组件（不复制两套 JSX）',
+    /<NegotiationExperienceForm/.test(modalSrc) &&
+      /<NegotiationExperienceForm/.test(
+        fs.readFileSync(path.join(REPO_ROOT, 'frontend/src/components/CandidateNegotiationExperienceModal.jsx'), 'utf8')
+      )
+  )
+
+  const applyBody = extractBody(sharedFormSrc, 'const applySuggestion')
+  check(
+    '4：应用到表单只写当前表单状态，不调用任何写入接口',
     Boolean(applyBody) &&
       !/createHistoricalNegotiationCase/.test(applyBody) &&
+      !/createNegotiationCase/.test(applyBody) &&
       !/request\.post/.test(applyBody) &&
-      /setReasonTags/.test(applyBody) &&
-      /setReasonNote/.test(applyBody) &&
-      /setStrategyNote/.test(applyBody)
+      /patch\(\{/.test(applyBody) &&
+      /reasonTags/.test(applyBody) &&
+      /reasonNote/.test(applyBody) &&
+      /strategyNote/.test(applyBody)
   )
 
   const modalApiCalls = modalSrc.match(/createHistoricalNegotiationCase\(/g) || []
@@ -611,8 +656,9 @@ async function main() {
   )
   check(
     '5b：应用 AI 建议后仍需最终保存（提示文案明确「保存历史谈价案例后才会写入系统」）',
-    modalSrc.includes('已应用到表单，保存历史谈价案例后才会写入系统。') &&
-      modalSrc.includes('应用到表单不会写入系统；保存历史谈价案例后才会持久化。')
+    /已应用到表单，保存\$\{saveLabel\}后才会写入系统。/.test(sharedFormSrc) &&
+      /应用到表单不会写入系统；保存\{saveLabel\}后才会持久化。/.test(sharedFormSrc) &&
+      /saveLabel="历史谈价案例"/.test(modalSrc)
   )
   check(
     '6：取消 / 关闭 Modal 不写 case（关闭路径不调用 POST，仅重置表单）',
@@ -621,8 +667,8 @@ async function main() {
   )
   check(
     '7：source_note 不被 AI 修改（建议只写入 reason_tags / reason_note / strategy_note）',
-    !/setSourceNote\(aiSuggestion/.test(modalSrc) &&
-      !/aiSuggestion\.source_note/.test(modalSrc) &&
+    !/sourceNote/.test(applyBody) &&
+      !/aiSuggestion\.source_note/.test(sharedFormSrc) &&
       !Object.prototype.hasOwnProperty.call(harvest, 'source_note')
   )
 

@@ -1024,10 +1024,66 @@ export function buildNegotiationHarvestSystemPrompt() {
 `
 }
 
-// 只把 source_note 作为用户输入发送（数据最小化：不发送 records / 其它达人 / decision / outcome）
-export function buildNegotiationHarvestUserText(sourceNote) {
-  return String(sourceNote ?? '')
+/**
+ * 组装 AI 输入（数据最小化）
+ *   · 必填：本次谈价原始备注 source_note
+ *   · 可选（仅当真实存在时才发送）：候选人人工备注 / 人工备注整理 / 相关决策备注
+ *   · 绝不发送 record 明细、其它达人、其它 negotiation case、outcome 或整库
+ * 兼容旧调用：传入字符串时等价于只发送 source_note。
+ */
+export function buildNegotiationHarvestUserText(input) {
+  if (typeof input === 'string') return input
+  const parts = []
+  const push = (label, value) => {
+    const text = typeof value === 'string' ? value.trim() : ''
+    if (text) parts.push(`【${label}】${text}`)
+  }
+  push('本次谈价原始备注', input?.sourceNote)
+  push('达人人工备注', input?.candidateDescription)
+  // distilled_description 是 AI 派生内容，不是人工 source of truth：
+  // 人工 description 存在时不再发送它，避免同一信息重复加权。
+  const hasDescription =
+    typeof input?.candidateDescription === 'string' && input.candidateDescription.trim() !== ''
+  if (!hasDescription) {
+    push('达人备注 AI 整理（AI 派生内容，非人工原始备注）', input?.distilledDescription)
+  }
+  push('相关决策备注', input?.decisionNote)
+  return parts.join('\n')
 }
+
+/**
+ * 记录本次实际发送给 AI 的来源（UI 只展示真实存在的来源）
+ *   · 人工 description 存在时不再包含 distilled_description（同源去重）
+ *   · distilled_description 只作为辅助来源，且 UI 标注为「达人备注AI整理」
+ */
+export function listNegotiationHarvestSources(input) {
+  if (typeof input === 'string') return input.trim() ? ['source_note'] : []
+  const sources = []
+  const has = (value) => typeof value === 'string' && value.trim() !== ''
+  if (has(input?.sourceNote)) sources.push('source_note')
+  if (has(input?.candidateDescription)) sources.push('candidate_description')
+  if (!has(input?.candidateDescription) && has(input?.distilledDescription)) {
+    sources.push('distilled_description')
+  }
+  if (has(input?.decisionNote)) sources.push('decision_note')
+  return sources
+}
+
+/**
+ * AI 整理是否具备可整理的人工内容（Context Reuse V0.2）
+ *   · 人工来源：谈价原始备注 / 达人人工备注 / 决策备注 —— 任一存在即可，不强制 source_note
+ *   · distilled_description 是 AI 派生内容，不算人工来源（不能单独作为整理依据）
+ */
+export function hasNegotiationHarvestSource(input) {
+  if (typeof input === 'string') return input.trim() !== ''
+  const has = (value) => typeof value === 'string' && value.trim() !== ''
+  return (
+    has(input?.sourceNote) || has(input?.candidateDescription) || has(input?.decisionNote)
+  )
+}
+
+export const NEGOTIATION_HARVEST_EMPTY_MSG =
+  '没有可整理的人工内容：谈价原始备注 / 达人人工备注 / 决策备注至少填写一项'
 
 /**
  * 解析 AI 返回：只接受 { reason_tags, reason_note, strategy_note }
@@ -1067,22 +1123,25 @@ export function parseNegotiationHarvestResult(content) {
 }
 
 /**
- * 整理历史谈价经验（可注入 callFn，便于测试完全离线）
- * @param {string} sourceNote 用户的历史谈价原始备注（唯一输入）
+ * 整理谈价经验（可注入 callFn，便于测试完全离线）
+ * @param {string|{sourceNote: string, candidateDescription?: string, distilledDescription?: string, decisionNote?: string}} input
+ *        本次谈价原始备注（必填）+ 真实存在的最小上下文
  * @param {Function} [callFn] 默认 callDeepSeek
  * @param {{ provider?: string, model?: string, apiKey?: string }} [options]
  */
 export async function harvestNegotiationExperience(
-  sourceNote,
+  input,
   callFn = callDeepSeek,
   options = {}
 ) {
   const content = await callFn(
     buildNegotiationHarvestSystemPrompt(),
-    buildNegotiationHarvestUserText(sourceNote),
+    buildNegotiationHarvestUserText(input),
     options
   )
-  return parseNegotiationHarvestResult(content)
+  // AI 输出仍然只有 reason_tags / reason_note / strategy_note（绝不产生价格事实）；
+  // sources 只用于 UI 展示「参考来源」。
+  return { ...parseNegotiationHarvestResult(content), sources: listNegotiationHarvestSources(input) }
 }
 
 /**
@@ -1094,12 +1153,45 @@ export async function harvestNegotiationExperience(
 router.post('/harvest-negotiation-experience', async (req, res) => {
   const body = req.body && !Array.isArray(req.body) ? req.body : {}
   const sourceNote = typeof body.source_note === 'string' ? body.source_note.trim() : ''
-  if (!sourceNote) return fail(res, 400, 'source_note 不能为空')
   if (sourceNote.length > MAX_NEGOTIATION_SOURCE_NOTE_LENGTH) {
     return fail(res, 400, `历史谈价原始备注长度不能超过 ${MAX_NEGOTIATION_SOURCE_NOTE_LENGTH}`)
   }
+  const readOptional = (value, label) => {
+    const text = typeof value === 'string' ? value.trim() : ''
+    if (text.length > MAX_NEGOTIATION_SOURCE_NOTE_LENGTH) {
+      return { error: `${label}长度不能超过 ${MAX_NEGOTIATION_SOURCE_NOTE_LENGTH}` }
+    }
+    return { text }
+  }
+  const candidateDescription = readOptional(body.candidate_description, '达人人工备注')
+  const distilledDescription = readOptional(body.distilled_description, '达人备注整理')
+  const decisionNote = readOptional(body.decision_note, '决策备注')
+  const optionalError =
+    candidateDescription.error || distilledDescription.error || decisionNote.error
+  if (optionalError) return fail(res, 400, optionalError)
+  // Context Reuse V0.2：不强制 source_note —— 只要存在任一人工来源即可整理；
+  // 全部为空（distilled 是 AI 派生，不算）才拒绝。
+  if (
+    !hasNegotiationHarvestSource({
+      sourceNote,
+      candidateDescription: candidateDescription.text,
+      decisionNote: decisionNote.text
+    })
+  ) {
+    return fail(res, 400, NEGOTIATION_HARVEST_EMPTY_MSG)
+  }
   try {
-    const result = await harvestNegotiationExperience(sourceNote, callDeepSeek, aiOptions(req))
+    // 只发送真实存在的最小上下文（candidate 备注 / 备注整理 / 相关决策备注）
+    const result = await harvestNegotiationExperience(
+      {
+        sourceNote,
+        candidateDescription: candidateDescription.text,
+        distilledDescription: distilledDescription.text,
+        decisionNote: decisionNote.text
+      },
+      callDeepSeek,
+      aiOptions(req)
+    )
     ok(res, result)
   } catch (err) {
     if (err instanceof DeepSeekError || err.isDeepSeekError) {

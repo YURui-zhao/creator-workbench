@@ -19,6 +19,9 @@ import { DEFAULT_PROVIDER, getAiConfig, getProviderPreset } from '../utils/aiCon
 
 const { Header, Sider, Content } = Layout
 
+// Persistent Sidebar：顶部导航高度（antd 默认 Header 高度，与下方 offset 保持一致）
+const HEADER_HEIGHT = 64
+
 const MENU_ITEMS = [
   { key: 'dashboard', icon: <BarChartOutlined />, label: '数据看板' },
   { key: 'creators', icon: <TeamOutlined />, label: '达人汇总' },
@@ -113,7 +116,7 @@ export default function MainLayout() {
   }
 
   return (
-    <Layout style={{ minHeight: '100vh' }}>
+    <Layout style={{ minHeight: '100vh', background: token.colorBgLayout }}>
       {/* 顶部导航栏 */}
       <Header
         style={{
@@ -123,9 +126,15 @@ export default function MainLayout() {
           background: token.colorBgContainer,
           padding: '0 24px',
           boxShadow: '0 1px 4px rgba(0, 21, 41, 0.08)',
-          position: 'sticky',
+          // 固定顶栏：始终留在 viewport 顶部（z-index 低于侧栏内的交互，但高于内容）
+          position: 'fixed',
           top: 0,
-          zIndex: 10
+          insetInlineStart: 0,
+          insetInlineEnd: 0,
+          width: '100%',
+          height: HEADER_HEIGHT,
+          lineHeight: `${HEADER_HEIGHT}px`,
+          zIndex: 20
         }}
       >
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -184,8 +193,8 @@ export default function MainLayout() {
         </Space>
       </Header>
 
-      <Layout>
-        {/* 左侧侧边栏：默认收起 80px，展开 200px */}
+      {/* Persistent Sidebar：固定左侧导航，主内容通过 offset 让位（不覆盖、不水平跳动） */}
+      <Layout style={{ marginTop: HEADER_HEIGHT }}>
         <Sider
           theme="dark"
           collapsible
@@ -194,6 +203,15 @@ export default function MainLayout() {
           width={200}
           collapsedWidth={80}
           trigger={null}
+          style={{
+            position: 'fixed',
+            insetInlineStart: 0,
+            top: HEADER_HEIGHT,
+            bottom: 0,
+            height: `calc(100vh - ${HEADER_HEIGHT}px)`,
+            overflow: 'auto',
+            zIndex: 15
+          }}
         >
           <Menu
             theme="dark"
@@ -201,12 +219,20 @@ export default function MainLayout() {
             selectedKeys={[selectedKey]}
             items={MENU_ITEMS}
             onClick={({ key }) => navigate(MENU_PATHS[key] || '/dashboard')}
-            style={{ borderInlineEnd: 'none' }}
+            style={{ borderInlineEnd: 'none', paddingBottom: 24 }}
           />
         </Sider>
 
-        {/* 主内容区：路由出口 */}
-        <Content style={{ padding: 24, background: token.colorBgLayout }}>
+        {/* 主内容区：路由出口（left offset 跟随 sidebar 收起 / 展开宽度） */}
+        <Content
+          style={{
+            padding: 24,
+            background: token.colorBgLayout,
+            marginInlineStart: collapsed ? 80 : 200,
+            minHeight: `calc(100vh - ${HEADER_HEIGHT}px)`,
+            transition: 'margin-inline-start 0.2s'
+          }}
+        >
           <Outlet />
         </Content>
       </Layout>

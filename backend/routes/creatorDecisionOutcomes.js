@@ -336,6 +336,29 @@ router.post('/:id/outcome', (req, res) => {
     return fail(res, 409, `投放记录 #${recordId} 已关联决策 #${existingForRecord.decision_id}，不能重复关联`)
   }
 
+  // Semantic Duplicate V0.2：同一真实事件不能被两种来源的谈价案例共同指向。
+  //   该决策已有 live case，且该投放记录已有 historical_backfill case
+  //   → 关联会把它俩连成同一次现实事件（Single Source of Truth 冲突）→ 409，绝不自动合并 / 删除。
+  const liveCaseForDecision = db
+    .prepare(
+      `SELECT id FROM creator_negotiation_cases
+       WHERE decision_id = ? AND source_type = 'live'`
+    )
+    .get(id)
+  const historicalCaseForRecord = db
+    .prepare(
+      `SELECT id FROM creator_negotiation_cases
+       WHERE record_id = ? AND source_type = 'historical_backfill'`
+    )
+    .get(recordId)
+  if (liveCaseForDecision && historicalCaseForRecord) {
+    return fail(
+      res,
+      409,
+      '该决策已有实时谈价案例，且该投放记录已有历史补录谈价案例；两者指向同一次真实谈价，请先确认保留哪一个来源（系统不会自动合并）。'
+    )
+  }
+
   if (timing.confirmationRequired && !timing.confirmationProvided) {
     return fail(
       res,

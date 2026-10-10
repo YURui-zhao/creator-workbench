@@ -78,12 +78,12 @@ export function extractCreatorScreenshot(images) {
 }
 
 /**
- * 人工备注 AI 整理（Phase 2.1）：只发送 description，遵循数据最小化
- * 入参：description（用户人工备注，唯一输入）
+ * 达人资料（人工观察）AI 整理（Phase 2.1）：只发送 description，遵循数据最小化
+ * 入参：description（用户人工观察，唯一输入）
  * 返回：{ code, data: { points: string[], text: string }, msg }
  * 说明：
- * - 只在用户显式点击「AI整理备注」后调用，页面加载 / 保存 candidate 都不触发
- * - 结果只是「基于人工备注整理的文本」，不是系统验证事实；不自动写库
+ * - 只在用户显式点击「AI整理达人资料」后调用，页面加载 / 保存 candidate 都不触发
+ * - 结果只是「基于人工观察整理的文本」，不是系统验证事实；不自动写库
  * - AI 未连接时后端返回明确错误，不影响 candidate 数据与页面正常使用
  */
 export function distillCreatorNote(description) {
@@ -95,16 +95,20 @@ export function distillCreatorNote(description) {
 }
 
 /**
- * Historical Negotiation Backfill V0.1：AI 整理谈价经验（可选增强）
- * 入参：source_note = 用户写的历史谈价原始备注（**只发送这一段**，数据最小化）
- * 返回：{ code, data: { reason_tags: string[], reason_note: string|null, strategy_note: string|null }, msg }
- * 说明：只返回「建议」，绝不写库；reason_tags 只可能落在现有 allowlist 内；
- *      AI 不可用时历史回填仍可人工填写并保存。
+ * 谈价经验 AI 整理（可选增强）
+ * 入参：
+ *   · 字符串：等价于 { source_note }（旧调用方式）
+ *   · 对象：{ source_note, candidate_description?, distilled_description?, decision_note? }
+ *     —— 只发送真实存在的最小上下文（数据最小化）
+ * 返回：{ code, data: { reason_tags, reason_note, strategy_note, sources: string[] }, msg }
+ * 说明：只返回「建议」，绝不写库、绝不返回任何价格字段；reason_tags 只可能落在现有 allowlist 内；
+ *      AI 不可用时谈价记录仍可人工填写并保存。
  */
-export function harvestNegotiationExperience(sourceNote) {
+export function harvestNegotiationExperience(payload) {
+  const body = typeof payload === 'string' ? { source_note: payload } : payload || {}
   return request.post(
     '/ai/harvest-negotiation-experience',
-    { source_note: sourceNote },
+    body,
     { timeout: 60000, headers: buildAiHeaders() }
   )
 }

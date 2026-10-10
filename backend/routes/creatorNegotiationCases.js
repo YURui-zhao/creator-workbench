@@ -5,6 +5,7 @@ import { computeCreatorPricing } from '../utils/creatorPricing.js'
 import {
   MAX_NEGOTIATION_NOTE_LENGTH,
   MAX_SOURCE_NOTE_LENGTH,
+  NEGOTIATION_CANDIDATE_LIVE_DECISIONS,
   NEGOTIATION_REASON_TAG_VALUES,
   NEGOTIATION_SOURCE_TYPES,
   isValidDateOnly,
@@ -43,6 +44,22 @@ const findHistoricalCaseByRecord = (recordId) =>
        WHERE record_id = ? AND source_type = 'historical_backfill'`
     )
     .get(recordId)
+/**
+ * Semantic Duplicate V0.2：同一次真实谈价不能被两种来源各记一次
+ *   live（decision_id）与 historical_backfill（record_id）经 outcome 关联后指向同一次现实事件，
+ *   因此跨来源必须互斥 —— 绝不自动复制 / 转换 source_type / UPDATE 已有 case。
+ */
+const findOutcomeLinkByDecision = (decisionId) =>
+  db.prepare('SELECT * FROM creator_decision_outcomes WHERE decision_id = ?').get(decisionId)
+const findOutcomeLinkByRecord = (recordId) =>
+  db.prepare('SELECT * FROM creator_decision_outcomes WHERE record_id = ?').get(recordId)
+const findLiveCaseByDecision = (decisionId) =>
+  db
+    .prepare(
+      `SELECT * FROM creator_negotiation_cases
+       WHERE decision_id = ? AND source_type = 'live'`
+    )
+    .get(decisionId)
 
 /**
  * 批量加载若干 decision 的谈判案例（单条 SQL，决策列表展示用，避免 N+1）
@@ -124,6 +141,16 @@ function collectCaseFields(body, { withHistoricalFields = false } = {}) {
 
   const result = { negotiatedPrice, negotiatedAt, reasonTags, reasonNote, strategyNote }
 
+  // source_note：live 与 historical_backfill 共用的「人工谈价原始说明」（人工维护的 source of truth）
+  const sourceNote =
+    body.source_note === null || body.source_note === undefined
+      ? null
+      : String(body.source_note).trim()
+  if (sourceNote && sourceNote.length > MAX_SOURCE_NOTE_LENGTH) {
+    return { error: `谈价原始备注（source_note）长度不能超过 ${MAX_SOURCE_NOTE_LENGTH}` }
+  }
+  result.sourceNote = sourceNote || null
+
   if (withHistoricalFields) {
     // 历史回填：星图刊例 / 初始报价都是「用户确认过的历史价格事实」，可空但不可伪造
     const xingtu = parseOptionalPrice(body.xingtu_price_snapshot, '历史星图刊例价（xingtu_price_snapshot）')
@@ -132,15 +159,6 @@ function collectCaseFields(body, { withHistoricalFields = false } = {}) {
     if (quote.error) return { error: quote.error }
     result.xingtuPriceSnapshot = xingtu.value
     result.currentQuoteSnapshot = quote.value
-
-    const sourceNote =
-      body.source_note === null || body.source_note === undefined
-        ? null
-        : String(body.source_note).trim()
-    if (sourceNote && sourceNote.length > MAX_SOURCE_NOTE_LENGTH) {
-      return { error: `历史谈价原始备注（source_note）长度不能超过 ${MAX_SOURCE_NOTE_LENGTH}` }
-    }
-    result.sourceNote = sourceNote || null
   }
 
   return result
@@ -162,12 +180,19 @@ router.post('/', (req, res) => {
   if (decision.decision_stage !== 'post_quote') {
     return fail(res, 400, '只有「已拿到报价」阶段的决策才能记录谈价结果')
   }
-  // Phase 4F-B：candidate 决策必须来自「继续议价」这一条（candidate 的 proceed / small_test / pause 不可记录谈价）
-  // 说明：legacy（candidate_id = NULL）保持既有宽松行为（只校验 stage），本阶段不收紧旧契约，
+  // Phase 4F-B → Unification V0.2：candidate 只有「报价阶段」决策才能挂谈价事实，
+  //   但不再强制必须是 negotiate —— 谈价常常在系统外完成（谈完价才回来记录），
+  //   因此允许 negotiate / proceed / small_test / pause；candidate_review（contact / observe 等）
+  //   永远不能挂谈价案例（不伪造报价阶段）。
+  // 说明：legacy（candidate_id = NULL）保持既有宽松行为（只校验 stage），不收紧旧契约，
   //      也兼容 historically「post_quote + repurchase/small_test 也记录谈价」的旧用法。
   const isCandidateDecision = decision.candidate_id !== null && decision.candidate_id !== undefined
-  if (isCandidateDecision && decision.human_decision !== 'negotiate') {
-    return fail(res, 400, '候选达人只有「继续议价」的报价阶段决策才能记录谈价结果')
+  if (isCandidateDecision && !NEGOTIATION_CANDIDATE_LIVE_DECISIONS.includes(decision.human_decision)) {
+    return fail(
+      res,
+      400,
+      '候选达人只有报价阶段决策（继续议价 / 直接推进 / 小额测试 / 暂缓）才能记录谈价事实'
+    )
   }
 
   const fields = collectCaseFields(body)
@@ -176,6 +201,18 @@ router.post('/', (req, res) => {
 
   if (findCaseByDecision(decisionId)) {
     return fail(res, 409, `决策 #${decisionId} 已经有谈价结果，不能重复记录`)
+  }
+
+  // Semantic Duplicate V0.2（跨来源去重）：
+  //   该决策若已通过 outcome 关联到真实投放记录，且该记录已补录历史谈价，
+  //   则同一次真实谈价会变成两条 case（live + historical_backfill）→ 拒绝，不自动复制 / 转换。
+  const outcomeLinkForDecision = findOutcomeLinkByDecision(decisionId)
+  if (outcomeLinkForDecision && findHistoricalCaseByRecord(outcomeLinkForDecision.record_id)) {
+    return fail(
+      res,
+      409,
+      `该次真实投放（记录 #${outcomeLinkForDecision.record_id}）已补录历史谈价，请查看已有谈价案例。`
+    )
   }
 
   // ---- 冻结「当时」的谈判上下文（全部由后端重新读取，忽略前端提交的同名字段）----
@@ -190,7 +227,25 @@ router.post('/', (req, res) => {
       })
     : null
   const xingtuPriceSnapshot = snapshotRow?.xingtu_price ?? null
-  const currentQuoteSnapshot = decision.current_quote ?? null
+  // ---- 谈前报价（current_quote_snapshot）语义 ----
+  //   A. 原生 negotiate flow（post_quote/negotiate）：decision.current_quote 就是「谈价开始前的真实报价」→ 服务端冻结
+  //   B. 「记录已发生谈价」retrofit flow（candidate 的 post_quote/proceed|small_test|pause）：
+  //      谈价发生在系统之外，回到系统时 decision.current_quote 可能**已经是谈后报价**，
+  //      因此绝不能自动当成谈前报价 —— 必须由人工明确填写，后端只做确定性校验（不做任何文本解析）。
+  //   legacy（candidate_id = NULL）保持原有行为（冻结 decision.current_quote），不破坏旧契约。
+  const isRetrofitCapture = isCandidateDecision && decision.human_decision !== 'negotiate'
+  let currentQuoteSnapshot = decision.current_quote ?? null
+  if (isRetrofitCapture) {
+    const preQuote = parseOptionalPrice(
+      body.current_quote_snapshot,
+      '谈前报价（current_quote_snapshot）'
+    )
+    if (preQuote.error) return fail(res, 400, preQuote.error)
+    if (preQuote.value === null) {
+      return fail(res, 400, '记录已发生谈价时必须人工填写谈前报价（current_quote_snapshot）')
+    }
+    currentQuoteSnapshot = preQuote.value
+  }
   const targetPriceSnapshot = snapshotPricing?.target_price ?? null
   const referenceLowSnapshot = snapshotPricing?.reference_low ?? null
   const referenceHighSnapshot = snapshotPricing?.reference_high ?? null
@@ -224,7 +279,7 @@ router.post('/', (req, res) => {
         referenceHighSnapshot,
         'live',
         null,
-        null
+        fields.sourceNote
       )
     saved = db.prepare('SELECT * FROM creator_negotiation_cases WHERE id = ?').get(info.lastInsertRowid)
   } catch (error) {
@@ -269,6 +324,13 @@ router.post('/historical-backfill', (req, res) => {
 
   if (findHistoricalCaseByRecord(recordId)) {
     return fail(res, 409, `投放记录 #${recordId} 已经补录过历史谈价，不能重复补录`)
+  }
+
+  // Semantic Duplicate V0.2（反方向）：该投放记录若已通过 outcome 关联到某个决策，
+  // 且该决策已有 live 谈价案例，则同一次投放已被实时流程记录 → 拒绝重复补录。
+  const outcomeLinkForRecord = findOutcomeLinkByRecord(recordId)
+  if (outcomeLinkForRecord && findLiveCaseByDecision(outcomeLinkForRecord.decision_id)) {
+    return fail(res, 409, '该次投放已存在实时谈价案例，无需重复补录。')
   }
 
   let saved

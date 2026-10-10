@@ -45,6 +45,17 @@ export const NEGOTIATION_SOURCE_TYPES = ['live', 'historical_backfill']
 // 历史谈价原始备注：人工维护的 source of truth（比 reason/strategy note 承载更多原始上下文）
 export const MAX_SOURCE_NOTE_LENGTH = 2000
 
+// Negotiation Unification V0.2：
+//   live 谈价事实允许挂在「报价阶段（post_quote）」的哪些人工决定上。
+//   真实使用中谈价常常发生在系统之外（谈完才回到系统记录），因此不再强制必须是 negotiate：
+//     negotiate   继续议价（原始流程）
+//     proceed     直接推进（谈完价后直接记录已发生谈价）
+//     small_test  小额测试
+//     pause       暂缓（谈过价但最终暂停 —— 记录的是已发生的谈价事实）
+//   注意：这里只约束「候选达人」决策；legacy（candidate_id = NULL）保持既有宽松行为。
+//   candidate_review / contact / observe 等非报价阶段决策永远不能挂谈价案例（不伪造报价阶段）。
+export const NEGOTIATION_CANDIDATE_LIVE_DECISIONS = ['negotiate', 'proceed', 'small_test', 'pause']
+
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
 
 /** 严格校验 YYYY-MM-DD（含真实日历校验；与 P2B observed_at 同一规则） */

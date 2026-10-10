@@ -131,9 +131,26 @@ async function main() {
 
     console.log('===== 1. candidate eligibility =====')
     check('candidate post_quote/negotiate 可创建 case', (await callRoute(postCase, { body: caseBody(decNegotiate) })).status === 200)
-    check('candidate proceed 不可创建', (await callRoute(postCase, { body: caseBody(decProceed) })).status === 400)
-    check('candidate small_test 不可创建', (await callRoute(postCase, { body: caseBody(decSmallTest) })).status === 400)
-    check('candidate pause 不可创建', (await callRoute(postCase, { body: caseBody(decPause) })).status === 400)
+    // Negotiation Unification V0.2：谈价常常在系统外完成（谈完才回来记录），
+    // 因此 candidate 的报价阶段决策（proceed / small_test / pause）也可记录已发生谈价事实。
+    // P0：retrofit flow（proceed / small_test / pause）必须人工填写「谈前报价」，
+    //     不能把 decision.current_quote（可能已是谈后价）自动当成谈前报价。
+    check(
+      'candidate proceed 可创建（V0.2 允许已发生谈价）',
+      (await callRoute(postCase, { body: caseBody(decProceed, { current_quote_snapshot: 6000 }) })).status === 200
+    )
+    check(
+      'retrofit 缺少谈前报价 → 400（P0）',
+      (await callRoute(postCase, { body: caseBody(decSmallTest) })).status === 400
+    )
+    check(
+      'candidate small_test 可创建（V0.2，带人工谈前报价）',
+      (await callRoute(postCase, { body: caseBody(decSmallTest, { current_quote_snapshot: 2500 }) })).status === 200
+    )
+    check(
+      'candidate pause 可创建（V0.2：记录已发生谈价事实，不代表推进）',
+      (await callRoute(postCase, { body: caseBody(decPause, { current_quote_snapshot: 3500 }) })).status === 200
+    )
     check('legacy（candidate_id=NULL）行为不变（post_quote/repurchase 仍可）', (await callRoute(postCase, { body: caseBody(legacyRepurchase) })).status === 200)
 
     console.log('\n===== 2. negotiated price =====')
@@ -202,15 +219,31 @@ async function main() {
 
     console.log('\n===== 7. CreatorPlaybook UI（源码级） =====')
     const page = fs.readFileSync(path.join(root, 'frontend/src/pages/CreatorPlaybook/index.jsx'), 'utf8')
-    check('引入 NegotiationCaseModal 且 candidate 模式', /<NegotiationCaseModal/.test(page) && /mode="candidate_playbook"/.test(page))
-    check('最新 post_quote = negotiate 时显示「记录谈价结果」', /latestPostQuoteNegotiating && !latestNegotiationCase/.test(page) && /记录谈价结果/.test(page))
-    check('只有 negotiate 才显示（proceed/small_test/pause 不显示）', /const latestPostQuoteNegotiating = latestPostQuoteDecision\?\.human_decision === 'negotiate'/.test(page))
+    // Negotiation Unification V0.2：candidate 谈价统一走共享谈价经验表单（同一领域模型），
+    // 旧的 NegotiationCaseModal 仅保留给 legacy Radar 决策抽屉。
+    check('引入统一谈价经验 Modal', /<CandidateNegotiationExperienceModal/.test(page))
+    // Semantic Duplicate V0.2：已有谈价经验（live case 或 outcome-linked 历史补录）时不再提供记录入口
+    check(
+      '最新 post_quote 可记录本次谈价（无任何已有谈价记录时）',
+      /canRecordNegotiationExperience && !existingNegotiationExperience/.test(page) &&
+        /记录本次谈价/.test(page)
+    )
+    check(
+      'V0.2 允许 negotiate / proceed / small_test / pause（不再只限 negotiate）',
+      /const negotiationCapturableDecisions = \['negotiate', 'proceed', 'small_test', 'pause'\]/.test(page) &&
+        /negotiationCapturableDecisions\.includes\(latestPostQuoteDecision\.human_decision\)/.test(page)
+    )
     check('谈价结果展示事实：初始报价 / 谈后价格 / 星图刊例 / 折扣', /初始报价：/.test(page) && /谈后价格：/.test(page) && /谈后价约为星图/.test(page))
     check('下降显示下降 X%（不出现负降幅）', /下降 \$\{\(Math\.abs\(latestNegotiationCase\.outcome\.quote_change_rate\) \* 100\)\.toFixed\(1\)\}%/.test(page) && /上升 \$\{\(latestNegotiationCase\.outcome\.quote_change_rate \* 100\)\.toFixed\(1\)\}%/.test(page))
     check('无星图价显示「暂无」', /星图刊例：[\s\S]{0,300}'暂无'/.test(page))
     check('「以谈后价继续判断」预填 negotiated_price', /以谈后价继续判断/.test(page) && /openPostQuote\(String\(latestNegotiationCase\.negotiated_price\)\)/.test(page))
     check('报价 Modal 不默认选中 human_decision（openPostQuote 重置为 null）', /setPostQuoteDecision\(null\)/.test(page))
-    check('candidate 谈价 Modal 不把 CPM30 当主依据', /mode="candidate_playbook"/.test(page) && !/CPM30目标价/.test(page))
+    check(
+      'candidate 谈价不留 CPM30 体系（统一 Modal 走 Playbook / 决策上下文）',
+      /<CandidateNegotiationExperienceModal/.test(page) &&
+        !/CPM30目标价/.test(page) &&
+        !/<NegotiationCaseModal/.test(page)
+    )
     check('未发生任何外部网络请求', blocked.length === 0, JSON.stringify(blocked))
     check('隔离库位于临时目录', process.env.WORKBENCH_DB_PATH.startsWith(os.tmpdir()))
   } finally {
